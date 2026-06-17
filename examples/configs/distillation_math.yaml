@@ -13,9 +13,16 @@ distillation:
     seed: 42
 
 loss_fn:
+    type: "kl"  # "kl" (default) or "oad" (Overlap-Aligned Distillation, see BASIC_OAD_PROPOSAL.md)
+
+    # Fields used when type == "kl"
     kl_type: "mixed" # forward, reverse, mixed
     mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
     zero_outside_topk: false # zero out the teacher logits outside the top k when calculate forward KL loss
+
+    # Fields used when type == "oad"
+    oad:
+        eps: 1.0e-8
 
 checkpointing:
     enabled: true

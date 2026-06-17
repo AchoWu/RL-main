@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, Optional, TypedDict
+from typing import Any, NotRequired, Optional, TypedDict
 
 import ray
 import torch
@@ -41,10 +41,17 @@ class ScoreOutputSpec(TypedDict):
 
 
 class TopkLogitsOutputSpec(TypedDict):
-    """Per-position top-k logits and corresponding global token indices."""
+    """Per-position top-k logits and corresponding global token indices.
+
+    The optional `logsumexp` field provides the per-position full-vocab logsumexp,
+    allowing consumers (e.g. OAD distillation) to recover exact global probabilities
+    without an extra forward pass. Workers SHOULD populate this when computationally
+    cheap; consumers MUST tolerate its absence (legacy / cheaper paths).
+    """
 
     topk_logits: torch.Tensor
     topk_indices: torch.Tensor
+    logsumexp: NotRequired[torch.Tensor]
 
 
 class PolicyInterface(ABC):

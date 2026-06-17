@@ -28,6 +28,7 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
     gather_logits_at_global_indices,
     get_logprobs_from_vocab_parallel_logits,
+    vocab_cp_logsumexp,
 )
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
@@ -1224,3 +1225,237 @@ class DistillationLossFn(LossFunction):
         }
 
         return kl_loss, metrics
+
+
+# ===============================================================================
+# Overlap-Aligned Distillation (OAD)
+# ===============================================================================
+class OADLossConfig(TypedDict):
+    """Configuration for Overlap-Aligned Distillation loss.
+
+    Loss = -E_t[ log( sum_y min(p_S(y|y_<t), p_T(y|y_<t)) ) ]
+
+    See BASIC_OAD_PROPOSAL.md for full design notes.
+    """
+
+    eps: NotRequired[float]
+
+
+class OADLossDataDict(TypedDict):
+    """Required keys for the OAD loss function (Path B).
+
+    `teacher_logsumexp` is the per-position full-vocab logsumexp of the teacher,
+    populated by the teacher worker's `get_topk_logits`. Without it, OAD cannot
+    construct exact teacher probabilities and will raise a clear error.
+    """
+
+    input_ids: torch.Tensor
+    input_lengths: torch.Tensor
+    token_mask: torch.Tensor
+    sample_mask: torch.Tensor
+    teacher_topk_logits: torch.Tensor  # [B, S, k]
+    teacher_topk_indices: torch.Tensor  # [B, S, k]
+    teacher_logsumexp: torch.Tensor  # [B, S], exact full-vocab logsumexp
+
+
+class OADLossFn(LossFunction):
+    """Basic Overlap-Aligned Distillation loss (Path B: exact teacher logsumexp).
+
+    Per-token loss = -log(sum_y min(p_S(y), p_T(y))) on the teacher's top-k support.
+    Each token is weighted equally (no length weighting, no critical-token weighting).
+
+    Implementation notes:
+        - Student logsumexp is computed exactly from full-vocab logits via
+          vocab_cp_logsumexp (TP+CP aware).
+        - Teacher logsumexp is the exact full-vocab value, supplied by the
+          teacher worker via `data["teacher_logsumexp"]` (Path B). With this in
+          place, identity (student==teacher) yields loss = 0 by construction.
+        - The truncated acceptance is a lower bound on the true acceptance,
+          with bias <= 1 - M_T (Theorem in §3.2). Monitored via
+          `teacher_topk_mass` (now meaningful under Path B).
+    """
+
+    def __init__(self, cfg: OADLossConfig):
+        self.eps = cfg.get("eps", 1e-8)
+        self.loss_type = LossType.TOKEN_LEVEL
+
+    def __call__(
+        self,
+        next_token_logits: torch.Tensor,
+        data: OADLossDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute OAD loss between teacher (top-k) and student logits."""
+        # 1) Teacher data — Path B requires exact teacher_logsumexp from the worker
+        teacher_topk_logits = data["teacher_topk_logits"].to(torch.float32)  # [B, S, k]
+        teacher_topk_indices = data["teacher_topk_indices"]  # [B, S, k]
+        if "teacher_logsumexp" not in data:
+            raise KeyError(
+                "OADLossFn (Path B) requires `teacher_logsumexp` in train_data. "
+                "Ensure the teacher worker's get_topk_logits returns the "
+                "full-vocab logsumexp (currently supported on dtensor backends; "
+                "Megatron backend returns top-k only and is not yet supported)."
+            )
+        teacher_lse = data["teacher_logsumexp"].to(torch.float32)  # [B, S]
+        batch_size = teacher_topk_indices.shape[0]
+        full_seq_len = teacher_topk_indices.shape[1]
+
+        if teacher_topk_indices.shape[-1] <= 0:
+            raise ValueError(
+                f"topk must be positive, got {teacher_topk_indices.shape[-1]}."
+            )
+
+        # 2) Resolve TP / CP (mirror DistillationLossFn:1029-1062).
+        # TODO(future): if a third distill loss is added, refactor TP/CP/DTensor
+        #   resolution into a shared helper to avoid 3-way duplication.
+        cp_group = context_parallel_group
+        cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+        next_token_logits = next_token_logits.to(torch.float32)
+
+        if vocab_parallel_group is not None:
+            assert vocab_parallel_rank is not None, (
+                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+            )
+            V_local = int(next_token_logits.shape[-1])
+            vocab_start_index = vocab_parallel_rank * V_local
+            vocab_end_index = (vocab_parallel_rank + 1) * V_local
+            parallel_group = vocab_parallel_group
+            logits_local = next_token_logits
+        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+            device_mesh = next_token_logits.device_mesh
+            tp_group = device_mesh.get_group("tp")
+            tp_rank = tp_group.rank()
+            local_logits = next_token_logits.to_local()
+            V_local = int(local_logits.shape[-1])
+            vocab_start_index = tp_rank * V_local
+            vocab_end_index = (tp_rank + 1) * V_local
+            parallel_group = tp_group
+            logits_local = local_logits
+            teacher_topk_indices = teacher_topk_indices.to(local_logits.device)
+            if (
+                device_mesh.mesh_dim_names is not None
+                and "cp" in device_mesh.mesh_dim_names
+            ):
+                cp_group = device_mesh.get_group("cp")
+                cp_size = cp_group.size()
+            else:
+                cp_group = None
+                cp_size = 1
+        else:
+            parallel_group = None
+            logits_local = next_token_logits
+            vocab_start_index = 0
+            vocab_end_index = int(logits_local.shape[-1])
+
+        # 3) Student logsumexp over full vocab (TP+CP aware) -> [B, S_full]
+        student_lse = vocab_cp_logsumexp(
+            logits_local,
+            tp_group=parallel_group,
+            cp_group=cp_group,
+            full_seq_len=full_seq_len,
+        )
+
+        # 4) (Path B) Teacher logsumexp is provided exactly by the worker;
+        #    we already loaded it as `teacher_lse` in step 1.
+
+        # 5) Student logits at teacher's top-k indices (TP+CP aware) -> [B, S, k]
+        student_topk_logits = gather_logits_at_global_indices(
+            logits_local,
+            teacher_topk_indices,
+            tp_group=parallel_group,
+            cp_group=cp_group,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+        )
+
+        # 6) logits -> global probabilities (true softmax, NOT top-k renormalized)
+        student_log_p_topk = student_topk_logits - student_lse.unsqueeze(-1)
+        teacher_log_p_topk = teacher_topk_logits - teacher_lse.unsqueeze(-1)
+
+        student_p_topk = student_log_p_topk.exp()
+        teacher_p_topk = teacher_log_p_topk.exp()
+
+        # 7) Acceptance = sum_y min(p_S, p_T) on the top-k support (lower bound; bias <= 1 - M_T)
+        acceptance = torch.minimum(student_p_topk, teacher_p_topk).sum(dim=-1)  # [B, S]
+
+        # 8) Next-token alignment: predict t+1 from position t
+        # Use token_mask aligned with predicted tokens (mirror DistillationLossFn KL: token_mask[:, 1:])
+        per_token_loss = -acceptance[:, :-1].clamp_min(self.eps).log()  # [B, S-1]
+
+        token_mask = data["token_mask"][:, 1:]  # [B, S-1]
+        sample_mask = data["sample_mask"]
+        max_len = per_token_loss.shape[1]
+        token_mask = token_mask[:, :max_len]
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        loss = masked_mean(
+            per_token_loss,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        )
+
+        # 9) Monitoring (per v2 §7.2; Path B semantics)
+        with torch.no_grad():
+            valid = mask.bool()
+            n_valid = mask.sum().clamp_min(1.0)
+            acc_aligned = acceptance[:, :-1]
+
+            mean_accept = (acc_aligned * mask).sum() / n_valid
+            min_accept = (
+                acc_aligned[valid].min()
+                if valid.any()
+                else torch.tensor(0.0, device=acceptance.device)
+            )
+
+            # Teacher's M_T: true sum of teacher probability on its own top-k.
+            # Under Path B (exact teacher_lse), this is observable and is the
+            # tightness of the §3.2 truncation bound. Drops in M_T directly
+            # signal "training assumption M_T > 0.99 may be violated".
+            teacher_topk_mass = (
+                teacher_p_topk[:, :-1].sum(dim=-1) * mask
+            ).sum() / n_valid
+
+            # Student mass on teacher's top-k support: complementary monitor —
+            # how much of the student distribution lives on tokens the teacher
+            # considers most likely. Rises when distributions converge.
+            student_mass_on_teacher_topk = (
+                student_p_topk[:, :-1].sum(dim=-1) * mask
+            ).sum() / n_valid
+
+            # Active-grad ratio: only top-k tokens with p_S < p_T contribute gradient
+            # under min. Two granularities (per v3 review §C.3(1)):
+            #   - position-level (`any`): coarse signal — does this position get any gradient?
+            #   - token-level (`mean`): fine-grained — what fraction of top-k positions get
+            #     gradient? Maps directly to the gradient-sparsity discussion in §8.
+            # Read jointly with mean_accept: if acceptance plateaus and either ratio drops,
+            # sparsity is biting.
+            grad_active_per_token = (
+                student_p_topk[:, :-1] < teacher_p_topk[:, :-1]
+            )  # [B, S-1, k] bool
+            active_grad_ratio_position = (
+                grad_active_per_token.any(dim=-1).to(mask.dtype) * mask
+            ).sum() / n_valid
+            active_grad_ratio_token = (
+                grad_active_per_token.to(mask.dtype).mean(dim=-1) * mask
+            ).sum() / n_valid
+
+        # Path B metrics carry `_pathB` suffix to distinguish from any future
+        # Path A run; teacher_topk_mass is the key "M_T assumption" monitor
+        # and student_mass_on_teacher_topk is its student-side complement.
+        metrics = {
+            "loss": float(loss.item()) if loss.ndim == 0 else loss,
+            "num_valid_samples": int(batch_size),
+            "acceptance_rate_mean_pathB": mean_accept,
+            "acceptance_rate_min_pathB": min_accept,
+            "tvd_mean_pathB": 1.0 - mean_accept,
+            "teacher_topk_mass": teacher_topk_mass,
+            "student_mass_on_teacher_topk": student_mass_on_teacher_topk,
+            "active_grad_ratio_position_pathB": active_grad_ratio_position,
+            "active_grad_ratio_token_pathB": active_grad_ratio_token,
+        }
+
+        return loss, metrics

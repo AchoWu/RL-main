@@ -982,6 +982,62 @@ def gather_logits_at_global_indices(
     return gathered_logits
 
 
+def vocab_cp_logsumexp(
+    vocab_parallel_logits: torch.Tensor,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    full_seq_len: Optional[int] = None,
+) -> torch.Tensor:
+    """Compute per-position logsumexp over the vocabulary, with TP and CP support.
+
+    Differentiable w.r.t. vocab_parallel_logits.
+
+    Args:
+        vocab_parallel_logits: [B, S_cp, V_local] where S_cp is CP sharded sequence length.
+        tp_group: Tensor-parallel process group. If None, treats logits as full-vocab and skips TP all-reduce.
+        cp_group: Optional context-parallel process group. If None or size 1, no CP gather is performed.
+        full_seq_len: When CP > 1, the original (un-padded) full sequence length. If provided, the
+            returned tensor will be sliced to length full_seq_len; otherwise padding is left in.
+
+    Returns:
+        logsumexp: [B, S_full] when CP > 1 (S_full == full_seq_len if provided, else padded length),
+                   [B, S_cp] otherwise.
+    """
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+
+    logits = vocab_parallel_logits.to(dtype=torch.float32)
+
+    # 1) Global max across vocab shards (TP-aware)
+    local_max = logits.max(dim=-1, keepdim=True).values  # [B, S_cp, 1]
+    if tp_group is not None:
+        torch.distributed.all_reduce(
+            local_max, op=torch.distributed.ReduceOp.MAX, group=tp_group
+        )
+
+    # 2) sum exp(logits - global_max) over vocab shards (TP-aware)
+    shifted = logits - local_max
+    local_sum = shifted.exp().sum(dim=-1)  # [B, S_cp]
+    if tp_group is not None:
+        torch.distributed.all_reduce(
+            local_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group
+        )
+
+    lse_local = local_max.squeeze(-1) + local_sum.log()  # [B, S_cp]
+
+    # 3) CP gather: assemble full-sequence logsumexp from CP shards.
+    # Convention matches gather_logits_at_global_indices: vocab_parallel_logits
+    # is already CP-sharded (length S_local = padded_full / cp_size). After
+    # allgather we recover the padded length S_local * cp_size; we then trim
+    # back to the caller's logical full_seq_len if it's shorter (i.e. drop pad).
+    if cp_size > 1:
+        lse_full = allgather_cp_sharded_tensor(lse_local, cp_group, seq_dim=1)
+        if full_seq_len is not None and lse_full.shape[1] > full_seq_len:
+            lse_full = lse_full[:, :full_seq_len]
+        return lse_full
+    return lse_local
+
+
 class ChunkedDistributedEntropy(torch.autograd.Function):
     """Compute H_all = sum_v p_v log p_v across TP with chunking over sequence.
 

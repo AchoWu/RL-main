@@ -28,6 +28,7 @@ from nemo_rl.algorithms.loss_functions import (
     DistillationLossConfig,
     DistillationLossDataDict,
     DistillationLossFn,
+    OADLossFn,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
@@ -163,7 +164,7 @@ def setup(
     Optional[GenerationInterface],  # student_generation
     StatefulDataLoader,
     Optional[StatefulDataLoader],
-    DistillationLossFn,
+    DistillationLossFn | OADLossFn,
     Logger,
     CheckpointManager,
     DistillationSaveState,
@@ -471,7 +472,17 @@ def setup(
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
 
-    loss_fn = DistillationLossFn(loss_config)
+    # Dispatch loss function: default "kl" (back-compat); "oad" enables
+    # Overlap-Aligned Distillation (see BASIC_OAD_PROPOSAL.md).
+    loss_type = loss_config.get("type", "kl")
+    if loss_type == "kl":
+        loss_fn = DistillationLossFn(loss_config)
+    elif loss_type == "oad":
+        loss_fn = OADLossFn(loss_config.get("oad", {}))
+    else:
+        raise ValueError(
+            f"Unknown loss_fn.type: {loss_type!r}. Expected one of: 'kl', 'oad'."
+        )
 
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
@@ -503,7 +514,7 @@ def distillation_train(
     dataloader: StatefulDataLoader,
     val_dataloader: Optional[StatefulDataLoader],
     tokenizer: TokenizerType,
-    loss_fn: DistillationLossFn,
+    loss_fn: DistillationLossFn | OADLossFn,
     task_to_env: dict[str, EnvironmentInterface],
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     logger: Logger,
@@ -699,6 +710,13 @@ def distillation_train(
                     )
                     train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                     train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                    # Path B for OAD: workers that compute exact full-vocab logsumexp
+                    # expose it as `logsumexp`. We pass it through if present so
+                    # OADLossFn can avoid the Path A approximation. Workers that
+                    # don't populate it (e.g. current Megatron path) will simply
+                    # not set this key, and OADLossFn will surface a clear error.
+                    if "logsumexp" in teacher_topk:
+                        train_data["teacher_logsumexp"] = teacher_topk["logsumexp"]
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):

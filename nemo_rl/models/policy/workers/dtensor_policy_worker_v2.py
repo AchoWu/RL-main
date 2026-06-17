@@ -69,6 +69,7 @@ from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
+    vocab_cp_logsumexp,
 )
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
@@ -1403,6 +1404,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         out_topk_vals = []
         out_topk_idx = []
+        out_lse = []
         self.model.eval()
 
         with torch.no_grad():
@@ -1553,6 +1555,14 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                         cp_group = self.cp_mesh.get_group()
 
+                        # Exact full-vocab logsumexp (TP+CP aware) for OAD Path B.
+                        lse = vocab_cp_logsumexp(
+                            local_logits,
+                            tp_group=tp_group,
+                            cp_group=cp_group,
+                            full_seq_len=seq_len,
+                        )  # [B, S]
+
                         vals = allgather_cp_sharded_tensor(
                             vals, cp_group, seq_dim=sequence_dim
                         )
@@ -1577,15 +1587,22 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 vocab_start_index=vocab_start_index,
                                 vocab_end_index=vocab_end_index,
                             )
+                            lse = vocab_cp_logsumexp(
+                                local_logits,
+                                tp_group=tp_group,
+                                cp_group=None,
+                            )  # [B, S]
                         else:
                             full_logits = logits.to(torch.float32)
                             vals, idx = torch.topk(full_logits, k=k, dim=-1)
+                            lse = torch.logsumexp(full_logits, dim=-1)  # [B, S]
 
                 # Handle sequence packing unpacking
                 if self.enable_seq_packing:
                     # Unpack top-k results from packed format back to original batch format
                     # vals: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
                     # idx: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
+                    # lse: [1, packed_seq_len]    -> [original_batch_size, original_seq_len]
 
                     # Create tensors to store unpacked results
                     unpacked_vals = torch.zeros(
@@ -1597,6 +1614,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         (original_batch_size, original_seq_len, k),
                         dtype=idx.dtype,
                         device=idx.device,
+                    )
+                    unpacked_lse = torch.zeros(
+                        (original_batch_size, original_seq_len),
+                        dtype=lse.dtype,
+                        device=lse.device,
                     )
 
                     # Get cumulative sequence lengths for unpacking
@@ -1611,26 +1633,30 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         # Note: vals and idx are [1, packed_seq_len, k] due to packing
                         unpacked_vals[i, :seq_len_actual, :] = vals[0, start:end, :]
                         unpacked_idx[i, :seq_len_actual, :] = idx[0, start:end, :]
+                        unpacked_lse[i, :seq_len_actual] = lse[0, start:end]
 
                     # Replace with unpacked results
                     vals = unpacked_vals
                     idx = unpacked_idx
+                    lse = unpacked_lse
 
                     # Update batch_size and seq_len for consistency
                     batch_size = original_batch_size
                     seq_len = original_seq_len
 
                 # Keep only real sequence tokens (no trimming here; padded positions can be masked downstream)
-                # Shapes remain [B, S, k].
+                # Shapes remain [B, S, k] / [B, S].
                 out_topk_vals.append(vals.cpu())
                 out_topk_idx.append(idx.cpu())
+                out_lse.append(lse.cpu())
 
         ret = BatchedDataDict[Any]()
         # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
         all_topk_vals_padded = []
         all_topk_idx_padded = []
+        all_lse_padded = []
         target_seq_len = seq_dim_size
-        for vals, idx in zip(out_topk_vals, out_topk_idx):
+        for vals, idx, lse in zip(out_topk_vals, out_topk_idx, out_lse):
             pad_needed = target_seq_len - vals.shape[1]
             if pad_needed > 0:
                 # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
@@ -1640,8 +1666,13 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 idx = torch.nn.functional.pad(
                     idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0
                 )
+                # lse is [B, S] — pad on seq dim only
+                lse = torch.nn.functional.pad(
+                    lse, (0, pad_needed, 0, 0), mode="constant", value=0.0
+                )
             all_topk_vals_padded.append(vals)
             all_topk_idx_padded.append(idx)
+            all_lse_padded.append(lse)
 
         ret["topk_logits"] = (
             torch.cat(all_topk_vals_padded, dim=0)
@@ -1652,6 +1683,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             torch.cat(all_topk_idx_padded, dim=0)
             if len(all_topk_idx_padded) > 1
             else all_topk_idx_padded[0]
+        ).cpu()
+        ret["logsumexp"] = (
+            torch.cat(all_lse_padded, dim=0)
+            if len(all_lse_padded) > 1
+            else all_lse_padded[0]
         ).cpu()
         return ret
 
