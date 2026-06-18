@@ -773,12 +773,6 @@ def distillation_train(
                         "global_valid_seqs",
                         "global_valid_toks",
                         "mean_prompt_length",
-                        # OAD probability/ratio metrics — must be averaged
-                        # across microbatches, not summed (they live in [0, 1]).
-                        "acceptance_rate_mean_pathB",
-                        "teacher_topk_mass",
-                        "student_mass_on_teacher_topk",
-                        "active_grad_ratio_token_pathB",
                     }:
                         metrics[k] = np.mean(v).item()
                     else:
@@ -889,21 +883,6 @@ def distillation_train(
             print(
                 f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}"
             )
-
-            # OAD-specific metrics (only present when loss_fn.type=oad).
-            # These are mean-aggregated across microbatches (see white-list
-            # above), so values are real probabilities in [0, 1].
-            oad_keys = [
-                "acceptance_rate_mean_pathB",
-                "teacher_topk_mass",
-                "student_mass_on_teacher_topk",
-                "active_grad_ratio_token_pathB",
-            ]
-            if any(k in metrics for k in oad_keys):
-                print("  • OAD metrics:")
-                for k in oad_keys:
-                    if k in metrics:
-                        print(f"      - {k}: {metrics[k]:.4f}")
             if "total_flops" in train_results:
                 total_tflops = (
                     train_results["total_flops"]
