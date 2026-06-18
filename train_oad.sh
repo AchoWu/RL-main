@@ -16,6 +16,14 @@ export no_proxy=$NO_PROXY
 export http_proxy=$ENV_VENUS_PROXY
 export https_proxy=$ENV_VENUS_PROXY
 
+# ====== Hugging Face 强制离线（关键） ======
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+
+# 明确指定缓存目录（确保所有 Ray worker 共享）
+export HF_HOME=/root/.cache/huggingface
+export HF_DATASETS_CACHE=/root/.cache/huggingface/datasets
+
 export WANDB_MODE=disabled
 
 # ====== Attention 后端（flash-attn 可用时注释掉下面这行） ======
@@ -37,10 +45,12 @@ sed -i 's/PY_EXECUTABLES.AUTOMODEL/PY_EXECUTABLES.SYSTEM/; s/PY_EXECUTABLES.FSDP
 export PYTHONPATH=/group/40143/howu/RL-main:$PYTHONPATH
 
 cd /group/40143/howu/RL-main && python examples/run_distillation_math.py \
+      --config examples/configs/distillation_math.yaml \
       loss_fn.type=oad \
       policy.model_name="/group/40143/howu/llms/Qwen3-1.7B/" \
       teacher.model_name="/group/40143/howu/llms/Qwen3-4B/" \
       cluster.gpus_per_node=8 \
       policy.train_micro_batch_size=1 \
       teacher.logprob_batch_size=2 \
+      distillation.max_num_epochs=3 \
       checkpointing.save_consolidated=true
