@@ -1446,16 +1446,19 @@ class OADLossFn(LossFunction):
         # Path B metrics carry `_pathB` suffix to distinguish from any future
         # Path A run; teacher_topk_mass is the key "M_T assumption" monitor
         # and student_mass_on_teacher_topk is its student-side complement.
+        # All metric values are converted to Python floats so the downstream
+        # `np.sum(v).item()` aggregation in distillation.py works without a
+        # CUDA-tensor numpy() crash (KL loss returns floats too — match it).
         metrics = {
             "loss": float(loss.item()) if loss.ndim == 0 else loss,
             "num_valid_samples": int(batch_size),
-            "acceptance_rate_mean_pathB": mean_accept,
-            "acceptance_rate_min_pathB": min_accept,
-            "tvd_mean_pathB": 1.0 - mean_accept,
-            "teacher_topk_mass": teacher_topk_mass,
-            "student_mass_on_teacher_topk": student_mass_on_teacher_topk,
-            "active_grad_ratio_position_pathB": active_grad_ratio_position,
-            "active_grad_ratio_token_pathB": active_grad_ratio_token,
+            "acceptance_rate_mean_pathB": float(mean_accept.item()),
+            "acceptance_rate_min_pathB": float(min_accept.item()),
+            "tvd_mean_pathB": float((1.0 - mean_accept).item()),
+            "teacher_topk_mass": float(teacher_topk_mass.item()),
+            "student_mass_on_teacher_topk": float(student_mass_on_teacher_topk.item()),
+            "active_grad_ratio_position_pathB": float(active_grad_ratio_position.item()),
+            "active_grad_ratio_token_pathB": float(active_grad_ratio_token.item()),
         }
 
         return loss, metrics

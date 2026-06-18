@@ -120,29 +120,24 @@ def test_oad_loss_zero_when_student_equals_teacher():
     # exactly). loss = -log(M_T) which can be > 0 if top-k < vocab.
     # The proper "loss ≡ 0" identity requires top-k == vocab; see test 7.
     # What Path B DOES guarantee unconditionally: acceptance == teacher_topk_mass.
-    torch.testing.assert_close(
-        metrics["acceptance_rate_mean_pathB"],
-        metrics["teacher_topk_mass"],
-        atol=1e-5,
-        rtol=1e-4,
-    )
-    torch.testing.assert_close(
-        metrics["student_mass_on_teacher_topk"],
-        metrics["teacher_topk_mass"],
-        atol=1e-5,
-        rtol=1e-4,
-    )
+    assert abs(
+        metrics["acceptance_rate_mean_pathB"] - metrics["teacher_topk_mass"]
+    ) < 1e-5
+    assert abs(
+        metrics["student_mass_on_teacher_topk"] - metrics["teacher_topk_mass"]
+    ) < 1e-5
 
     # loss == -log(acceptance), no spurious clamp_max bias.
-    expected = -torch.log(metrics["acceptance_rate_mean_pathB"]).item()
+    import math
+    expected = -math.log(metrics["acceptance_rate_mean_pathB"])
     assert abs(loss.item() - expected) < 1e-4, (
         f"loss={loss.item()} vs -log(acceptance)={expected}"
     )
 
     # Under exact identity p_S == p_T at every top-k token, so no token has
     # p_S < p_T strictly — active_grad_ratio is 0.
-    assert metrics["active_grad_ratio_position_pathB"].item() < 1e-5
-    assert metrics["active_grad_ratio_token_pathB"].item() < 1e-5
+    assert metrics["active_grad_ratio_position_pathB"] < 1e-5
+    assert metrics["active_grad_ratio_token_pathB"] < 1e-5
 
 
 # -------------------------------------------------------------------
@@ -263,30 +258,27 @@ def test_oad_loss_metric_bounds():
         global_valid_toks=_global_valid_toks(data),
     )
 
-    assert 0.0 <= metrics["acceptance_rate_min_pathB"].item() <= 1.0
-    assert 0.0 <= metrics["acceptance_rate_mean_pathB"].item() <= 1.0
-    assert 0.0 <= metrics["teacher_topk_mass"].item() <= 1.0
-    assert 0.0 <= metrics["student_mass_on_teacher_topk"].item() <= 1.0
-    torch.testing.assert_close(
-        metrics["tvd_mean_pathB"],
-        1.0 - metrics["acceptance_rate_mean_pathB"],
-        atol=1e-6,
-        rtol=1e-5,
-    )
-    assert 0.0 <= metrics["active_grad_ratio_position_pathB"].item() <= 1.0
-    assert 0.0 <= metrics["active_grad_ratio_token_pathB"].item() <= 1.0
+    assert 0.0 <= metrics["acceptance_rate_min_pathB"] <= 1.0
+    assert 0.0 <= metrics["acceptance_rate_mean_pathB"] <= 1.0
+    assert 0.0 <= metrics["teacher_topk_mass"] <= 1.0
+    assert 0.0 <= metrics["student_mass_on_teacher_topk"] <= 1.0
+    assert abs(
+        metrics["tvd_mean_pathB"] - (1.0 - metrics["acceptance_rate_mean_pathB"])
+    ) < 1e-6
+    assert 0.0 <= metrics["active_grad_ratio_position_pathB"] <= 1.0
+    assert 0.0 <= metrics["active_grad_ratio_token_pathB"] <= 1.0
     assert (
-        metrics["active_grad_ratio_token_pathB"].item()
-        <= metrics["active_grad_ratio_position_pathB"].item() + 1e-6
+        metrics["active_grad_ratio_token_pathB"]
+        <= metrics["active_grad_ratio_position_pathB"] + 1e-6
     )
 
     # acceptance ≤ min(M_T, student_mass_on_teacher_topk) ≤ both individually,
     # since min(p_S, p_T) ≤ p_T and ≤ p_S.
-    assert metrics["acceptance_rate_mean_pathB"].item() <= (
-        metrics["teacher_topk_mass"].item() + 1e-5
+    assert metrics["acceptance_rate_mean_pathB"] <= (
+        metrics["teacher_topk_mass"] + 1e-5
     )
-    assert metrics["acceptance_rate_mean_pathB"].item() <= (
-        metrics["student_mass_on_teacher_topk"].item() + 1e-5
+    assert metrics["acceptance_rate_mean_pathB"] <= (
+        metrics["student_mass_on_teacher_topk"] + 1e-5
     )
 
 
@@ -328,13 +320,9 @@ def test_oad_loss_zero_when_topk_equals_vocab():
     assert loss.item() < 1e-5, (
         f"Path B identity at top-k=vocab should give loss ≡ 0, got {loss.item()}"
     )
-    torch.testing.assert_close(
-        metrics["acceptance_rate_mean_pathB"], torch.tensor(1.0), atol=1e-5, rtol=1e-4
-    )
-    torch.testing.assert_close(
-        metrics["teacher_topk_mass"], torch.tensor(1.0), atol=1e-5, rtol=1e-4
-    )
-    assert metrics["active_grad_ratio_position_pathB"].item() < 1e-5
+    assert abs(metrics["acceptance_rate_mean_pathB"] - 1.0) < 1e-5
+    assert abs(metrics["teacher_topk_mass"] - 1.0) < 1e-5
+    assert metrics["active_grad_ratio_position_pathB"] < 1e-5
 
 
 # -------------------------------------------------------------------
@@ -382,8 +370,8 @@ def test_oad_loss_truncation_bound_when_teacher_mass_is_split():
     )
 
     # Under Path B, teacher_topk_mass IS the observable M_T_true.
-    assert abs(metrics["teacher_topk_mass"].item() - 0.5) < 5e-2, (
-        f"expected teacher_topk_mass ≈ 0.5, got {metrics['teacher_topk_mass'].item()}"
+    assert abs(metrics["teacher_topk_mass"] - 0.5) < 5e-2, (
+        f"expected teacher_topk_mass ≈ 0.5, got {metrics['teacher_topk_mass']}"
     )
 
 
