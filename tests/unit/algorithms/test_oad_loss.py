@@ -89,11 +89,8 @@ def test_oad_loss_returns_scalar_no_nan():
     for key in (
         "loss",
         "acceptance_rate_mean_pathB",
-        "acceptance_rate_min_pathB",
-        "tvd_mean_pathB",
         "teacher_topk_mass",
         "student_mass_on_teacher_topk",
-        "active_grad_ratio_position_pathB",
         "active_grad_ratio_token_pathB",
     ):
         assert key in metrics, f"missing metric: {key}"
@@ -136,7 +133,6 @@ def test_oad_loss_zero_when_student_equals_teacher():
 
     # Under exact identity p_S == p_T at every top-k token, so no token has
     # p_S < p_T strictly — active_grad_ratio is 0.
-    assert metrics["active_grad_ratio_position_pathB"] < 1e-5
     assert metrics["active_grad_ratio_token_pathB"] < 1e-5
 
 
@@ -258,19 +254,10 @@ def test_oad_loss_metric_bounds():
         global_valid_toks=_global_valid_toks(data),
     )
 
-    assert 0.0 <= metrics["acceptance_rate_min_pathB"] <= 1.0
     assert 0.0 <= metrics["acceptance_rate_mean_pathB"] <= 1.0
     assert 0.0 <= metrics["teacher_topk_mass"] <= 1.0
     assert 0.0 <= metrics["student_mass_on_teacher_topk"] <= 1.0
-    assert abs(
-        metrics["tvd_mean_pathB"] - (1.0 - metrics["acceptance_rate_mean_pathB"])
-    ) < 1e-6
-    assert 0.0 <= metrics["active_grad_ratio_position_pathB"] <= 1.0
     assert 0.0 <= metrics["active_grad_ratio_token_pathB"] <= 1.0
-    assert (
-        metrics["active_grad_ratio_token_pathB"]
-        <= metrics["active_grad_ratio_position_pathB"] + 1e-6
-    )
 
     # acceptance ≤ min(M_T, student_mass_on_teacher_topk) ≤ both individually,
     # since min(p_S, p_T) ≤ p_T and ≤ p_S.
@@ -322,7 +309,7 @@ def test_oad_loss_zero_when_topk_equals_vocab():
     )
     assert abs(metrics["acceptance_rate_mean_pathB"] - 1.0) < 1e-5
     assert abs(metrics["teacher_topk_mass"] - 1.0) < 1e-5
-    assert metrics["active_grad_ratio_position_pathB"] < 1e-5
+    assert metrics["active_grad_ratio_token_pathB"] < 1e-5
 
 
 # -------------------------------------------------------------------

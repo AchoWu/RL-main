@@ -1398,18 +1398,13 @@ class OADLossFn(LossFunction):
             global_normalization_factor=global_valid_toks,
         )
 
-        # 9) Monitoring (per v2 §7.2; Path B semantics)
+        # 9) Monitoring (per v2 §7.2; Path B semantics; trimmed per v3 review)
         with torch.no_grad():
             valid = mask.bool()
             n_valid = mask.sum().clamp_min(1.0)
             acc_aligned = acceptance[:, :-1]
 
             mean_accept = (acc_aligned * mask).sum() / n_valid
-            min_accept = (
-                acc_aligned[valid].min()
-                if valid.any()
-                else torch.tensor(0.0, device=acceptance.device)
-            )
 
             # Teacher's M_T: true sum of teacher probability on its own top-k.
             # Under Path B (exact teacher_lse), this is observable and is the
@@ -1426,38 +1421,29 @@ class OADLossFn(LossFunction):
                 student_p_topk[:, :-1].sum(dim=-1) * mask
             ).sum() / n_valid
 
-            # Active-grad ratio: only top-k tokens with p_S < p_T contribute gradient
-            # under min. Two granularities (per v3 review §C.3(1)):
-            #   - position-level (`any`): coarse signal — does this position get any gradient?
-            #   - token-level (`mean`): fine-grained — what fraction of top-k positions get
-            #     gradient? Maps directly to the gradient-sparsity discussion in §8.
-            # Read jointly with mean_accept: if acceptance plateaus and either ratio drops,
-            # sparsity is biting.
+            # Active-grad ratio (token-level): fraction of top-k entries where
+            # p_S < p_T (the only entries that contribute gradient through min).
+            # Read jointly with mean_accept: if acceptance plateaus and this
+            # ratio drops, gradient sparsity is biting (see §8 / §9.2).
             grad_active_per_token = (
                 student_p_topk[:, :-1] < teacher_p_topk[:, :-1]
             )  # [B, S-1, k] bool
-            active_grad_ratio_position = (
-                grad_active_per_token.any(dim=-1).to(mask.dtype) * mask
-            ).sum() / n_valid
             active_grad_ratio_token = (
                 grad_active_per_token.to(mask.dtype).mean(dim=-1) * mask
             ).sum() / n_valid
 
-        # Path B metrics carry `_pathB` suffix to distinguish from any future
-        # Path A run; teacher_topk_mass is the key "M_T assumption" monitor
-        # and student_mass_on_teacher_topk is its student-side complement.
-        # All metric values are converted to Python floats so the downstream
-        # `np.sum(v).item()` aggregation in distillation.py works without a
-        # CUDA-tensor numpy() crash (KL loss returns floats too — match it).
+        # Trimmed metric set (5 useful signals + bookkeeping). Removed:
+        #   - acceptance_rate_min_pathB (high-noise, diluted by sum->mean agg)
+        #   - tvd_mean_pathB            (redundant with 1 - acceptance_mean)
+        #   - active_grad_ratio_position_pathB (subsumed by token-level granularity)
+        # All remaining values are Python floats so distillation.py's
+        # np.mean/np.sum aggregation works without CUDA-tensor numpy() crash.
         metrics = {
             "loss": float(loss.item()) if loss.ndim == 0 else loss,
             "num_valid_samples": int(batch_size),
             "acceptance_rate_mean_pathB": float(mean_accept.item()),
-            "acceptance_rate_min_pathB": float(min_accept.item()),
-            "tvd_mean_pathB": float((1.0 - mean_accept).item()),
             "teacher_topk_mass": float(teacher_topk_mass.item()),
             "student_mass_on_teacher_topk": float(student_mass_on_teacher_topk.item()),
-            "active_grad_ratio_position_pathB": float(active_grad_ratio_position.item()),
             "active_grad_ratio_token_pathB": float(active_grad_ratio_token.item()),
         }
 
