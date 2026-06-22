@@ -891,22 +891,44 @@ def distillation_train(
             )
 
             # OAD-specific metrics (only present when loss_fn.type=oad).
-            # These keys are in the np.mean white-list above, so the values
-            # are real probabilities in [0, 1].
-            oad_keys = [
-                "acceptance_rate_mean_pathB",
-                "acceptance_rate_min_pathB",
-                "tvd_mean_pathB",
-                "teacher_topk_mass",
-                "student_mass_on_teacher_topk",
-                "active_grad_ratio_position_pathB",
-                "active_grad_ratio_token_pathB",
-            ]
-            if any(k in metrics for k in oad_keys):
-                print("  • OAD metrics:")
-                for k in oad_keys:
-                    if k in metrics:
-                        print(f"      - {k}: {metrics[k]:.4f}")
+            # OADLossFn returns per-mb *sums* + a token count rather than
+            # already-averaged values, so the final average is computed here
+            # from sum / count. This is invariant to the worker's mb / dp /
+            # global-batch aggregation and shows real [0, 1] probabilities.
+            if "oad_token_count" in metrics:
+                token_count = metrics["oad_token_count"]
+                if token_count > 0:
+                    acc = metrics["oad_acceptance_sum"] / token_count
+                    teacher_mass = (
+                        metrics["oad_teacher_topk_mass_sum"] / token_count
+                    )
+                    student_mass = (
+                        metrics["oad_student_mass_on_teacher_topk_sum"]
+                        / token_count
+                    )
+                    active_pos = (
+                        metrics["oad_active_grad_position_sum"] / token_count
+                    )
+                    active_tok = (
+                        metrics["oad_active_grad_token_sum"] / token_count
+                    )
+                    print("  • OAD metrics:")
+                    print(f"      - acceptance_rate_mean_pathB: {acc:.4f}")
+                    print(
+                        f"      - acceptance_rate_min_pathB:  "
+                        f"{metrics['oad_min_accept_pathB']:.4f}"
+                    )
+                    print(f"      - tvd_mean_pathB:             {1.0 - acc:.4f}")
+                    print(f"      - teacher_topk_mass:          {teacher_mass:.4f}")
+                    print(
+                        f"      - student_mass_on_teacher_topk:{student_mass:.4f}"
+                    )
+                    print(
+                        f"      - active_grad_ratio_position_pathB:{active_pos:.4f}"
+                    )
+                    print(
+                        f"      - active_grad_ratio_token_pathB:   {active_tok:.4f}"
+                    )
             if "total_flops" in train_results:
                 total_tflops = (
                     train_results["total_flops"]

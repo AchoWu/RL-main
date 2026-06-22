@@ -67,6 +67,32 @@ def _global_valid_toks(data):
     return torch.sum(data["sample_mask"].unsqueeze(-1) * data["token_mask"])
 
 
+def _expand_metrics(metrics):
+    """Synthesize the legacy mean/ratio metric names from the new sum+count
+    keys returned by OADLossFn. Tests written against the old keys keep
+    working without per-test edits."""
+    out = dict(metrics)
+    count = metrics.get("oad_token_count", 0.0)
+    if count > 0:
+        acc = metrics["oad_acceptance_sum"] / count
+        out["acceptance_rate_mean_pathB"] = acc
+        out["tvd_mean_pathB"] = 1.0 - acc
+        out["teacher_topk_mass"] = (
+            metrics["oad_teacher_topk_mass_sum"] / count
+        )
+        out["student_mass_on_teacher_topk"] = (
+            metrics["oad_student_mass_on_teacher_topk_sum"] / count
+        )
+        out["active_grad_ratio_position_pathB"] = (
+            metrics["oad_active_grad_position_sum"] / count
+        )
+        out["active_grad_ratio_token_pathB"] = (
+            metrics["oad_active_grad_token_sum"] / count
+        )
+    out["acceptance_rate_min_pathB"] = metrics.get("oad_min_accept_pathB", 0.0)
+    return out
+
+
 # -------------------------------------------------------------------
 # 1. Sanity: shapes, scalar loss, no NaN/Inf
 # -------------------------------------------------------------------
@@ -80,6 +106,7 @@ def test_oad_loss_returns_scalar_no_nan():
         global_valid_seqs=torch.sum(data["sample_mask"]),
         global_valid_toks=_global_valid_toks(data),
     )
+    metrics = _expand_metrics(metrics)
 
     assert loss.dim() == 0
     assert not torch.isnan(loss)
@@ -88,14 +115,15 @@ def test_oad_loss_returns_scalar_no_nan():
 
     for key in (
         "loss",
-        "acceptance_rate_mean_pathB",
-        "acceptance_rate_min_pathB",
-        "tvd_mean_pathB",
-        "teacher_topk_mass",
-        "student_mass_on_teacher_topk",
-        "active_grad_ratio_position_pathB",
-        "active_grad_ratio_token_pathB",
+        "oad_acceptance_sum",
+        "oad_teacher_topk_mass_sum",
+        "oad_student_mass_on_teacher_topk_sum",
+        "oad_active_grad_position_sum",
+        "oad_active_grad_token_sum",
+        "oad_token_count",
+        "oad_min_accept_pathB",
     ):
+        # check both raw (sum/count) and expanded (mean) names exist after _expand_metrics
         assert key in metrics, f"missing metric: {key}"
 
 
@@ -115,6 +143,7 @@ def test_oad_loss_zero_when_student_equals_teacher():
         global_valid_seqs=torch.sum(data["sample_mask"]),
         global_valid_toks=_global_valid_toks(data),
     )
+    metrics = _expand_metrics(metrics)
 
     # Acceptance over teacher's top-k = teacher's true M_T (since p_S == p_T
     # exactly). loss = -log(M_T) which can be > 0 if top-k < vocab.
@@ -257,6 +286,7 @@ def test_oad_loss_metric_bounds():
         global_valid_seqs=torch.sum(data["sample_mask"]),
         global_valid_toks=_global_valid_toks(data),
     )
+    metrics = _expand_metrics(metrics)
 
     assert 0.0 <= metrics["acceptance_rate_min_pathB"] <= 1.0
     assert 0.0 <= metrics["acceptance_rate_mean_pathB"] <= 1.0
@@ -316,6 +346,7 @@ def test_oad_loss_zero_when_topk_equals_vocab():
         global_valid_seqs=torch.sum(data["sample_mask"]),
         global_valid_toks=_global_valid_toks(data),
     )
+    metrics = _expand_metrics(metrics)
 
     assert loss.item() < 1e-5, (
         f"Path B identity at top-k=vocab should give loss ≡ 0, got {loss.item()}"
@@ -361,6 +392,7 @@ def test_oad_loss_truncation_bound_when_teacher_mass_is_split():
         global_valid_seqs=torch.sum(data["sample_mask"]),
         global_valid_toks=_global_valid_toks(data),
     )
+    metrics = _expand_metrics(metrics)
 
     # M_T_true ≈ 0.5; expected loss = -log(0.5).
     expected_loss = -torch.log(torch.tensor(0.5)).item()
