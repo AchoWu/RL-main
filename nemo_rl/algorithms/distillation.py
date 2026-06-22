@@ -773,6 +773,18 @@ def distillation_train(
                         "global_valid_seqs",
                         "global_valid_toks",
                         "mean_prompt_length",
+                        # OAD probability / ratio metrics — each microbatch
+                        # already reports a [0, 1] value, so the right cross-
+                        # microbatch aggregate is mean, not sum. Without this
+                        # the console print and wandb both show
+                        # `value * num_microbatches`, which is not meaningful.
+                        "acceptance_rate_mean_pathB",
+                        "acceptance_rate_min_pathB",
+                        "tvd_mean_pathB",
+                        "teacher_topk_mass",
+                        "student_mass_on_teacher_topk",
+                        "active_grad_ratio_position_pathB",
+                        "active_grad_ratio_token_pathB",
                     }:
                         metrics[k] = np.mean(v).item()
                     else:
@@ -885,12 +897,8 @@ def distillation_train(
             )
 
             # OAD-specific metrics (only present when loss_fn.type=oad).
-            # NOTE: line ~779 aggregates per-microbatch values via `np.sum`,
-            # so probability metrics here are inflated by num_microbatches
-            # (= train_global_batch_size / train_micro_batch_size = 64 for
-            # the current Qwen3 setup). Divide by that ratio to read the
-            # true [0, 1] value. Switching to `np.mean` for these keys is
-            # the planned step 2 of the monitor restoration.
+            # These keys are in the np.mean white-list above, so the values
+            # are real probabilities in [0, 1].
             oad_keys = [
                 "acceptance_rate_mean_pathB",
                 "acceptance_rate_min_pathB",
@@ -901,10 +909,7 @@ def distillation_train(
                 "active_grad_ratio_token_pathB",
             ]
             if any(k in metrics for k in oad_keys):
-                print(
-                    "  • OAD metrics (raw sum-aggregated; divide by mb count "
-                    "for true [0,1] value):"
-                )
+                print("  • OAD metrics:")
                 for k in oad_keys:
                     if k in metrics:
                         print(f"      - {k}: {metrics[k]:.4f}")
