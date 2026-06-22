@@ -773,21 +773,15 @@ def distillation_train(
                         "global_valid_seqs",
                         "global_valid_toks",
                         "mean_prompt_length",
-                        # OAD probability / ratio metrics — each microbatch
-                        # already reports a [0, 1] value, so the right cross-
-                        # microbatch aggregate is mean, not sum. Without this
-                        # the console print and wandb both show
-                        # `value * num_microbatches`, which is not meaningful.
-                        "acceptance_rate_mean_pathB",
-                        "acceptance_rate_min_pathB",
-                        "tvd_mean_pathB",
-                        "teacher_topk_mass",
-                        "student_mass_on_teacher_topk",
-                        "active_grad_ratio_position_pathB",
-                        "active_grad_ratio_token_pathB",
                     }:
                         metrics[k] = np.mean(v).item()
                     else:
+                        # IMPORTANT: dtensor_policy_worker_v2.py:863 already
+                        # pre-divides every loss-fn metric by num_global_batches
+                        # before appending to `all_mb_metrics`, so summing the
+                        # microbatch values here recovers the true cross-mb mean.
+                        # Using np.mean instead would compound that pre-division
+                        # and shrink probability metrics by ~num_microbatches.
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
                 total_valid_tokens += metrics["global_valid_toks"]
