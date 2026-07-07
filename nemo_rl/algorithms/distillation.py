@@ -28,7 +28,6 @@ from nemo_rl.algorithms.loss_functions import (
     DistillationLossConfig,
     DistillationLossDataDict,
     DistillationLossFn,
-    OADLossFn,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
@@ -164,7 +163,7 @@ def setup(
     Optional[GenerationInterface],  # student_generation
     StatefulDataLoader,
     Optional[StatefulDataLoader],
-    DistillationLossFn | OADLossFn,
+    DistillationLossFn,
     Logger,
     CheckpointManager,
     DistillationSaveState,
@@ -472,17 +471,7 @@ def setup(
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
 
-    # Dispatch loss function: default "kl" (back-compat); "oad" enables
-    # Overlap-Aligned Distillation (see BASIC_OAD_PROPOSAL.md).
-    loss_type = loss_config.get("type", "kl")
-    if loss_type == "kl":
-        loss_fn = DistillationLossFn(loss_config)
-    elif loss_type == "oad":
-        loss_fn = OADLossFn(loss_config.get("oad", {}))
-    else:
-        raise ValueError(
-            f"Unknown loss_fn.type: {loss_type!r}. Expected one of: 'kl', 'oad'."
-        )
+    loss_fn = DistillationLossFn(loss_config)
 
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
@@ -514,7 +503,7 @@ def distillation_train(
     dataloader: StatefulDataLoader,
     val_dataloader: Optional[StatefulDataLoader],
     tokenizer: TokenizerType,
-    loss_fn: DistillationLossFn | OADLossFn,
+    loss_fn: DistillationLossFn,
     task_to_env: dict[str, EnvironmentInterface],
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     logger: Logger,
@@ -710,13 +699,6 @@ def distillation_train(
                     )
                     train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                     train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
-                    # Path B for OAD: workers that compute exact full-vocab logsumexp
-                    # expose it as `logsumexp`. We pass it through if present so
-                    # OADLossFn can avoid the Path A approximation. Workers that
-                    # don't populate it (e.g. current Megatron path) will simply
-                    # not set this key, and OADLossFn will surface a clear error.
-                    if "logsumexp" in teacher_topk:
-                        train_data["teacher_logsumexp"] = teacher_topk["logsumexp"]
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -776,12 +758,6 @@ def distillation_train(
                     }:
                         metrics[k] = np.mean(v).item()
                     else:
-                        # IMPORTANT: dtensor_policy_worker_v2.py:863 already
-                        # pre-divides every loss-fn metric by num_global_batches
-                        # before appending to `all_mb_metrics`, so summing the
-                        # microbatch values here recovers the true cross-mb mean.
-                        # Using np.mean instead would compound that pre-division
-                        # and shrink probability metrics by ~num_microbatches.
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
                 total_valid_tokens += metrics["global_valid_toks"]
@@ -889,46 +865,6 @@ def distillation_train(
             print(
                 f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}"
             )
-
-            # OAD-specific metrics (only present when loss_fn.type=oad).
-            # OADLossFn returns per-mb *sums* + a token count rather than
-            # already-averaged values, so the final average is computed here
-            # from sum / count. This is invariant to the worker's mb / dp /
-            # global-batch aggregation and shows real [0, 1] probabilities.
-            if "oad_token_count" in metrics:
-                token_count = metrics["oad_token_count"]
-                if token_count > 0:
-                    acc = metrics["oad_acceptance_sum"] / token_count
-                    teacher_mass = (
-                        metrics["oad_teacher_topk_mass_sum"] / token_count
-                    )
-                    student_mass = (
-                        metrics["oad_student_mass_on_teacher_topk_sum"]
-                        / token_count
-                    )
-                    active_pos = (
-                        metrics["oad_active_grad_position_sum"] / token_count
-                    )
-                    active_tok = (
-                        metrics["oad_active_grad_token_sum"] / token_count
-                    )
-                    print("  • OAD metrics:")
-                    print(f"      - acceptance_rate_mean_pathB: {acc:.4f}")
-                    print(
-                        f"      - acceptance_rate_min_pathB:  "
-                        f"{metrics['oad_min_accept_pathB']:.4f}"
-                    )
-                    print(f"      - tvd_mean_pathB:             {1.0 - acc:.4f}")
-                    print(f"      - teacher_topk_mass:          {teacher_mass:.4f}")
-                    print(
-                        f"      - student_mass_on_teacher_topk:{student_mass:.4f}"
-                    )
-                    print(
-                        f"      - active_grad_ratio_position_pathB:{active_pos:.4f}"
-                    )
-                    print(
-                        f"      - active_grad_ratio_token_pathB:   {active_tok:.4f}"
-                    )
             if "total_flops" in train_results:
                 total_tflops = (
                     train_results["total_flops"]

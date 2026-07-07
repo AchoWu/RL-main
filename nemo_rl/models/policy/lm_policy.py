@@ -459,14 +459,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
         stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
 
-        # Forward the optional full-vocab logsumexp (used by OAD Path B).
-        # Workers that compute it expose `logsumexp` in their per-shard output;
-        # if any shard is missing it (e.g. older Megatron worker), skip.
-        if all("logsumexp" in wb for wb in worker_batches):
-            stacked["logsumexp"] = torch.cat(
-                [wb["logsumexp"] for wb in worker_batches], dim=0
-            )
-
         if self.use_dynamic_batches or self.use_sequence_packing:
             stacked.reorder_data(unsorted_data_indices)
 
