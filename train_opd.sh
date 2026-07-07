@@ -5,6 +5,14 @@ export no_proxy=$NO_PROXY
 export http_proxy=$ENV_VENUS_PROXY
 export https_proxy=$ENV_VENUS_PROXY
 
+# ====== Hugging Face 强制离线（关键） ======
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+
+# 明确指定缓存目录（确保所有 Ray worker 共享）
+export HF_HOME=/root/.cache/huggingface
+export HF_DATASETS_CACHE=/root/.cache/huggingface/datasets
+
 export WANDB_MODE=disabled
 
 # ====== Attention 后端（flash-attn 可用时注释掉下面这行） ======

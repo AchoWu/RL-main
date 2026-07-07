@@ -1261,3 +1261,689 @@ metrics = {
 | 工程稳健性 | 改一个超参就可能数值飘 | **数学上保证正确** |
 
 ✅ Path B + sum/count 合约 是 v3 系列的最终形态。
+
+---
+
+## 附录 G：v3.4 OAD on-policy 模式塌缩（exp_012 失败记录）
+
+> 在 exp_011 健康收敛记录（附录 F）的基础上，从 step 0 全新启动训练（exp_012），结果出现 **on-policy 模式塌缩**：学生在 ~10 步内退化到字符级重复（`2,2,2...`、`3,3,3...`、`0,0,0...`）。本节用 step 1/5/6/7/8/9/10 的实际 rollout 数据精确还原塌缩动力学，并给出第一性原理的机理分析。**重要：本节只做诊断，不给修复方案**——修复方向单独讨论。
+
+### G.1 配置与现象
+
+**配置**：与 exp_011 完全相同（同 `train_oad.sh`、同 yaml、同模型 checkpoint、同 8×H20 拓扑）。**唯一区别**：exp_011 中途崩溃续训过几次，exp_012 是 fresh start。
+
+**Val 现象**：step 20 时 `val_accuracy = 0`，sample conversation 显示学生输出形如：
+
+```
+232322333323223233322223232333232223232323222323232235...
+333333330333333333333333330333333333333333330333333333...
+000000000000000000000000000000000000000000000000000000...
+```
+
+**OAD 训练 metric 全程"正常"**：
+
+| Step | Loss | acceptance | teacher_topk_mass | 推测状态 |
+|---|---|---|---|---|
+| 1 | 0.1498 | 0.90 | 0.99+ | 健康 |
+| 5 | 0.1860 | 0.87 | 0.99+ | 健康 |
+| 6 | 0.27 | 0.84 | 0.99+ | ⚠️ loss 异常上升（之前以为噪声）|
+| 9 | 0.0885 | 0.95 | 0.99+ | 看似恢复 |
+| 18-19 | 0.025-0.030 | 0.98 | 0.99+ | "完美对齐"|
+
+**关键事实**：训练 metric **完全无法**反映学生输出已经塌缩——OAD 的 acceptance 在 collapsed 模式下反而能保持 0.98。
+
+### G.2 塌缩时间线（rollout 文本分析）
+
+对 `train_data_step{1,5,6,7,8,9,10}.jsonl` 共 7 个 step 的 128 个学生生成进行字符层统计（脚本 `diagnose_collapse_progression.py`）：
+
+| Step | acc%¹ | mean_gen_len | tail_unique<10² | tail_unique<5 | `2,` 总数³ | `\boxed{}` 占比 |
+|---:|---:|---:|---:|---:|---:|---:|
+|  1 | **57.8%** | 16686 | 0/128 | 0/128 |   1772 | 91/128 (71%) |
+|  5 | **55.5%** | 12963 | 0/128 | 0/128 |   1653 | 103/128 (80%) |
+|  6 | **32.0%** |  7521 | 0/128 | 0/128 |    632 | 122/128 (95%) |
+|  7 | **10.9%** |  5163 | 0/128 | 0/128 |    509 | 97/128 (76%) |
+|  8 |  9.4% |  6073 | 13/128 | 5/128 |  1418 | 95/128 (74%) |
+|  9 |  3.9% |  9808 | 75/128 | 37/128 |  6603 | 26/128 (20%) |
+| 10 |  **0.0%** |  9713 | **119/128** | **108/128** | **11702** | 16/128 (13%) |
+
+¹ acc% = `Environment: correct` reward 占比
+² tail_unique = 生成末尾 200 字符中的 unique char 数；<10 = 显式字符塌缩信号
+³ 直接数 substring `'2,'` 的出现次数
+
+**三阶段塌缩模型**：
+
+#### Phase 1 — 能力崩盘期（step 5 → step 7）
+- **acc 暴跌**：55.5% → **32.0% → 10.9%**（两个 step 内损失 80% 解题能力）
+- **生成长度急缩**：12963 → 7521 → 5163（-60%）
+- **字符层完全正常**：tail_unique<10 = 0/128
+- **`\boxed{}` 占比甚至上升**（80% → 95% → 76%）
+- **解读**：学生**还在写正常的数学符号**，但 **开始倾向"提前收尾"——绕过推理中段的复杂步骤**
+
+#### Phase 2 — 符号层崩盘萌芽期（step 8）
+- **acc 稳在错误率**：9.4%
+- **`tail_unique<5` 首次 > 0**：5/128（4% 样本字符塌缩）
+- **`'2,'` 出现次数回升**：509 → 1418
+- **解读**：少数样本开始出现字符级重复模式，但还未扩散
+
+#### Phase 3 — 雪崩传染期（step 9 → step 10）
+- **acc**：3.9% → **0.0%**
+- **`tail_unique<5`**：5 → 37 → **108/128**（指数扩散：4% → 29% → 84%）
+- **`'2,'`**：1418 → 6603 → **11702**（×8 爆炸）
+- **解读**：on-policy 自反馈把局部 collapse 模式**传染**到几乎所有 prompt 上
+
+### G.3 一个反直觉的数据点：`'0,0'` 的反向轨迹
+
+`'0,0'` 出现次数：360 → 249 → 166 → **41 → 21 → 11 → 17**（一路下降，与塌缩无关）。
+
+这个反向轨迹很关键——它说明 **Phase 1 不是"开始重复"，而是"开始拒绝输出"**。`'0,0'` 这种"正常数学计算文本中的重复"在 Phase 1 反而减少，证明学生在 Phase 1 是在**缩减输出范围**，不是在**进入重复模式**。重复模式（Phase 2-3）是后续的下游产物。
+
+### G.4 机理分析：为什么 OAD on-policy 会塌缩
+
+#### 第一性原理推导
+
+OAD 训练时的实际目标：
+
+$$
+\mathcal{L}_{\text{OAD-on-policy}}(\pi_S) = -\mathbb{E}_{x_{<t} \sim \pi_S}\Big[\log \sum_y \min(p_S(y \mid x_{<t}), \, p_T(y \mid x_{<t}))\Big]
+$$
+
+注意期望是对**学生 rollout 前缀分布** $\pi_S$ 求的。
+
+记 $A_t = \sum_y \min(p_S, p_T) = 1 - \text{TVD}(p_S, p_T)$ 为每个 token 位置的 acceptance，那么 $\mathcal{L} = -\mathbb{E}_{\pi_S}[\log A_t]$。
+
+**关键问题**：教师 $\pi_T$（Qwen3-4B）在不同前缀上的 entropy 差异巨大——
+- **简单前缀**（如 "The answer is "）：教师 top-1 概率可能 > 0.9，$A_t$ 容易达到 0.95+
+- **难前缀**（如推理中段的"$\sqrt{2 \cdot 7^2 + 3}$" 这类位置）：教师 top-1 ≈ 0.3，$A_t$ 上界被强烈压低，loss 偏高
+
+**OAD 在 on-policy 下的致命漏洞**：
+
+> **OAD loss 只惩罚"前缀上不对齐"，不惩罚"故意制造对齐容易的前缀"。**
+>
+> 学生有两条降 loss 的路径：
+> 1. 在难前缀上对齐教师（困难，进步缓慢）
+> 2. 在难前缀**之前**的分叉点上，把概率挪到"通往简单前缀"的 token 上——**让 $\pi_S$ 直接绕开难前缀**（容易，立即见效）
+
+梯度下降必然选路径 2。这就是 Phase 1 看到的**"学生学会了赶紧用 \boxed{} 写个答案结束"**：推理中段那些位置 loss 太高，绕开它们立即拿到低 loss。
+
+#### 为什么 `min` 操作是病根
+
+OAD 的核心结构是 $\sum_y \min(p_S, p_T)$。这个 $\min$ 有一个机理上的副作用：
+
+> **教师在学生支持集之外的概率质量被 $\min$ 完全"原谅"了**。
+
+具体来说：如果学生分布 $p_S$ 只在某 5 个 token 上有显著质量，而教师在另外 100 个 token 上分布广泛——$\sum \min$ 只受学生那 5 个 token 上"min"出来的少量重叠的限制。**学生只要在自己挑的窄通道上挨着教师，acceptance 就能很高**。
+
+这正好解释了为什么 collapsed 状态下 acceptance 仍能达到 0.98：
+
+- 学生塌缩到 `2,2,2,...`
+- 在 `prefix = "2,2,2,..."` 这种前缀上，教师 Qwen3-4B 的 top-1 next-token 也是 `2`（数列延续是最自然的），$p_T(2) \approx 0.5$
+- $\min(p_S(2), p_T(2)) \approx \min(1.0, 0.5) = 0.5$
+- 加上其他 token 上的少量重叠，$A_t \approx 0.98$
+- **OAD loss = 0.02，看起来完美**
+
+#### 与 KL 的对比（只为机理对照，不涉及修复选型）
+
+| 性质 | KL($\pi_T \\| \pi_S$) | OAD ($-\log(1-\text{TVD})$) |
+|---|---|---|
+| 教师高 entropy 时单 token 最低 loss | 不一定低（教师的所有概率质量都要被学生承接）| 被 $\min$ 截断到很低 |
+| 学生支持集外教师质量的处理 | 爆炸（除非 $p_S$ 也很小，否则 KL 散发）| **被 $\min$ 完全原谅** |
+| 学生通过"塌缩到窄通道"逃避的收益 | 极小（KL 在其他位置仍施压）| **巨大**（迅速到 ~0）|
+| 学生通过"绕开难前缀"逃避的收益 | 中（KL 在简单前缀上也有 loss）| **巨大**（简单前缀 loss 极低）|
+
+**核心机理差异（一句话）**：
+- KL 是"严师"——教师在每个 token 都强制学生匹配自己的整个分布
+- OAD 是"宽容师"—— $\min$ 把超出学生支持集的教师质量"原谅"掉了
+
+OAD 的"宽容性"在**离线 distillation** 下是 feature（避免 KL 长尾爆炸、教师 noise 不传染），但在 **on-policy + 学生自由改写 rollout 分布** 的设定下变成 bug。
+
+### G.5 OAD 监控指标为什么完全失明
+
+回看附录 F.6 列出的监控项：
+
+| 指标 | Phase 1-3 表现 | 失明原因 |
+|---|---|---|
+| `acceptance_rate_mean_pathB` | 持续 ↑（最终 0.98）| 测的是"给定前缀下学生 vs 教师对齐度"，**前缀分布本身的恶化测不出** |
+| `teacher_topk_mass` | 始终 ≈ 0.9999 | 教师 distribution 性质，与学生 collapse 无关 |
+| `student_mass_on_teacher_topk` | 持续 ↑ | 学生质量集中（whether 集中到正确 mode 还是 collapsed mode 它分不清）|
+| `active_grad_ratio_position` | 缓慢 ↓ | 我们曾解读为"接近收敛"——**实际是"学生 rollout 多样性塌缩"** |
+| `oad_min_accept_pathB` | 偶有 0 | 单 token outlier，噪声大不可靠 |
+
+**根本盲点**：
+> 所有 OAD 监控指标都是**"前缀分布给定下的对齐质量"**——而病根是 **前缀分布本身**正在恶化。这是 OAD 目标定义层面的盲点，**不能通过加新 metric 修复**。任何"基于前缀条件分布"的指标都看不见这个问题。
+
+**唯一能检测的指标类型**：rollout 文本层面统计（`tail_unique_chars`、generation length、reward correct rate）。Phase 1 中 reward correct rate 已经从 57.8% 跌到 10.9%——**如果训练循环里加 val/rollout 评估到 reward 指标，Phase 1 末就能 catch**。
+
+### G.6 病根总结
+
+> **OAD on-policy 的 loss 函数对"学生 rollout 前缀分布"是无条件信任的：它只惩罚"前缀上不对齐"，不惩罚"故意制造对齐容易的前缀"。当学生发现"绕开高熵前缀比对齐高熵前缀代价更小"后，rollout 分布就开始坍缩到"教师在那里特别自信的窄通道"上，最终连这个通道都退化成单 token 的字符层 collapse。**
+
+这是 **目标定义层面**的漏洞，而非超参/工程层面问题。任何**只在 $\pi_S$ 访问的前缀上**计算的对齐目标（OAD/JSD/反向 KL 等"宽容"散度）都可能有此问题；KL on-policy 不会塌缩到这种程度，是因为 KL 不"宽容"。
+
+### G.7 候选修复方向（仅列出，不选型）
+
+> 本节只把可能的方向列出来供后续讨论。**未确定要采用哪条路线**。
+
+**方向 A：截断 loss 的上界**
+- A1. 用 TVD 而不是 $-\log(1-\text{TVD})$，loss 上界变成 1
+- A2. 加 floor：$\mathcal{L} = -\log\max(A_t, \tau)$
+- ⚠️ 风险：降低"逃避动机"的同时也降低了"在难前缀上学习"的信号 → 等于躺平
+
+**方向 B：在难前缀上加重梯度**
+- B1. 每 token loss 加权 $w_t = 1/(\epsilon + A_t)$
+- B2. 教师 entropy 高的位置 loss × k
+- ⚠️ 风险：放大已经不稳定位置的梯度，可能让 Phase 2 雪崩**更早**到来
+
+**方向 C：约束前缀分布不漂移**
+- C1. 学生 entropy 正则：$\mathcal{L} += -\alpha H(\pi_S)$
+- C2. 学生 KL 到**初始学生模型**：$\mathcal{L} += \beta \text{KL}(\pi_S \| \pi_S^{(0)})$
+- C3. 反向 KL 到教师：$\mathcal{L} += \gamma \text{KL}(\pi_S \| \pi_T)$（对支持集外质量施压，**对症 §G.4 病根**）
+- ⚠️ C1/C2 是纯防御止血；C3 是目标定义修正
+
+**方向 D：切断 on-policy 自反馈**
+- D1. 混合 rollout：50% 学生 + 50% 教师
+- D2. 重要性采样 rollout：前缀分布按 $\sqrt{\pi_S \pi_T}$ 加权
+- D3. 早期纯 off-policy，后期再 on-policy
+- ⚠️ 直接解决病根，但工程复杂度高、教师推理量翻倍
+
+**方向 E：改 loss 的对称性**
+- E1. JSD 替代 $-\log(1-\text{TVD})$
+- E2. 用教师 rollout 而非学生 rollout —— **退化为经典 KD，不是 on-policy 蒸馏**
+
+**方向 F（已明确排除）：基于 reward 的解（GRPO-like）**
+- 用户明确希望先**不从 reward 角度切入**——保持"distillation 不依赖 task verifier"的洁净假设。
+
+### G.8 与附录 F (exp_011) 健康收敛的对比
+
+exp_011 跑到 step 51 acceptance 0.987 healthy，exp_012 同样配置 step 10 全军覆没。这表明**塌缩是路径依赖现象**——某些初始化/数据顺序/数值轨迹会跌入塌缩盆地，另一些会跌入对齐盆地。两个盆地共存于同一目标景观。
+
+**目前仍未解释**：
+- exp_011 训练中途崩溃续训过，每次从最新 ckpt 重启——这是否**意外起到了"重置 rollout 分布"的作用**，从而避开了塌缩？
+- exp_012 fresh start 没有这种重置机会，更直接暴露在塌缩动力学下？
+
+这是个值得回归验证的假设——**故意中途重启 exp_012 看是否能"救回来"**，可作为下一步实验之一。
+
+### G.9 与论文叙事的关系
+
+附录 F（exp_011）和附录 G（exp_012）合起来构成 OAD on-policy 的**完整经验图谱**：
+
+- exp_011：理想情况下 OAD 能学到 acceptance 0.987 的高质量对齐
+- exp_012：但 OAD 目标本身有结构性脆弱——只要踩入塌缩盆地，会在 10 步内崩盘
+- exp_011 vs exp_012：训练成败由**前缀分布动力学**决定，与 loss 大小关系弱
+
+**这反而是论文的卖点而非污点**：
+
+> "我们提出的 OAD loss 在离线/控制良好的 on-policy 设置下能达到 acceptance 0.987 的对齐质量；但纯 on-policy 训练下展现出可重现的三阶段塌缩动力学（acc 56% → 0% in 10 steps），其机理来自 OAD 目标对学生 rollout 分布的无条件信任。我们识别此机制为 OAD 在线训练的核心稳定性瓶颈，并讨论了 [方向 A/B/C/D] 的修复路径权衡。"
+
+这是 RL/distillation 文献里**很少被实证记录的"on-policy alignment objective collapse"现象**——比单纯报告"我们方法 work 了"更有学术价值。
+
+### G.10 v3.4 已完成 & 未完成事项
+
+✅ 完成：
+- step 1-10 rollout 文本分析（`diagnose_collapse_progression.py`）
+- 三阶段塌缩动力学模型
+- 第一性原理机理推导
+- OAD 监控指标失明原因
+- 候选修复方向枚举（无选型）
+
+⏳ 未完成（按用户当前意愿不做 reward 路径）：
+- KL baseline (`train_opd.sh`) 同配置同步数对照——验证"OAD 特有 vs setup 共因"
+- 候选方向 A/B/C/D 中选定一条做实验
+- 故意中途重启 exp_012 验证"路径依赖"假设
+
+---
+
+## 附录 H：为什么 KL OPD 不会塌缩到 OAD 这种程度（机理对照）
+
+> 附录 G 给出了 OAD on-policy 塌缩的现象与机理。本附录回答一个对偶问题：**为什么 KL OPD 不出现这种 10 步内崩盘？** 这不是修复方案选型，是为 §G.7 候选方向给出**理论硬约束**——任何不引入 KL 那种"恢复支持集梯度"的修复都治不了根。
+
+### H.1 核心机理差异（一句话）
+
+> **KL 在 $p_S(y) \to 0$ 时梯度趋于无穷——这个"长尾爆炸"在 §1.1 里被列为 KL 的 bug，但在 on-policy 训练中它恰好是防止"学生塌缩到窄通道"的核心防御机制。OAD 的 $\min$ 操作消除了这个爆炸，也消除了防御。**
+
+§G.4 的"宽容师 vs 严师"是定性描述。本附录把它**定量化**：KL 的"严"不在 loss 大小，在 $p_S \to 0$ 时**梯度方向永远指向"恢复支持集"**——这是 OAD 结构上做不到的。
+
+### H.2 塌缩态的代表 setup
+
+回忆 §G.4 的 collapsed prefix 状态：
+- 学生 $p_S(2) \approx 1.0$，其余 token 概率 ≈ 0
+- 教师 $p_T(2) \approx 0.5$，剩余 0.5 的概率分散在 100+ token 上
+
+下面用此状态对比 OAD、KL forward、KL reverse 的 loss 与梯度。
+
+### H.3 各 loss 在塌缩态下的数值与梯度
+
+#### H.3.1 OAD：loss 中等 + 梯度死锁
+
+$$
+A_t = \min(1.0, 0.5) + \sum_{y \ne 2} \min(0, p_T(y)) = 0.5
+$$
+
+**loss = -log(0.5) ≈ 0.69**
+
+梯度分析：
+- 在塌缩 token $y=2$ 上：$\min$ 取的是 $p_T(2) = 0.5$（短板），$\partial \min / \partial p_S(2) = 0$ —— **学生在塌缩 token 上没有梯度信号让 $p_S(2)$ 改变**
+- 在其他 token $y \ne 2$ 上：$\min$ 取 $p_S(y) \approx 0$，梯度推 $p_S(y)$ 上升——但 softmax 约束下 $p_S(2)=1.0$ 不放手，其他 token 升不起来
+
+**结论**：OAD 在塌缩态是**梯度死锁**——塌缩 token 不再被推，其他 token 推不动。
+
+#### H.3.2 KL forward $\text{KL}(\pi_T \| \pi_S)$：loss 爆炸 + 梯度指向恢复
+
+$$
+\text{KL}(\pi_T \| \pi_S) = \sum_y p_T(y) \log\frac{p_T(y)}{p_S(y)}
+$$
+
+- $y=2$ 项：$0.5 \cdot \log(0.5/1.0) = -0.35$
+- $y \ne 2$ 项：$p_T(y) > 0$ 但 $p_S(y) \approx 0$，$p_T(y) \cdot \log(p_T(y)/\epsilon) \to +\infty$
+
+**整个 loss 趋于 $+\infty$**——这正是 §1.1 列出的"长尾爆炸"。
+
+梯度分析：
+
+$$
+\frac{\partial \text{KL}(\pi_T \| \pi_S)}{\partial \log p_S(y)} = -p_T(y)
+$$
+
+对所有 $p_T(y) > 0$ 的位置——**包括那 100 个被学生丢掉的 token**——梯度推 $\log p_S(y)$ 上升。在 $p_S(y) \approx 0$ 处沿 softmax 反传到 logits 时，梯度幅度 $\propto p_T(y)/\epsilon \to \infty$。**学生几乎是被"踹"回去给那些被丢弃的 token 分配概率。**
+
+**结论**：KL forward 产生**指向"恢复支持集"的爆炸性梯度**——OAD 缺的就是这个。
+
+#### H.3.3 KL reverse $\text{KL}(\pi_S \| \pi_T)$：loss 中等 + 主动压塌缩
+
+$$
+\text{KL}(\pi_S \| \pi_T) = \sum_y p_S(y) \log\frac{p_S(y)}{p_T(y)} = 1.0 \cdot \log(1.0/0.5) = 0.69
+$$
+
+数值看着和 OAD 差不多——但梯度方向完全不同：
+
+$$
+\frac{\partial \text{KL}(\pi_S \| \pi_T)}{\partial \log p_S(y)} = p_S(y) (\log(p_S(y)/p_T(y)) + 1)
+$$
+
+- 塌缩 token $y=2$：$p_S(2)=1.0$，$\log(1.0/0.5)+1 \approx 1.69$，梯度推 $\log p_S(2)$ **下降**——**主动压塌缩 token 的概率**
+
+**结论**：KL reverse 通过 mode-avoiding-when-over-concentrated 也能压塌缩，机制和 KL forward 不同但同样有效。
+
+#### H.3.4 KL mixed（NeMo-RL 默认 `kl_type: "mixed"`）
+
+$\text{mixed} = \alpha \cdot \text{forward} + (1-\alpha) \cdot \text{reverse}$——**两路防塌缩机制叠加**：
+- forward 路径：把学生踹回教师支持集
+- reverse 路径：压学生不要在某个 mode 上过度集中
+
+这就是为什么 NeMo-RL 把 mixed 设为默认——**经验上最稳的防塌缩配置**。
+
+### H.4 总结表：四种 loss 在塌缩态的对比
+
+| Loss | 塌缩态 loss | 塌缩 token 梯度 | 其他 token 梯度 | 防塌缩机制 |
+|---|---|---|---|---|
+| **OAD** | 0.69 | **0**（min 短板转移） | 微弱（被 softmax 压住） | **无** |
+| KL forward | $+\infty$ | 微弱（−0.5） | **爆炸**（推回支持集） | 恢复支持集 |
+| KL reverse | 0.69 | **1.69**（压塌缩 token） | 微弱 | mode-avoiding |
+| KL mixed | $+\infty$ | 1.69（reverse 部分） | 爆炸（forward 部分） | **双重防御** |
+
+注意：**OAD 与 KL reverse 在塌缩态的 loss 数值相同**（都是 0.69），但梯度行为完全不同。这强力佐证了 §H.1 的论点——**loss 大小不是关键，梯度方向才是**。
+
+### H.5 为什么"OAD 在低 entropy 前缀低 loss"的逃避路径在 KL 下失效
+
+回到 §G.4 的核心病机：**学生通过把 rollout 引到"教师 entropy 低"的前缀上来降 loss。**
+
+#### H.5.1 OAD：低 entropy 前缀 = 低 loss
+
+- 教师在低 entropy 前缀上 $p_T$ 集中在少数 token，**$\sum \min$ 容易接近 1**
+- $A_t \approx 1 \Rightarrow$ loss $\approx 0$
+- 学生学到"去这种前缀"的强烈信号
+- **这就是 Phase 1（step 5→7）观察到的"提前 \boxed{} 结束"行为的机理**
+
+#### H.5.2 KL：低 entropy 前缀 ≠ 低 loss
+
+- KL = $\sum p_T \log(p_T/p_S)$
+- 即便教师只在 2 个 token 上有质量，**学生还是必须精确匹配这 2 个 token 上的概率比例**
+- 如果学生塌缩到只押 top-1，KL 在 top-2 上仍然爆炸：$p_T(\text{top-2}) \log(p_T(\text{top-2})/0) \to \infty$
+- **学生无法用"教师在这里很自信，我也跟着自信"的策略偷懒**
+
+KL 要求**精确分布匹配**，不只是 mode 匹配——这正好对应 §G.4 提到的"KL 是严师"，但**真正严的不是 loss 大小，是梯度永远指向'恢复完整分布'**。OAD 的 min 操作把这个梯度方向砍掉了。
+
+### H.6 KL 也不是免疫——只是塌缩盆地更小
+
+诚实地讲，KL OPD **不是完全不会塌缩**。distillation 文献里 KL 训练偶尔也有学生输出退化的报道。差异在于**塌缩盆地的吸引域大小**：
+
+| Loss | 塌缩盆地占目标景观的比例 | 塌缩动力学 |
+|---|---|---|
+| OAD on-policy | **大**（min 原谅 + 前缀分布失控）| **10 步内雪崩**（exp_012 实证）|
+| KL mixed on-policy | 小（forward+reverse 双向压制）| 缓慢漂移，通常被 checkpoint / early stop catch |
+| KL reverse only | 中（只有 mode-avoiding 一路防御）| 比 KL mixed 略不稳 |
+| KL forward only | 小（最强的"恢复支持集"压力）| 长尾爆炸 dominate，工程上数值不稳 |
+
+**关键洞察**：OAD 不是"引入了一个 KL 没有的塌缩"，而是**把一个 KL 偶尔有但被 dominate 住的塌缩盆地放大了**。
+
+### H.7 对 §G.7 候选修复方向的硬约束
+
+如果"KL 不塌缩"的机理是"对学生支持集外质量爆炸惩罚"，那**任何不引入这种惩罚的修复都治不了根**：
+
+| §G.7 候选方向 | 是否引入"恢复支持集"梯度 | 评价 |
+|---|---|---|
+| A1（用 TVD 不取 -log）| ❌ TVD 仍有界 | 治不了 |
+| A2（floor on $A_t$）| ❌ 只限 loss 下界，不改梯度方向 | 治不了 |
+| B（难前缀加权）| ❌ 不改 $\min$ 的宽容性 | 治不了 |
+| **C3（反向 KL 到教师）**| ✅ **正是 §H.3.3 的反 KL** | **唯一对症的 loss-side 修复** |
+| C1（学生 entropy 正则）| 🟡 间接（鼓励学生分布展开）| 部分对症 |
+| C2（KL 到初始学生）| 🟡 防御止血 | 限制学生进步，治标 |
+| D 类（混合 rollout / 截断 on-policy）| ✅ 从 rollout 分布断绝入口 | **绕过 loss 问题** |
+| E1（JSD）| ❌ JSD 也是有界量 | 治不了 |
+
+**结论**：本附录把 §G.7 修复路线**砍掉了 5/8 个选项**——真正对症的只有 **C3 和 D 类**。
+
+### H.8 这也说明了 OAD 的天然适用场景
+
+**离线蒸馏（teacher rollout 上的 distillation）**：
+- prefix 分布由教师 rollout 决定，不被学生自己污染
+- OAD 的"宽容性"变成 **feature**——避免 KL 长尾爆炸引起的数值不稳
+- ✅ OAD 应该 work，且优于 KL
+
+**On-policy 蒸馏（student rollout）**：
+- prefix 分布由学生自己决定，OAD 的宽容性被学生**利用**
+- ❌ OAD 不应该单独使用，必须配 §H.7 的 C3 或 D 类修复
+
+### H.9 对论文叙事的含义
+
+不要把 OAD 卖成"**KL 的替代品**"，应该卖成"**prefix 分布可信时的 KL 替代品**"。
+
+这把 §G.4 的负面发现转化为一个**正面的方法论贡献**——**OAD 暴露了"loss 函数 vs prefix 分布"的耦合关系**，这是 distillation 文献里没人系统讨论过的视角。
+
+具体论文卖点的三段式：
+1. **离线 KD 视角**：OAD 在 prefix 分布外生时严格优于 KL（§3 理论 + 离线实验）
+2. **on-policy 退化**：当 prefix 分布由学生自己决定时，OAD 的"宽容性"导致 §G 描述的塌缩——这是 distillation 文献里第一次系统记录此机理
+3. **修复方向**：C3 / D 类修复（§H.7）恢复 KL 的"严师"防御，同时保留 OAD 的数值稳定性
+
+### H.10 与 §G 的关系
+
+- §G 给出**现象 + 第一性原理机理**（学生侧）
+- §H 给出**对偶机理**（KL 侧）和**修复路线的理论硬约束**
+- 两节一起构成 OAD on-policy 失效的**完整学术叙事**——比单独的 §G 更有论文价值
+
+---
+
+## 附录 I：Entropy-Matching KL（候选下一代 loss，未发表方向）
+
+> §G/§H 把 OAD on-policy 塌缩定位为"学生熵失控"问题：OAD 的 $\min$ 操作消除了 KL 的反塌缩梯度，学生在 on-policy 自反馈下把 $H(\pi_S)$ 从 ~5 bits 单调推到 ~0 bits。
+>
+> 本附录提出一个**未发表方向**：显式让学生在每个 prefix 上的 entropy 匹配教师，作为 OAD 与 KL 之外的第三条路。本节只做方案 sketch，**未实现、未验证**。
+
+### I.1 动机：文献定位
+
+mixing 路线（§I 隐式分类）已被 GKD（ICLR 2024 的 Generalized JSD）和 DistiLLM（ICML 2024 的 Skew-KL）覆盖——本质都是**用 $M = β p_T + (1-β) p_S$ 给 KL 的分母兜底**，属于"修补 KL"。
+
+**熵路线在 on-policy LLM distillation 上是真空白**：
+- 经典 KD 在 offline + teacher rollout 下，prefix 分布由教师给定 ⇒ $H(\pi_S)$ 在难 prefix 上自然会被推高（因为教师在那里高熵）⇒ **entropy matching 是 KL 的 implicit byproduct**
+- 只有在 **on-policy + 学生改写 prefix 分布** 时，这条 implicit 约束才断裂——这正好是 §G 暴露的情境
+- "Entropy-matching distillation"在 KD 文献里有零散应用，但**专门针对 on-policy LLM distillation 的 dedicated 工作目前未见**
+
+### I.2 损失函数定义
+
+对学生 on-policy 轨迹的每个位置 $t$：
+
+$$
+\mathcal{L}_{\text{EM-KL}} = \underbrace{\text{KL}_{\text{mixed}}(\pi_T, \pi_S | x_{<t})}_{\text{对齐项}} + \lambda \cdot \underbrace{\big| H(\pi_S | x_{<t}) - H(\pi_T | x_{<t}) \big|}_{\text{熵匹配项}}
+$$
+
+其中：
+- $H(\pi | x_{<t}) = -\sum_y p(y|x_{<t}) \log p(y|x_{<t})$ 是 prefix-conditioned entropy
+- $\lambda$ 控制熵匹配强度；初始建议 $\lambda \in \{0.01, 0.1, 1.0\}$ 扫
+- 对齐项可以用现有 KL mixed（最稳）、Skew-KL（数值更稳）或 GJSD（理论最干净）
+
+### I.3 核心机理：为什么这能堵住塌缩入口
+
+回 §G.4 塌缩机理：
+
+> 学生通过"塌缩到窄通道"降 OAD loss
+
+**用熵语言重述**：学生在降 loss 的过程中，$H(\pi_S)$ 也在单调下降——从初始的 ~5 bits 跌到 collapsed state 的 ~0 bits。
+
+EM-KL 的熵匹配项**显式锁住这条逃避维度**：
+
+| 情境 | 教师熵 $H(\pi_T)$ | 学生熵约束 |
+|---|---|---|
+| 难前缀（推理中段）| 高（教师 top-1 ≈ 0.3）| **学生必须高熵**——不能塌缩到 top-1 |
+| 简单前缀（"The answer is "）| 低（教师 top-1 > 0.9）| 学生熵也低——不强求多样性 |
+
+**核心好处**：熵匹配是 **prefix-conditioned** 的——自动适应每个位置应有的不确定性，不需要全局 entropy floor 这种粗粒度阈值。
+
+### I.4 与 OAD / KL / mixing 路线的机理对比
+
+| 方法 | 反塌缩梯度来源 | 长尾爆炸 | top-k 偏差 | 关键弱点 |
+|---|---|---|---|---|
+| KL forward | $p_T(y)/p_S(y) \to \infty$ when $p_S \to 0$ | ❌ +∞ | ❌ 无界 | 数值不稳 |
+| KL reverse | mode-avoiding when $p_S$ over-concentrated | ✅ 有界 | ❌ 无界 | mode-seeking |
+| KL mixed | 上述双重 | ❌ 部分爆炸 | ❌ 无界 | NeMo-RL 默认 |
+| OAD | **无**（§G.4 + §H.3.1）| ✅ 有界 | ✅ $\le 1-M_T$ | **on-policy 塌缩** |
+| GJSD / Skew-KL | $M_β \ge β p_T$ 兜底 | ✅ 有界 | ✅ 有界 | 修补 KL，论文 novelty 低 |
+| **EM-KL** | **熵约束显式锁住 $H(\pi_S)$** | ✅ 有界（由对齐项决定）| ✅ 有界 | **未验证** |
+
+**EM-KL 的独特卖点**：它不依赖 KL 的爆炸来防塌缩，也不依赖 OAD 的宽容来获取数值稳定——而是**直接把"学生熵"这个塌缩动力学的核心变量当一阶变量管理**。
+
+### I.5 实现 sketch
+
+#### I.5.1 学生熵的 closed-form 计算
+
+学生侧完整 logits 可见，直接：
+
+```python
+s_log_p_full = s_logits - s_lse.unsqueeze(-1)              # [B, S, V_local]
+s_p_full     = s_log_p_full.exp()
+H_student    = -(s_p_full * s_log_p_full).sum(dim=-1)      # [B, S]，精确
+# TP 下需要 allreduce sum 后再求负
+```
+
+**学生熵无截断偏差**——这是 EM-KL 相对 OAD/KL 的优势：学生侧从未需要 top-k 估计。
+
+#### I.5.2 教师熵的 top-k 估计
+
+教师只有 top-k logits。教师熵分两部分：
+
+$$
+H(\pi_T) = -\sum_{y \in \text{top-k}} p_T(y) \log p_T(y) - \sum_{y \notin \text{top-k}} p_T(y) \log p_T(y)
+$$
+
+**Path A（路径 B 未启用时）**：tail 用 uniform 假设：
+
+```python
+# 教师概率用 top-k 估计（同 OAD 路径 A）
+t_log_p_topk = t_topk_logits - t_lse.unsqueeze(-1)         # [B, S, k]
+t_p_topk     = t_log_p_topk.exp()
+H_teacher_topk = -(t_p_topk * t_log_p_topk).sum(dim=-1)    # top-k 部分
+
+# tail 部分：假定均匀分布在 V-k 个 token 上
+M_T = t_p_topk.sum(dim=-1)                                  # ≈ 1.0
+tail_mass = (1.0 - M_T).clamp_min(0.0)
+H_teacher_tail = tail_mass * (-tail_mass.log() + math.log(vocab_size - k))
+# 实际应该是 -tail_mass * log(tail_mass / (V-k))，但 tail_mass 接近 0 时数值需小心
+
+H_teacher = H_teacher_topk + H_teacher_tail                # [B, S]
+```
+
+**Path B（精确教师 logsumexp 可用）**：tail 估计更精确。实测 v3.3 路径 B 下 `teacher_topk_mass = 0.9999`，所以 tail 项 ≈ $(0.0001) \cdot 17 \approx 0.002$ bits，可忽略。
+
+#### I.5.3 偏差量级
+
+教师熵估计偏差 $\le (1-M_T) \log V$：
+- k=64, Qwen V=152,064, $M_T = 0.9999$ → 偏差 ≤ 0.002 bits
+- k=64, $M_T = 0.99$（理论保证）→ 偏差 ≤ 0.17 bits
+
+**注意**：教师熵偏差比 OAD 的 acceptance 偏差大一个数量级（OAD 是 ≤ 0.01，EM-KL 是 ≤ 0.17 bits）。这是熵方向的内禀工程代价。Path B 下可降到 0.002，问题不大。
+
+#### I.5.4 完整 loss
+
+```python
+class EMKLLossFn(LossFunction):
+    """Entropy-Matching KL Distillation Loss.
+
+    L = KL_mixed(π_T, π_S) + λ · |H(π_S) - H(π_T)|
+
+    Path B 下教师 logsumexp 精确，教师熵 top-k 偏差 ≤ 0.002 bits（可忽略）。
+    """
+
+    def __init__(self, cfg):
+        self.lambda_entropy = cfg["lambda_entropy"]            # 推荐 0.01-1.0
+        self.kl_type = cfg.get("kl_type", "mixed")             # 复用现有 KL
+        self.mixed_kl_weight = cfg.get("mixed_kl_weight", 0.5)
+        self.eps = cfg.get("eps", 1e-8)
+        # ... 其他和 DistillationLossFn 一致
+
+    def __call__(self, ...):
+        # 1. 复用现有 DistillationLossFn 的 KL 项（取得 kl_per_token）
+        kl_per_token = compute_kl_mixed(...)                   # [B, S]
+
+        # 2. 学生熵（精确）
+        s_log_p_full = s_logits - s_lse.unsqueeze(-1)
+        s_p_full     = s_log_p_full.exp()
+        H_student    = -(s_p_full * s_log_p_full).sum(dim=-1)
+        # TP 下 allreduce
+
+        # 3. 教师熵（top-k 估计 + tail uniform）
+        H_teacher    = compute_teacher_entropy_topk(t_topk_logits, t_lse, ...)
+
+        # 4. 熵匹配项
+        entropy_diff = (H_student - H_teacher).abs()           # [B, S]
+
+        # 5. 合并 + mask + CP 切分 + 归约（与 KL 完全一致）
+        per_token_loss = kl_per_token + self.lambda_entropy * entropy_diff
+        ...
+
+        # 6. 监控指标
+        metrics = {
+            "loss":                  loss.detach(),
+            "kl_loss":               (kl_per_token * mask).sum() / n_valid,
+            "entropy_diff_mean":     (entropy_diff * mask).sum() / n_valid,
+            "H_student_mean":        (H_student * mask).sum() / n_valid,
+            "H_teacher_mean":        (H_teacher * mask).sum() / n_valid,
+            "H_student_min":         H_student[mask.bool()].min() if mask.any() else 0.0,
+        }
+```
+
+### I.6 关键监控指标（防塌缩诊断）
+
+EM-KL 设计本身就**自带塌缩诊断指标**——这是它相对 OAD 监控盲点（§G.5）的一大优势：
+
+| 指标 | 健康轨迹 | 异常信号 | 解读 |
+|---|---|---|---|
+| `H_student_mean` | 与 $H_{\text{teacher\_mean}}$ 同步 | 急剧下降 | 学生塌缩前兆 |
+| `H_student_min` | $\ge 0.5$ bits | $\to 0$ | 至少一个 prefix 上学生塌缩 |
+| `entropy_diff_mean` | 单调下降至小值 | 上升 | 熵匹配项失效 |
+| `kl_loss` 与 `entropy_diff_mean` 比例 | 平衡 | KL 主导 | $\lambda$ 太小，需调大 |
+
+**关键性质**：与 OAD 的所有监控指标都是"前缀分布给定下的对齐质量"不同，`H_student_*` **测的是学生分布本身的性质**——前缀分布退化的瞬间就反映在 `H_student_min` 上。**这是 §G.5 监控盲点的天然解药**。
+
+### I.7 与 §G/§H 的衔接：完整学术叙事
+
+EM-KL 不是孤立的 ad-hoc 修复——它的提出建立在 §G/§H 的失败分析上：
+
+1. **§G**：OAD 在 on-policy 下塌缩 = 学生熵失控
+2. **§H**：KL 在 on-policy 下稳定 = 长尾爆炸**隐式**锁住学生熵
+3. **§I（EM-KL）**：**显式**用熵匹配锁住学生熵——既不依赖 KL 的爆炸，也不依赖 OAD 的宽容
+
+**论文卖点（如果 EM-KL work）**：
+> "我们从 OAD on-policy 失败的机理分析出发，识别出'学生熵控制'是 on-policy distillation 的关键变量，并提出 Entropy-Matching KL 作为第一种**显式**控制熵的 distillation 目标。EM-KL 同时保留了 KL 的反塌缩防御与 OAD 的数值稳定性，且自带塌缩诊断指标，无需依赖外部 reward signal 或 rollout 分析。"
+
+这条叙事比纯 incremental 改进（如 GJSD/Skew-KL 的"修补 KL 长尾爆炸"）novelty 更高。
+
+### I.8 风险与待验证项
+
+#### I.8.1 已识别的两个失败模式
+
+**(1) 教师熵估计偏差**
+- Path A 下 ≤ $(1-M_T) \log V$，约 0.17 bits（k=64, $M_T=0.99$）
+- Path B 下降到 ≤ 0.002 bits
+- **对策**：v3.2 已切到 Path B，工程上不构成问题
+
+**(2) 学生熵的梯度方差**
+- $H(\pi_S) = -\sum p \log p$ 在 $p$ 接近 0 或 1 时梯度大
+- 塌缩态下 $H_{\text{student}}$ 梯度反而**强**——这是 feature（推学生反塌缩），但可能引入训练抖动
+- **对策**：必要时在 entropy 项前加 gradient clipping，或对 $H_{\text{student}}$ 用 entropy 上界（如 $\log V$）做归一化
+
+#### I.8.2 未验证的核心假设
+
+EM-KL 还**未实现、未跑实验**，以下假设需后续验证：
+
+| 假设 | 验证方法 |
+|---|---|
+| $\lambda$ 存在一个 sweet spot 让 KL 和 entropy 项都不主导 | 扫 $\lambda \in \{0.01, 0.1, 1.0, 10.0\}$ |
+| EM-KL 不出现 §G 类塌缩 | 跑 exp_012 同配置 ≥ 50 step，看 `H_student_min` 是否保持 > 0.5 |
+| EM-KL 在 GSM8K 上不劣化于 KL mixed | Phase 3 完整对照 |
+| 熵匹配在难前缀上的梯度是否真能阻止"提前 \boxed{} 结束"行为 | rollout 文本分析（同 §G.2 协议）|
+
+### I.9 实验路线建议
+
+如果决定上 EM-KL，建议路线：
+
+1. **Sanity baseline**：跑 Skew-KL（$\alpha=0.1$）+ KL mixed 作为文献对照（共 2 个 baseline run）
+2. **EM-KL 主实验**：扫 $\lambda \in \{0.01, 0.1, 1.0\}$，共 3 个 run
+3. **消融 1**：EM-KL 但 entropy 项改用 squared loss（$\| \cdot \|^2$ 而非 $|\cdot|$），看是否更稳
+4. **消融 2**：EM-KL 但只在高熵 token 上加 entropy 项（结合 §G.7 候选 C 的 token-entropy-weighting）
+5. **关键对照**：exp_012 同 fresh-start 配置下，所有方法是否都塌缩
+
+每个 run 约 1000 step / 2-3 天，总成本约 3 周（GPU 集群）。
+
+### I.10 状态
+
+🟢 **未实现** —— 本附录只是方案 sketch，作为 §G.7 候选 C3 的具体化路线之一记录在案
+
+⏳ **决策**：是否实现 EM-KL，需在 §G.10 列出的三件事完成后判断：
+- KL baseline 同配置同步数对照（验证 OAD 特有 vs setup 共因）
+- exp_012 故意中途重启实验（验证路径依赖假设）
+- 候选 A/B/C/D 选型
+
+EM-KL 是 C3（反向 KL）和 C1（学生熵正则）的"加法版"——如果 §G.10 的实验显示 C1 路线有潜力，EM-KL 是直接升级；如果 D 类（截断 on-policy 自反馈）已经够用，EM-KL 可推迟。
+
+---
+
+## 附录 J：方案结案——为什么暂不继续 OAD，转向 EM-KL（v2 文档）
+
+> 本附录是 BASIC_OAD_PROPOSAL.md 的结案陈述。后续工作在 `BASIC_EM_KL_PROPOSAL.md` 中展开。
+
+### J.1 当前问题（一句话）
+
+**OAD on-policy 训练存在结构性脆弱性**——在 fresh start 下 ~10 step 内可重现地塌缩到字符层重复（exp_012，§G），且 OAD 自身的全部监控指标对塌缩失明（§G.5）。
+
+### J.2 为什么不继续用 OAD
+
+按 §G/§H/§I 的累积论证：
+
+1. **病根在目标函数层面**（§G.4）：OAD 的 $\min$ 操作消除了 KL 在 $p_S \to 0$ 时的反塌缩梯度——这不是超参问题，是结构问题
+2. **OAD 自身监控失明**（§G.5）：所有 OAD 指标都是"条件于学生 rollout 前缀"的对齐质量，而病根是**前缀分布本身**正在恶化——任何"基于前缀条件分布"的指标都看不见
+3. **§G.7 候选修复中 5/8 不对症**（§H.7 硬约束）：只有 C3（反向 KL）或 D 类（截断 on-policy 自反馈）能治根；其余方向治标
+4. **OAD 离线 KD 仍然 work**（exp_011 acceptance=0.987）——但 NeMo-RL 的核心使用场景是 on-policy distillation，离线场景不是本期目标
+
+**结论**：在 on-policy 设定下，OAD 不是 KL 的上位替代——是 KL 的**侧位互补**（离线 ✅，on-policy ❌）。
+
+### J.3 为什么转向 EM-KL
+
+附录 I 已经详细论证。一句话总结：
+
+> EM-KL 把 §G/§H 的失败/成功机理升级为一个**显式控制变量**——学生熵。既不依赖 KL 的爆炸（数值稳定），也不依赖 OAD 的宽容（防塌缩），且**自带塌缩诊断指标**（`H_student_min`）。
+
+文献上熵路线在 on-policy LLM distillation 是真空白，论文 novelty 较高。
+
+### J.4 OAD 工作的剩余价值
+
+虽然 OAD 不作为主线推进，但 v1（本文档）的工作并非沉没成本：
+
+| 资产 | 用途 |
+|---|---|
+| §G 塌缩动力学诊断 | EM-KL 论文 motivation 章节核心素材 |
+| §H KL 机理对照 | 论文 method 章节理论铺垫 |
+| §B/D/E/F OAD 路径 B + sum/count 监控架构 | 直接复用到 EM-KL 实现 |
+| `vocab_cp_logsumexp` helper | EM-KL 学生熵 closed-form 计算依赖 |
+| `train_oad.sh` + checkpoint 续训机制 | 直接改 yaml 即可切到 EM-KL |
+| exp_011 / exp_012 数据 | EM-KL 主实验的对照点 |
+
+工程上 EM-KL 实施约 **~120 行**（复用 OAD 的 v3.3 架构），比 OAD 当时的 ~280 行少一半。
+
+### J.5 后续工作位置
+
+✅ **本文档（BASIC_OAD_PROPOSAL.md）**：作为 OAD 工作的完整记录与结案，不再追加。
+
+📄 **下一阶段（BASIC_EM_KL_PROPOSAL.md）**：v2 文档，从附录 I 的 sketch 开始展开为完整提案，包括：
+- 复用本文档 §G/§H 作为 motivation
+- 完整实现细节（含 NeMo-RL 集成路径）
+- 实验设计（含 OAD/KL/Skew-KL/GJSD 四方对照）
+- Phase 1/2/3 验证计划
+
