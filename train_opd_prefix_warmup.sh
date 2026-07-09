@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Prefix-Length Warmup 训练脚本 (Idea 3).
-# See docs/design-docs/opd-improvements-proposal.md.
+# See opd-improvements-proposal.md.
 #
 # 用法：
 #   bash train_opd_prefix_warmup.sh              # 默认跑 E-B1 (stepwise 4 段)

@@ -657,7 +657,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
 
 # ---------------------------------------------------------------------------
 # Prefix-length warmup (Idea 3) — pure helpers.
-# See docs/design-docs/opd-improvements-proposal.md.
+# See opd-improvements-proposal.md at repo root.
 # ---------------------------------------------------------------------------
 
 

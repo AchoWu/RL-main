@@ -1,5 +1,5 @@
 # Idea 3: prefix-length warmup for on-policy distillation.
-# See docs/design-docs/opd-improvements-proposal.md.
+# See opd-improvements-proposal.md at repo root.
 #
 # Inherits everything from distillation_math.yaml, then attaches the
 # prefix_length_warmup block. Base config stays untouched so the default

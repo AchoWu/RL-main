@@ -78,7 +78,7 @@ class PrefixLengthWarmupStepConfig(TypedDict):
 class PrefixLengthWarmupConfig(TypedDict, total=False):
     """Idea 3: restrict distillation loss to a prefix of each student rollout.
 
-    See docs/design-docs/opd-improvements-proposal.md for design rationale.
+    See opd-improvements-proposal.md at repo root for design rationale.
     """
 
     mode: str  # "none" | "fixed" | "stepwise"
@@ -136,7 +136,7 @@ def _resolve_prefix_ratio(
     - mode="stepwise": step through sorted schedule entries; each entry applies
       while global_step / max_num_steps <= its `until_step_frac`.
 
-    See docs/design-docs/opd-improvements-proposal.md §2.3.
+    See opd-improvements-proposal.md §2.3.
     """
     if warmup_cfg is None:
         return 1.0
@@ -781,7 +781,7 @@ def distillation_train(
                 # inference on tokens that will not contribute to the loss (not
                 # implemented yet — currently teacher still runs on full seq;
                 # the mask alone suffices to change the loss).
-                # See docs/design-docs/opd-improvements-proposal.md.
+                # See opd-improvements-proposal.md.
                 warmup_cfg = cast(
                     Optional[PrefixLengthWarmupConfig],
                     master_config["distillation"].get("prefix_length_warmup"),
