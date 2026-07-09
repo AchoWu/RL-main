@@ -70,6 +70,22 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+class PrefixLengthWarmupStepConfig(TypedDict):
+    until_step_frac: float  # apply this ratio for global_step / max_num_steps <= this value
+    prefix_ratio: float  # fraction of per-sample response length to keep in loss
+
+
+class PrefixLengthWarmupConfig(TypedDict, total=False):
+    """Idea 3: restrict distillation loss to a prefix of each student rollout.
+
+    See docs/design-docs/opd-improvements-proposal.md for design rationale.
+    """
+
+    mode: str  # "none" | "fixed" | "stepwise"
+    fixed_prefix_ratio: float  # only used when mode == "fixed"
+    stepwise_schedule: list[PrefixLengthWarmupStepConfig]  # only used when mode == "stepwise"
+
+
 class DistillationConfig(TypedDict):
     # Training configuration
     num_prompts_per_step: int
@@ -83,6 +99,7 @@ class DistillationConfig(TypedDict):
     max_val_samples: int
     topk_logits_k: int
     seed: int
+    prefix_length_warmup: NotRequired[PrefixLengthWarmupConfig]
 
 
 class DistillationSaveState(TypedDict):
@@ -105,6 +122,77 @@ def _default_distillation_save_state() -> DistillationSaveState:
         "consumed_samples": 0,
         "total_valid_tokens": 0,
     }
+
+
+def _resolve_prefix_ratio(
+    warmup_cfg: Optional["PrefixLengthWarmupConfig"],
+    global_step: int,
+    max_num_steps: int,
+) -> float:
+    """Return the current prefix keep-ratio in (0, 1]. Returns 1.0 when disabled.
+
+    - mode="none": always 1.0 (feature off).
+    - mode="fixed": constant ratio from cfg["fixed_prefix_ratio"].
+    - mode="stepwise": step through sorted schedule entries; each entry applies
+      while global_step / max_num_steps <= its `until_step_frac`.
+
+    See docs/design-docs/opd-improvements-proposal.md §2.3.
+    """
+    if warmup_cfg is None:
+        return 1.0
+    mode = warmup_cfg.get("mode", "none")
+    if mode == "none":
+        return 1.0
+    if mode == "fixed":
+        ratio = float(warmup_cfg["fixed_prefix_ratio"])
+        return max(min(ratio, 1.0), 0.0)
+    if mode == "stepwise":
+        schedule = warmup_cfg["stepwise_schedule"]
+        # Interpret step_frac against max_num_steps; clamp to [0, 1].
+        frac = 0.0 if max_num_steps <= 0 else min(global_step / max_num_steps, 1.0)
+        # Assume schedule is authored in ascending order by until_step_frac.
+        for entry in schedule:
+            if frac <= float(entry["until_step_frac"]):
+                return max(min(float(entry["prefix_ratio"]), 1.0), 0.0)
+        # Past the last entry: keep the last ratio (should typically be 1.0).
+        return max(min(float(schedule[-1]["prefix_ratio"]), 1.0), 0.0)
+    raise ValueError(f"Unknown prefix_length_warmup mode: {mode!r}")
+
+
+def _apply_prefix_length_warmup_(
+    token_mask: torch.Tensor,
+    prefix_ratio: float,
+) -> tuple[torch.Tensor, int, int]:
+    """In-place-style helper: zero out the tail of each row's response tokens.
+
+    A "response token" is any position with token_mask == 1 (assistant-generated).
+    We keep only the first `ceil(prefix_ratio * n_response)` response tokens per
+    sample; downstream `global_valid_toks` recomputes from the modified mask, so
+    loss normalization stays consistent (design-doc §3.3, choice B).
+
+    Returns (new_token_mask, total_response_tokens, kept_response_tokens) for
+    metrics. The original tensor is not mutated; a new tensor is returned.
+    """
+    if prefix_ratio >= 1.0:
+        n_kept = int(token_mask.sum().item())
+        return token_mask, n_kept, n_kept
+
+    # Per-row cumulative count of response tokens: position i (1-indexed among
+    # response tokens) is kept iff i <= ceil(ratio * total_response_in_row).
+    mask_int = token_mask.to(torch.int64)
+    response_totals = mask_int.sum(dim=1, keepdim=True)  # [B, 1]
+    # ceil(ratio * n); using floor((n * num + den - 1) / den) with integer math
+    # to avoid float drift.
+    num = int(round(prefix_ratio * 1_000_000))
+    den = 1_000_000
+    keep_counts = (response_totals * num + (den - 1)) // den  # [B, 1]
+
+    cum = mask_int.cumsum(dim=1)  # [B, S]; only counts response positions
+    keep = (cum <= keep_counts) & (mask_int == 1)
+    new_mask = torch.where(
+        mask_int == 1, keep.to(token_mask.dtype), token_mask
+    )
+    return new_mask, int(response_totals.sum().item()), int(keep.sum().item())
 
 
 class MasterConfig(TypedDict):
@@ -688,6 +776,36 @@ def distillation_train(
                     )
                     train_data.to("cpu")
 
+                # Idea 3: prefix-length warmup. Zero out tail response tokens
+                # BEFORE teacher top-k is computed, so we can also skip teacher
+                # inference on tokens that will not contribute to the loss (not
+                # implemented yet — currently teacher still runs on full seq;
+                # the mask alone suffices to change the loss).
+                # See docs/design-docs/opd-improvements-proposal.md.
+                warmup_cfg = cast(
+                    Optional[PrefixLengthWarmupConfig],
+                    master_config["distillation"].get("prefix_length_warmup"),
+                )
+                prefix_ratio = _resolve_prefix_ratio(
+                    warmup_cfg,
+                    global_step=total_steps,
+                    max_num_steps=master_config["distillation"]["max_num_steps"],
+                )
+                original_token_mask = train_data["token_mask"]
+                new_token_mask, resp_total, resp_kept = _apply_prefix_length_warmup_(
+                    original_token_mask, prefix_ratio
+                )
+                train_data["token_mask"] = new_token_mask
+                # Only thread the pre-warmup mask through when it actually differs;
+                # this keeps baseline (mode=none) memory/metrics identical to before.
+                if prefix_ratio < 1.0 and resp_kept < resp_total:
+                    train_data["token_mask_pre_warmup"] = original_token_mask
+                prefix_warmup_metrics = {
+                    "prefix_ratio_current": prefix_ratio,
+                    "prefix_response_tokens_total": resp_total,
+                    "prefix_response_tokens_kept": resp_kept,
+                }
+
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
                     teacher_policy.prepare_for_lp_inference()
@@ -746,6 +864,7 @@ def distillation_train(
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
+                    **prefix_warmup_metrics,
                 }
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():
@@ -755,10 +874,23 @@ def distillation_train(
                         "global_valid_seqs",
                         "global_valid_toks",
                         "mean_prompt_length",
+                        "prefix_ratio_current",
                     }:
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
+
+                # Idea 3 diagnostic: convert per-mb sums into weighted means.
+                # Missing keys (baseline / mode=none) leave the block a no-op.
+                _pv = metrics.pop("prefix_valid_tokens", 0)
+                _ps = metrics.pop("prefix_kl_sum", 0.0)
+                _tv = metrics.pop("tail_valid_tokens", 0)
+                _ts = metrics.pop("tail_kl_sum", 0.0)
+                if _pv > 0:
+                    metrics["prefix_kl_mean"] = _ps / _pv
+                if _tv > 0:
+                    metrics["tail_kl_mean"] = _ts / _tv
+                    metrics["tail_valid_tokens"] = int(_tv)
                 metrics.update(rollout_metrics)
                 total_valid_tokens += metrics["global_valid_toks"]
 

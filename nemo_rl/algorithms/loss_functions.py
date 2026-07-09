@@ -976,6 +976,12 @@ class DistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     teacher_topk_logits: torch.Tensor
     teacher_topk_indices: torch.Tensor
+    # Idea 3 diagnostic: if the prefix-length warmup zeroed some response
+    # tokens, this holds the pre-warmup mask so the loss can report
+    # prefix_kl_mean vs tail_kl_mean (whether the tail signal is actually
+    # noisier than the prefix — the core testable hypothesis of the proposal).
+    # If absent, the diagnostic is skipped.
+    token_mask_pre_warmup: NotRequired[torch.Tensor]
 
 
 class DistillationLossFn(LossFunction):
@@ -1222,5 +1228,28 @@ class DistillationLossFn(LossFunction):
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
             "num_valid_samples": int(batch_size),
         }
+
+        # Idea 3 diagnostic: compare KL on the kept prefix vs the dropped tail.
+        # Emitted only when a pre-warmup mask was threaded through and it
+        # actually differs from the current mask; otherwise this reduces to
+        # baseline behavior with no extra output.
+        # We emit SUMS and token counts so the outer loop can compute a proper
+        # weighted mean across microbatches (mean-of-means would be biased when
+        # mb sizes differ).
+        if (
+            "token_mask_pre_warmup" in data
+            and "token_mask" in data
+            and "sample_mask" in data
+        ):
+            pre_mask_full = data["token_mask_pre_warmup"][:, 1:]
+            pre_mask = pre_mask_full[:, :max_len].to(mask.dtype)
+            sample_mask_b = sample_mask.unsqueeze(-1)
+            # Tail = tokens that were valid before warmup but got zeroed by it.
+            tail_mask = (pre_mask * (1.0 - token_mask.to(pre_mask.dtype))) * sample_mask_b
+            per_token_kl_d = per_token_kl.detach()
+            metrics["prefix_kl_sum"] = float((per_token_kl_d * mask).sum().item())
+            metrics["prefix_valid_tokens"] = int(mask.sum().item())
+            metrics["tail_kl_sum"] = float((per_token_kl_d * tail_mask).sum().item())
+            metrics["tail_valid_tokens"] = int(tail_mask.sum().item())
 
         return kl_loss, metrics

@@ -1,0 +1,37 @@
+# Idea 3: prefix-length warmup for on-policy distillation.
+# See docs/design-docs/opd-improvements-proposal.md.
+#
+# Inherits everything from distillation_math.yaml, then attaches the
+# prefix_length_warmup block. Base config stays untouched so the default
+# OPD recipe is bit-exact identical to before this feature landed.
+#
+# To switch experiments (E-A1, E-A2, E-B1, ...), edit only the
+# distillation.prefix_length_warmup block below, or override on the CLI, e.g.:
+#   uv run python examples/run_distillation_math.py \
+#     --config examples/configs/distillation_math_prefix_warmup.yaml \
+#     distillation.prefix_length_warmup.mode=fixed \
+#     distillation.prefix_length_warmup.fixed_prefix_ratio=0.25
+defaults: distillation_math.yaml
+
+checkpointing:
+    checkpoint_dir: "checkpoints/distillation-prefix-warmup-${policy.model_name}"
+
+distillation:
+    # mode="none"     -> preserves base OPD behavior (identical to baseline).
+    # mode="fixed"    -> constant prefix ratio throughout training (E-A*).
+    # mode="stepwise" -> ratio advances through the schedule as
+    #                    global_step / max_num_steps crosses each
+    #                    until_step_frac. The final entry SHOULD use
+    #                    prefix_ratio=1.0 so training ends on the full seq.
+    prefix_length_warmup:
+        mode: "stepwise"
+        fixed_prefix_ratio: 0.5
+        stepwise_schedule:
+            - {until_step_frac: 0.2, prefix_ratio: 0.25}
+            - {until_step_frac: 0.4, prefix_ratio: 0.50}
+            - {until_step_frac: 0.6, prefix_ratio: 0.75}
+            - {until_step_frac: 1.0, prefix_ratio: 1.00}
+
+logger:
+    wandb:
+        name: "distillation-prefix-warmup-${distillation.prefix_length_warmup.mode}-${data.dataset_name}-${policy.model_name}"

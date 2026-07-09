@@ -20,7 +20,9 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
+    _apply_prefix_length_warmup_,
     _default_distillation_save_state,
+    _resolve_prefix_ratio,
     check_vocab_equality,
     distillation_train,
     validate,
@@ -651,3 +653,144 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
         # Configure mocks to skip checkpoint loading
         mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
         setup(master_config, tokenizer, dataset, None)
+
+
+# ---------------------------------------------------------------------------
+# Prefix-length warmup (Idea 3) — pure helpers.
+# See docs/design-docs/opd-improvements-proposal.md.
+# ---------------------------------------------------------------------------
+
+
+class TestResolvePrefixRatio:
+    def test_none_config_returns_full(self):
+        assert _resolve_prefix_ratio(None, global_step=0, max_num_steps=100) == 1.0
+
+    def test_mode_none_returns_full(self):
+        assert (
+            _resolve_prefix_ratio({"mode": "none"}, global_step=5, max_num_steps=100)
+            == 1.0
+        )
+
+    def test_mode_fixed(self):
+        cfg = {"mode": "fixed", "fixed_prefix_ratio": 0.5}
+        assert _resolve_prefix_ratio(cfg, 0, 100) == 0.5
+        assert _resolve_prefix_ratio(cfg, 99, 100) == 0.5
+
+    def test_mode_fixed_clamps(self):
+        cfg = {"mode": "fixed", "fixed_prefix_ratio": 1.5}
+        assert _resolve_prefix_ratio(cfg, 0, 100) == 1.0
+        cfg = {"mode": "fixed", "fixed_prefix_ratio": -0.1}
+        assert _resolve_prefix_ratio(cfg, 0, 100) == 0.0
+
+    def test_mode_stepwise_progression(self):
+        cfg = {
+            "mode": "stepwise",
+            "stepwise_schedule": [
+                {"until_step_frac": 0.2, "prefix_ratio": 0.25},
+                {"until_step_frac": 0.4, "prefix_ratio": 0.50},
+                {"until_step_frac": 0.6, "prefix_ratio": 0.75},
+                {"until_step_frac": 1.0, "prefix_ratio": 1.00},
+            ],
+        }
+        assert _resolve_prefix_ratio(cfg, 0, 100) == 0.25
+        assert _resolve_prefix_ratio(cfg, 20, 100) == 0.25  # boundary inclusive
+        assert _resolve_prefix_ratio(cfg, 21, 100) == 0.50
+        assert _resolve_prefix_ratio(cfg, 40, 100) == 0.50
+        assert _resolve_prefix_ratio(cfg, 55, 100) == 0.75
+        assert _resolve_prefix_ratio(cfg, 90, 100) == 1.00
+
+    def test_mode_stepwise_past_end(self):
+        cfg = {
+            "mode": "stepwise",
+            "stepwise_schedule": [
+                {"until_step_frac": 0.5, "prefix_ratio": 0.5},
+                {"until_step_frac": 1.0, "prefix_ratio": 1.0},
+            ],
+        }
+        # global_step > max_num_steps clamps to last entry.
+        assert _resolve_prefix_ratio(cfg, 200, 100) == 1.0
+
+    def test_mode_stepwise_zero_max_steps(self):
+        cfg = {
+            "mode": "stepwise",
+            "stepwise_schedule": [
+                {"until_step_frac": 1.0, "prefix_ratio": 0.5},
+            ],
+        }
+        # max_num_steps=0 should not divide-by-zero; treat frac as 0.
+        assert _resolve_prefix_ratio(cfg, 0, 0) == 0.5
+
+    def test_unknown_mode_raises(self):
+        with pytest.raises(ValueError, match="Unknown prefix_length_warmup mode"):
+            _resolve_prefix_ratio(
+                {"mode": "bogus"}, global_step=0, max_num_steps=100
+            )
+
+
+class TestApplyPrefixLengthWarmup:
+    def test_ratio_one_is_noop(self):
+        mask = torch.tensor(
+            [
+                [0, 0, 1, 1, 1, 1],
+                [0, 1, 1, 1, 0, 0],
+                [1, 1, 1, 1, 1, 1],
+            ],
+            dtype=torch.int64,
+        )
+        new_mask, total, kept = _apply_prefix_length_warmup_(mask, 1.0)
+        assert torch.equal(new_mask, mask)
+        assert total == kept == int(mask.sum().item())
+
+    def test_ratio_half_keeps_first_half_of_response(self):
+        # Row 0: 4 response tokens at positions 2-5 -> ceil(4*0.5)=2 kept.
+        # Row 1: 3 response tokens at positions 1-3 -> ceil(3*0.5)=2 kept.
+        mask = torch.tensor(
+            [
+                [0, 0, 1, 1, 1, 1],
+                [0, 1, 1, 1, 0, 0],
+            ],
+            dtype=torch.int64,
+        )
+        new_mask, total, kept = _apply_prefix_length_warmup_(mask, 0.5)
+        expected = torch.tensor(
+            [
+                [0, 0, 1, 1, 0, 0],
+                [0, 1, 1, 0, 0, 0],
+            ],
+            dtype=torch.int64,
+        )
+        assert torch.equal(new_mask, expected)
+        assert total == 7
+        assert kept == 4
+
+    def test_prompt_tokens_never_flipped_on(self):
+        mask = torch.tensor([[0, 0, 1, 1, 1, 0]], dtype=torch.int64)
+        new_mask, _, _ = _apply_prefix_length_warmup_(mask, 0.5)
+        assert new_mask[0, 5].item() == 0
+        assert new_mask[0, 0].item() == 0
+        assert new_mask[0, 1].item() == 0
+
+    def test_ceil_semantics(self):
+        mask = torch.tensor([[0, 1, 0]], dtype=torch.int64)
+        new_mask, total, kept = _apply_prefix_length_warmup_(mask, 0.1)
+        assert kept == 1
+        assert total == 1
+        assert new_mask[0, 1].item() == 1
+
+    def test_all_zero_mask(self):
+        mask = torch.zeros((2, 4), dtype=torch.int64)
+        new_mask, total, kept = _apply_prefix_length_warmup_(mask, 0.5)
+        assert torch.equal(new_mask, mask)
+        assert total == 0
+        assert kept == 0
+
+    def test_preserves_dtype(self):
+        mask = torch.tensor([[0, 1, 1, 1, 0]], dtype=torch.float32)
+        new_mask, _, _ = _apply_prefix_length_warmup_(mask, 0.5)
+        assert new_mask.dtype == torch.float32
+
+    def test_response_tokens_kept_are_strict_prefix(self):
+        mask = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1]], dtype=torch.int64)
+        new_mask, _, kept = _apply_prefix_length_warmup_(mask, 0.5)
+        assert kept == 3
+        assert new_mask[0].tolist() == [0, 0, 1, 1, 1, 0, 0, 0]
