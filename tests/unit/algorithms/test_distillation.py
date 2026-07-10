@@ -794,3 +794,78 @@ class TestApplyPrefixLengthWarmup:
         new_mask, _, kept = _apply_prefix_length_warmup_(mask, 0.5)
         assert kept == 3
         assert new_mask[0].tolist() == [0, 0, 1, 1, 1, 0, 0, 0]
+
+
+class TestResolvePrefixRatioCosine:
+    """Cosine warmup: S-shaped curve start -> 1.0 by until_frac, then stays 1.0."""
+
+    def test_starts_at_start_ratio(self):
+        cfg = {
+            "mode": "cosine",
+            "cosine_start_ratio": 0.25,
+            "cosine_warmup_until_frac": 0.3,
+        }
+        assert _resolve_prefix_ratio(cfg, 0, 1000) == pytest.approx(0.25, abs=1e-9)
+
+    def test_reaches_one_at_until_frac(self):
+        cfg = {
+            "mode": "cosine",
+            "cosine_start_ratio": 0.25,
+            "cosine_warmup_until_frac": 0.3,
+        }
+        # global_step == 0.3 * max_num_steps
+        assert _resolve_prefix_ratio(cfg, 300, 1000) == pytest.approx(1.0, abs=1e-9)
+
+    def test_stays_one_after_until_frac(self):
+        cfg = {
+            "mode": "cosine",
+            "cosine_start_ratio": 0.25,
+            "cosine_warmup_until_frac": 0.3,
+        }
+        assert _resolve_prefix_ratio(cfg, 500, 1000) == 1.0
+        assert _resolve_prefix_ratio(cfg, 999, 1000) == 1.0
+
+    def test_midpoint_is_average(self):
+        # progress = 0.5 -> curve = 0.5 * (1 - cos(π/2)) = 0.5
+        # ratio = 0.25 + (1 - 0.25) * 0.5 = 0.625
+        cfg = {
+            "mode": "cosine",
+            "cosine_start_ratio": 0.25,
+            "cosine_warmup_until_frac": 0.4,
+        }
+        # global_step = 0.2 * max = half of warmup phase
+        r = _resolve_prefix_ratio(cfg, 200, 1000)
+        assert r == pytest.approx(0.625, abs=1e-9)
+
+    def test_monotone_increasing(self):
+        cfg = {
+            "mode": "cosine",
+            "cosine_start_ratio": 0.1,
+            "cosine_warmup_until_frac": 0.5,
+        }
+        prev = -1.0
+        for step in range(0, 501, 10):
+            r = _resolve_prefix_ratio(cfg, step, 1000)
+            assert r >= prev - 1e-9, f"non-monotone at step {step}: {r} < {prev}"
+            prev = r
+        # At the endpoint the ratio saturates at 1.0.
+        assert prev == pytest.approx(1.0, abs=1e-9)
+
+    def test_zero_until_frac_returns_full(self):
+        # A degenerate schedule that skips warmup entirely.
+        cfg = {
+            "mode": "cosine",
+            "cosine_start_ratio": 0.25,
+            "cosine_warmup_until_frac": 0.0,
+        }
+        assert _resolve_prefix_ratio(cfg, 0, 1000) == 1.0
+        assert _resolve_prefix_ratio(cfg, 500, 1000) == 1.0
+
+    def test_start_geq_one_returns_full(self):
+        cfg = {
+            "mode": "cosine",
+            "cosine_start_ratio": 1.0,
+            "cosine_warmup_until_frac": 0.3,
+        }
+        assert _resolve_prefix_ratio(cfg, 0, 1000) == 1.0
+        assert _resolve_prefix_ratio(cfg, 100, 1000) == 1.0

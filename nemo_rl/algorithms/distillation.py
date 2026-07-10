@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and limitations.
 # limitations under the License.
 import os
+import math
 import warnings
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
@@ -81,9 +82,15 @@ class PrefixLengthWarmupConfig(TypedDict, total=False):
     See opd-improvements-proposal.md at repo root for design rationale.
     """
 
-    mode: str  # "none" | "fixed" | "stepwise"
+    mode: str  # "none" | "fixed" | "stepwise" | "cosine"
     fixed_prefix_ratio: float  # only used when mode == "fixed"
     stepwise_schedule: list[PrefixLengthWarmupStepConfig]  # only used when mode == "stepwise"
+    # Cosine warmup: prefix_ratio smoothly grows from `cosine_start_ratio` at
+    # step 0 to 1.0 at global_step == cosine_warmup_until_frac * max_num_steps,
+    # then stays at 1.0. Curve is S-shaped: 0.5 * (1 - cos(π * progress)), so
+    # derivatives at both endpoints are 0 (no jump into or out of warmup).
+    cosine_start_ratio: float
+    cosine_warmup_until_frac: float
 
 
 class DistillationConfig(TypedDict):
@@ -135,6 +142,10 @@ def _resolve_prefix_ratio(
     - mode="fixed": constant ratio from cfg["fixed_prefix_ratio"].
     - mode="stepwise": step through sorted schedule entries; each entry applies
       while global_step / max_num_steps <= its `until_step_frac`.
+    - mode="cosine": smoothly interpolate from `cosine_start_ratio` at step 0
+      to 1.0 at step == cosine_warmup_until_frac * max_num_steps (then stay at
+      1.0). S-shaped curve 0.5 * (1 - cos(π * progress)); derivative is 0 at
+      both endpoints, so there is no jump into full-length training.
 
     See opd-improvements-proposal.md §2.3.
     """
@@ -156,6 +167,20 @@ def _resolve_prefix_ratio(
                 return max(min(float(entry["prefix_ratio"]), 1.0), 0.0)
         # Past the last entry: keep the last ratio (should typically be 1.0).
         return max(min(float(schedule[-1]["prefix_ratio"]), 1.0), 0.0)
+    if mode == "cosine":
+        start = float(warmup_cfg["cosine_start_ratio"])
+        until_frac = float(warmup_cfg["cosine_warmup_until_frac"])
+        start = max(min(start, 1.0), 0.0)
+        until_frac = max(min(until_frac, 1.0), 0.0)
+        # Special cases: instant full-length or already-full start.
+        if until_frac <= 0.0 or start >= 1.0:
+            return 1.0
+        frac = 0.0 if max_num_steps <= 0 else min(global_step / max_num_steps, 1.0)
+        progress = min(frac / until_frac, 1.0)
+        # S-shaped: 0 -> 0 (slope 0), 1 -> 1 (slope 0), monotone increasing.
+        curve = 0.5 * (1.0 - math.cos(math.pi * progress))
+        ratio = start + (1.0 - start) * curve
+        return max(min(ratio, 1.0), 0.0)
     raise ValueError(f"Unknown prefix_length_warmup mode: {mode!r}")
 
 

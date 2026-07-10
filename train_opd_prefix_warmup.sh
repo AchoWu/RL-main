@@ -3,10 +3,12 @@
 # See opd-improvements-proposal.md.
 #
 # 用法：
-#   bash train_opd_prefix_warmup.sh              # 默认跑 E-B1 (stepwise 4 段)
-#   MODE=fixed RATIO=0.5 bash train_opd_prefix_warmup.sh   # E-A1
-#   MODE=fixed RATIO=0.25 bash train_opd_prefix_warmup.sh  # E-A2
-#   MODE=none bash train_opd_prefix_warmup.sh              # 基线对照 (等价 E0)
+#   bash train_opd_prefix_warmup.sh                     # 默认 cosine warmup (start=0.25, until=0.3)
+#   MODE=stepwise    bash train_opd_prefix_warmup.sh    # 用 yaml 里的 stepwise schedule
+#   MODE=fixed RATIO=0.5  bash train_opd_prefix_warmup.sh   # E-A1
+#   MODE=fixed RATIO=0.25 bash train_opd_prefix_warmup.sh   # E-A2
+#   MODE=none        bash train_opd_prefix_warmup.sh    # 基线对照 (等价 E0)
+#   MODE=cosine START=0.1 UNTIL=0.4 bash train_opd_prefix_warmup.sh   # 自定义 cosine
 set -euo pipefail
 
 # 环境与代理（与 train_opd.sh 保持一致）
@@ -35,12 +37,16 @@ sed -i 's/PY_EXECUTABLES.AUTOMODEL/PY_EXECUTABLES.SYSTEM/; s/PY_EXECUTABLES.FSDP
 # ====== 结束 ======
 
 # ====== Prefix-length warmup 实验切换 ======
-# MODE   ∈ {none, fixed, stepwise}  — 默认 stepwise（跑 E-B1）
+# MODE   ∈ {none, fixed, stepwise, cosine}  — 默认 cosine
 # RATIO  仅在 MODE=fixed 时使用（E-A1 用 0.5，E-A2 用 0.25）
-MODE="${MODE:-stepwise}"
+# START  仅在 MODE=cosine 时使用，起始 prefix_ratio（默认 0.25）
+# UNTIL  仅在 MODE=cosine 时使用，warmup 结束的 step fraction（默认 0.3）
+MODE="${MODE:-cosine}"
 RATIO="${RATIO:-0.5}"
+START="${START:-0.25}"
+UNTIL="${UNTIL:-0.3}"
 
-echo "▶ Running OPD prefix-length warmup: MODE=${MODE} RATIO=${RATIO}"
+echo "▶ Running OPD prefix-length warmup: MODE=${MODE} RATIO=${RATIO} START=${START} UNTIL=${UNTIL}"
 
 python examples/run_distillation_math.py \
     --config examples/configs/distillation_math_prefix_warmup.yaml \
@@ -51,4 +57,6 @@ python examples/run_distillation_math.py \
     teacher.logprob_batch_size=2 \
     checkpointing.save_consolidated=true \
     distillation.prefix_length_warmup.mode="${MODE}" \
-    distillation.prefix_length_warmup.fixed_prefix_ratio="${RATIO}"
+    distillation.prefix_length_warmup.fixed_prefix_ratio="${RATIO}" \
+    distillation.prefix_length_warmup.cosine_start_ratio="${START}" \
+    distillation.prefix_length_warmup.cosine_warmup_until_frac="${UNTIL}"
