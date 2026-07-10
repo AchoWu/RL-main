@@ -2,13 +2,25 @@
 # Prefix-Length Warmup 训练脚本 (Idea 3).
 # See opd-improvements-proposal.md.
 #
-# 用法：
-#   bash train_opd_prefix_warmup.sh                     # 默认 cosine warmup (start=0.1, until=0.4)
-#   MODE=stepwise    bash train_opd_prefix_warmup.sh    # 用 yaml 里的 stepwise schedule
-#   MODE=fixed RATIO=0.5  bash train_opd_prefix_warmup.sh   # E-A1
-#   MODE=fixed RATIO=0.25 bash train_opd_prefix_warmup.sh   # E-A2
-#   MODE=none        bash train_opd_prefix_warmup.sh    # 基线对照 (等价 E0)
-#   START=0.25 UNTIL=0.3 bash train_opd_prefix_warmup.sh # 覆盖 cosine 参数
+# 当前配置：cosine warmup, start=0.01, until=0.2
+#
+# 含义：
+#   - 用 S 形余弦曲线控制 prefix_ratio 随训练步数递增。
+#   - 起步 (global_step=0) 时 prefix_ratio=0.01 —— 每条 rollout 只有前 1%
+#     的 response token 参与 distillation loss，后 99% 被 mask 掉；
+#     实际由于 ceil 语义，短序列至少保留 1 个 token。
+#   - 当 global_step / max_num_steps == 0.2 时，prefix_ratio=1.0 —— 之后
+#     全序列都学（回到基线 OPD 行为）。
+#   - 曲线两端导数为 0：起点稳住 0.01，终点稳住 1.0，中间平滑加速；
+#     不存在阶梯 mode 里那种边界跳变。
+#
+# 训练轨迹（max_num_steps=1000, max_num_epochs=3 → 实际 ~942 step）：
+#   step   0     : ratio=0.01   起手前 1% token（极激进）
+#   step 100     : ratio=0.505  曲线中点
+#   step 200     : ratio=1.00   warmup 结束，全序列训练开始
+#   step 200-942 : ratio=1.00   最后 ~79% 训练时长在 full length
+#
+# 切换实验时直接修改下面的 MODE / RATIO / START / UNTIL 变量。
 set -euo pipefail
 
 # 环境与代理（与 train_opd.sh 保持一致）
@@ -36,15 +48,22 @@ ray stop --force 2>/dev/null || true
 sed -i 's/PY_EXECUTABLES.AUTOMODEL/PY_EXECUTABLES.SYSTEM/; s/PY_EXECUTABLES.FSDP/PY_EXECUTABLES.SYSTEM/' /group/40143/howu/RL-main/nemo_rl/distributed/ray_actor_environment_registry.py
 # ====== 结束 ======
 
-# ====== Prefix-length warmup 实验切换 ======
-# MODE   ∈ {none, fixed, stepwise, cosine}  — 默认 cosine
-# RATIO  仅在 MODE=fixed 时使用（E-A1 用 0.5，E-A2 用 0.25）
-# START  仅在 MODE=cosine 时使用，起始 prefix_ratio（默认 0.25）
-# UNTIL  仅在 MODE=cosine 时使用，warmup 结束的 step fraction（默认 0.3）
-MODE="${MODE:-cosine}"
-RATIO="${RATIO:-0.5}"
-START="${START:-0.1}"
-UNTIL="${UNTIL:-0.4}"
+# ====== Prefix-length warmup 实验参数 ======
+# MODE   实验类型：
+#   - "cosine"    S 形余弦 warmup（当前）：由 START / UNTIL 参数决定曲线
+#   - "stepwise"  阶梯 schedule：由 yaml 里的 stepwise_schedule 决定
+#   - "fixed"     固定 prefix_ratio 不变：由 RATIO 参数决定
+#   - "none"      关闭 feature，等价于基线 OPD（loss 覆盖全部 response token）
+# RATIO  只在 MODE=fixed 时生效。E-A1 用 0.5，E-A2 用 0.25。
+# START  只在 MODE=cosine 时生效。step 0 时的 prefix_ratio。
+#          越低 = 起步 warmup 越激进（只学更少 token）
+# UNTIL  只在 MODE=cosine 时生效。global_step / max_num_steps 达到该值时
+#        ratio 到 1.0；之后一直保持 1.0。越高 = warmup 期越长，full-length
+#        训练时间越短。
+MODE="cosine"
+RATIO=0.5
+START=0.01
+UNTIL=0.2
 
 echo "▶ Running OPD prefix-length warmup: MODE=${MODE} RATIO=${RATIO} START=${START} UNTIL=${UNTIL}"
 
