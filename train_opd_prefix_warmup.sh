@@ -3,12 +3,12 @@
 # See opd-improvements-proposal.md.
 #
 # 用法：
-#   bash train_opd_prefix_warmup.sh                     # 默认 cosine warmup (start=0.25, until=0.3)
+#   bash train_opd_prefix_warmup.sh                     # 默认 cosine warmup (start=0.1, until=0.4)
 #   MODE=stepwise    bash train_opd_prefix_warmup.sh    # 用 yaml 里的 stepwise schedule
 #   MODE=fixed RATIO=0.5  bash train_opd_prefix_warmup.sh   # E-A1
 #   MODE=fixed RATIO=0.25 bash train_opd_prefix_warmup.sh   # E-A2
 #   MODE=none        bash train_opd_prefix_warmup.sh    # 基线对照 (等价 E0)
-#   MODE=cosine START=0.1 UNTIL=0.4 bash train_opd_prefix_warmup.sh   # 自定义 cosine
+#   START=0.25 UNTIL=0.3 bash train_opd_prefix_warmup.sh # 覆盖 cosine 参数
 set -euo pipefail
 
 # 环境与代理（与 train_opd.sh 保持一致）
@@ -43,8 +43,8 @@ sed -i 's/PY_EXECUTABLES.AUTOMODEL/PY_EXECUTABLES.SYSTEM/; s/PY_EXECUTABLES.FSDP
 # UNTIL  仅在 MODE=cosine 时使用，warmup 结束的 step fraction（默认 0.3）
 MODE="${MODE:-cosine}"
 RATIO="${RATIO:-0.5}"
-START="${START:-0.25}"
-UNTIL="${UNTIL:-0.3}"
+START="${START:-0.1}"
+UNTIL="${UNTIL:-0.4}"
 
 echo "▶ Running OPD prefix-length warmup: MODE=${MODE} RATIO=${RATIO} START=${START} UNTIL=${UNTIL}"
 
