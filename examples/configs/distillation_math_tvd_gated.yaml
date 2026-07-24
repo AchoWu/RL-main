@@ -1,0 +1,45 @@
+# TVD-gated KL distillation (Idea: use TVD as a filter, not as a loss target).
+#
+# Loss stays KL (forward / reverse / mixed), same as the base distillation_math
+# recipe. On top of that, a per-token TVD gate zeros out tokens whose truncated
+# TVD (1 - sum_y min(p_S, p_T) on the teacher's top-k support) is BELOW a
+# threshold — only tokens where student and teacher disagree the most survive
+# into the loss. This avoids the mode-collapse observed when TVD is *optimized*
+# directly (OAD), while still concentrating gradient on the tokens that most
+# need correction.
+#
+# Requires:
+#   - loss_fn.zero_outside_topk = true   (needs true global student probs)
+#   - Path B teacher logsumexp (DTensor backend; Megatron path currently unsupported)
+#
+# See:
+#   - Gate direction (B): keep iff TVD > threshold
+#   - Threshold sweep 0..1: 0 -> keep all (baseline); 1 -> keep nothing
+#   - Modes: none / fixed / warmup
+defaults: distillation_math.yaml
+
+checkpointing:
+    checkpoint_dir: "checkpoints/distillation-tvd-gated-${policy.model_name}"
+
+loss_fn:
+    type: "kl"
+    kl_type: "mixed"
+    mixed_kl_weight: 0.5
+    zero_outside_topk: true  # REQUIRED for tvd_gate
+
+    tvd_gate:
+        # "none"   -> gate off, baseline KL (byte-identical to base recipe)
+        # "fixed"  -> keep iff TVD_topk > threshold, constant τ
+        # "warmup" -> τ interpolates from start_threshold at step 0 to
+        #             end_threshold at global_step / max_num_steps ==
+        #             warmup_until_frac, then stays at end_threshold.
+        #             Curve is S-shaped cosine (slope 0 at both endpoints).
+        mode: "fixed"
+        threshold: 0.3
+        start_threshold: 0.8
+        end_threshold: 0.1
+        warmup_until_frac: 0.3
+
+logger:
+    wandb:
+        name: "distillation-tvd-gated-${loss_fn.tvd_gate.mode}-${data.dataset_name}-${policy.model_name}"

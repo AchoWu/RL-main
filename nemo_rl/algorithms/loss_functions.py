@@ -964,10 +964,40 @@ class SequencePackingLossWrapper:
         return loss_accum, metrics_accum
 
 
+class TvdGateConfig(TypedDict, total=False):
+    """Config for TVD-based token gating on top of the KL distillation loss.
+
+    Gates the KL loss to only the tokens where the student and teacher
+    disagree the most, using the truncated total-variation distance
+    TVD_topk = 1 - sum_y min(p_S(y), p_T(y)) over the teacher's top-k support
+    as the disagreement signal. This is the OAD `acceptance` quantity turned
+    into a *filter* rather than a loss target — direct OAD optimization was
+    observed to collapse into repetition; using TVD only as a gate leaves
+    the KL loss shape intact.
+
+    Modes:
+        - "none":   no gating (baseline; token_mask is untouched).
+        - "fixed":  keep tokens with TVD > threshold (single scalar).
+        - "warmup": threshold anneals from `start_threshold` at step 0 to
+                    `end_threshold` at global_step / max_num_steps ==
+                    warmup_until_frac, then stays constant. S-shaped cosine
+                    curve (matches prefix_length_warmup cosine mode).
+
+    Reference: opd-improvements-proposal.md (future §), BASIC_OAD_PROPOSAL.md.
+    """
+
+    mode: str  # "none" | "fixed" | "warmup"
+    threshold: float  # used when mode == "fixed"; TVD > threshold ⇒ keep
+    start_threshold: float  # used when mode == "warmup"; τ at step 0
+    end_threshold: float  # used when mode == "warmup"; τ at (and after) warmup_until_frac
+    warmup_until_frac: float  # fraction of max_num_steps to finish annealing
+
+
 class DistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float
     zero_outside_topk: bool
+    tvd_gate: NotRequired[TvdGateConfig]
 
 
 class DistillationLossDataDict(TypedDict):
@@ -977,6 +1007,10 @@ class DistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     teacher_topk_logits: torch.Tensor
     teacher_topk_indices: torch.Tensor
+    # Optional: exact full-vocab logsumexp of the teacher, needed by the TVD
+    # gate to convert teacher_topk_logits into true global probabilities.
+    # Populated by the DTensor teacher worker (see Path B plumbing).
+    teacher_logsumexp: NotRequired[torch.Tensor]
 
 
 class DistillationLossFn(LossFunction):
@@ -993,6 +1027,53 @@ class DistillationLossFn(LossFunction):
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
+
+        # TVD gate: uses the OAD acceptance quantity as a *filter* on which
+        # tokens contribute to the KL loss (not as a loss target itself). The
+        # main training loop stamps `_tvd_gate_state` before each train call
+        # with the current global_step / max_num_steps + resolved threshold.
+        # When mode == "none" (or no gate cfg at all) the gate is off — the
+        # loss is byte-identical to a baseline run.
+        self.tvd_gate_cfg = cfg.get("tvd_gate")
+        self._tvd_gate_state: dict[str, Any] = {
+            "tau": float("-inf"),
+            "mode": "none",
+        }
+
+        # Fail-fast on misconfig at controller construction time: with a gate
+        # configured, we need true global student probs on the teacher's top-k
+        # support, which only zero_outside_topk=True guarantees. Waiting until
+        # the first training step would waste teacher rollout time and Ray
+        # worker init before crashing.
+        gate_mode = (
+            self.tvd_gate_cfg.get("mode", "none")
+            if self.tvd_gate_cfg is not None
+            else "none"
+        )
+        if gate_mode != "none":
+            # Reject unknown modes up-front so users see the full valid list.
+            if gate_mode not in ("fixed", "warmup"):
+                raise ValueError(
+                    f"Unknown tvd_gate.mode={gate_mode!r}. "
+                    "Expected one of: 'none', 'fixed', 'warmup'."
+                )
+            assert self.zero_outside_topk, (
+                "tvd_gate requires loss_fn.zero_outside_topk=true; "
+                f"got {self.zero_outside_topk!r}."
+            )
+            if gate_mode == "fixed":
+                assert "threshold" in self.tvd_gate_cfg, (
+                    "tvd_gate.mode='fixed' requires 'threshold' in config."
+                )
+            else:  # gate_mode == "warmup"
+                for required_key in (
+                    "start_threshold",
+                    "end_threshold",
+                    "warmup_until_frac",
+                ):
+                    assert required_key in self.tvd_gate_cfg, (
+                        f"tvd_gate.mode='warmup' requires {required_key!r} in config."
+                    )
 
     def __call__(
         self,
@@ -1202,15 +1283,73 @@ class DistillationLossFn(LossFunction):
         # [B, S-1, k] → [B, S-1]
         per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
 
-        # Masking and reduction
+        # Masking and reduction.
+        # The optional TVD gate lives entirely inside the branch that has
+        # both token_mask and sample_mask — attempting to gate when there is
+        # no per-token mask is meaningless (per_token_kl.mean() has no notion
+        # of "keep this position").
+        tvd_gate_mode = str(self._tvd_gate_state.get("mode", "none"))
+        tvd_gate_tau = float(self._tvd_gate_state.get("tau", float("-inf")))
+        tvd_gate_active = tvd_gate_mode != "none"
+
         if "token_mask" in data and "sample_mask" in data:
             token_mask = data["token_mask"][:, 1:]
             sample_mask = data["sample_mask"]
             # Align mask length to current per_token_kl
             max_len = per_token_kl.shape[1]
             token_mask = token_mask[:, :max_len]
-            mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
-            # align mask shape to per_token_kl
+            base_mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
+            mask = base_mask
+
+            tvd_topk: Optional[torch.Tensor] = None
+            base_valid_sum: Optional[torch.Tensor] = None
+            kept_valid_sum: Optional[torch.Tensor] = None
+            tvd_sum: Optional[torch.Tensor] = None
+
+            if tvd_gate_active:
+                # Preconditions: gate needs true global student probs on
+                # top-k support (only zero_outside_topk=True path guarantees
+                # this) and exact teacher full-vocab logsumexp (Path B).
+                # __init__ fails fast if `zero_outside_topk=False`, so this
+                # is defense-in-depth for future direct callers.
+                if not self.zero_outside_topk:
+                    raise ValueError(
+                        "tvd_gate requires zero_outside_topk=True (needs true "
+                        "global student probabilities on the top-k support)."
+                    )
+                if "teacher_logsumexp" not in data:
+                    raise KeyError(
+                        "tvd_gate requires `teacher_logsumexp` in train_data "
+                        "(Path B). The teacher worker must return exact "
+                        "full-vocab logsumexp (DTensor backend only)."
+                    )
+                teacher_lse = data["teacher_logsumexp"].to(
+                    device=student_topk_logprobs.device, dtype=torch.float32
+                )  # [B, S]
+                teacher_true_log_p_topk = (
+                    teacher_topk_logits.to(torch.float32) - teacher_lse.unsqueeze(-1)
+                )[:, :-1, :]  # [B, S-1, k]
+                teacher_p_topk_true = teacher_true_log_p_topk.exp()
+                student_p_topk_true = student_topk_logprobs.to(torch.float32).exp()
+                acceptance_topk = torch.minimum(
+                    student_p_topk_true, teacher_p_topk_true
+                ).sum(-1)  # [B, S-1]
+                tvd_topk = (1.0 - acceptance_topk).clamp(0.0, 1.0)  # [B, S-1]
+
+                gate_w = (tvd_topk > tvd_gate_tau).to(base_mask.dtype)
+                # These sums are computed once and reused: mask -> loss, and
+                # base/kept/tvd sums -> diagnostics. Loss uses `global_valid_toks`
+                # (the pre-gate DP-aware count) as its denominator — the gate
+                # only zeros tokens in the numerator, so both loss and gradient
+                # scale by roughly kept_frac. Treat it as an implicit learning
+                # rate scaler; if kept_frac swings (warmup mode) factor it into
+                # your lr schedule.
+                mask = base_mask * gate_w
+                with torch.no_grad():
+                    base_valid_sum = base_mask.sum()
+                    kept_valid_sum = mask.sum()
+                    tvd_sum = (tvd_topk * base_mask).sum()
+
             kl_loss = masked_mean(
                 per_token_kl,
                 mask,
@@ -1223,6 +1362,22 @@ class DistillationLossFn(LossFunction):
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
             "num_valid_samples": int(batch_size),
         }
+
+        # Gate diagnostics: only emitted when the gate ran and per-token mask
+        # was available. Values are RAW SUMS. The outer worker will pre-divide
+        # every loss-fn metric by num_global_batches, and the outer training
+        # loop then applies np.sum across microbatches — that pipeline recovers
+        # true totals for sum-shaped metrics, so downstream can compute
+        #   kept_frac = kept_sum / base_sum
+        #   tvd_mean  = tvd_sum  / base_sum
+        # exactly. NOTE: raw absolute counts are NOT reported (they'd be
+        # true_count / num_global_batches after the pipeline; only the ratio
+        # is invariant). The threshold τ is logged separately by the training
+        # loop, NOT here, to bypass the same pre-divide.
+        if tvd_gate_active and base_valid_sum is not None:
+            metrics["tvd_gate_base_tokens_sum"] = float(base_valid_sum.item())
+            metrics["tvd_gate_kept_tokens_sum"] = float(kept_valid_sum.item())
+            metrics["tvd_topk_sum"] = float(tvd_sum.item())
 
         return kl_loss, metrics
 

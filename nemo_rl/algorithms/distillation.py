@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and limitations.
 # limitations under the License.
 import os
+import math
 import warnings
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
@@ -106,6 +107,50 @@ def _default_distillation_save_state() -> DistillationSaveState:
         "consumed_samples": 0,
         "total_valid_tokens": 0,
     }
+
+
+def _resolve_tvd_gate_threshold(
+    gate_cfg: Optional[dict],
+    global_step: int,
+    max_num_steps: int,
+) -> tuple[str, float]:
+    """Return (mode, threshold) for the TVD gate at the current step.
+
+    - mode="none"   ⇒ threshold=0.0 (gate is a no-op; callers should skip work)
+    - mode="fixed"  ⇒ constant scalar from cfg["threshold"]
+    - mode="warmup" ⇒ S-shaped cosine anneal from start_threshold at step 0
+      to end_threshold at global_step / max_num_steps == warmup_until_frac,
+      then stays at end_threshold. Slope is 0 at both endpoints — no jump
+      when the gate "opens up" at the end of warmup.
+
+    Config-shape validation (required keys per mode, valid mode names) lives
+    in `DistillationLossFn.__init__` — this resolver assumes it's been
+    handed a well-formed config and uses direct dict access. Kept as a pure
+    function (no torch dep) so it can be unit-tested standalone.
+    """
+    if gate_cfg is None:
+        return "none", 0.0
+    mode = gate_cfg.get("mode", "none")
+    if mode == "none":
+        return "none", 0.0
+    if mode == "fixed":
+        tau = float(gate_cfg["threshold"])
+        return "fixed", max(min(tau, 1.0), 0.0)
+    if mode == "warmup":
+        start = float(gate_cfg["start_threshold"])
+        end = float(gate_cfg["end_threshold"])
+        until_frac = float(gate_cfg["warmup_until_frac"])
+        start = max(min(start, 1.0), 0.0)
+        end = max(min(end, 1.0), 0.0)
+        until_frac = max(min(until_frac, 1.0), 0.0)
+        if until_frac <= 0.0:
+            return "warmup", end
+        frac = 0.0 if max_num_steps <= 0 else min(global_step / max_num_steps, 1.0)
+        progress = min(frac / until_frac, 1.0)
+        curve = 0.5 * (1.0 - math.cos(math.pi * progress))
+        tau = start + (end - start) * curve
+        return "warmup", max(min(tau, 1.0), 0.0)
+    raise ValueError(f"Unknown tvd_gate mode: {mode!r}")
 
 
 class MasterConfig(TypedDict):
@@ -725,7 +770,37 @@ def distillation_train(
                     POLICY_GENERATION_STALE = True
 
                 print("▶ Training policy...", flush=True)
+                tvd_gate_threshold_current: Optional[float] = None
                 with timer.time("policy_training"):
+                    # Stamp the TVD gate state on the loss function BEFORE handing
+                    # it to Ray workers. `loss_fn` is picklable and shipped as a
+                    # common kwarg every step, so state stamped here is what each
+                    # worker sees for this step. Skip the stamp entirely when the
+                    # loss has no gate config so baseline runs' pickled loss image
+                    # stays byte-identical to before this feature.
+                    if isinstance(loss_fn, DistillationLossFn) and getattr(
+                        loss_fn, "tvd_gate_cfg", None
+                    ) is not None:
+                        gate_cfg = loss_fn.tvd_gate_cfg
+                        mode, tau = _resolve_tvd_gate_threshold(
+                            gate_cfg,
+                            global_step=total_steps,
+                            max_num_steps=master_config["distillation"][
+                                "max_num_steps"
+                            ],
+                        )
+                        loss_fn._tvd_gate_state = {
+                            "tau": tau if mode != "none" else float("-inf"),
+                            "mode": mode,
+                        }
+                        # Log τ here — NOT via the loss.metrics pipeline. The
+                        # worker unconditionally divides every loss-fn metric by
+                        # num_global_batches (dtensor_policy_worker.py:804), which
+                        # would silently rescale τ. Threshold is a per-step
+                        # scalar, not a per-microbatch sum, so it belongs to the
+                        # outer training-loop metrics dict.
+                        if mode != "none":
+                            tvd_gate_threshold_current = tau
                     # nemo_rl/models/policy/workers/dtensor_policy_worker.py 506
                     train_results = student_policy.train(train_data, loss_fn)
 
@@ -783,6 +858,31 @@ def distillation_train(
                         # Using np.mean instead would compound that pre-division
                         # and shrink probability metrics by ~num_microbatches.
                         metrics[k] = np.sum(v).item()
+
+                # TVD gate diagnostics.
+                # Loss emits base/kept/tvd as raw sums. After the worker's
+                # pre-divide + this loop's np.sum they represent true totals
+                # scaled by 1 (perfectly recovered) for the SAME num_global_batches
+                # (which is why we don't report the absolute counts — the pipeline
+                # only preserves ratios, not integers). Ratios are invariant.
+                #
+                # Threshold is logged directly from the outer stamp (bypasses
+                # the pre-divide pipeline entirely).
+                if tvd_gate_threshold_current is not None:
+                    metrics["tvd_gate_threshold_current"] = tvd_gate_threshold_current
+                if "tvd_gate_base_tokens_sum" in metrics:
+                    _base = metrics.pop("tvd_gate_base_tokens_sum")
+                    _kept = metrics.pop("tvd_gate_kept_tokens_sum")
+                    _tvd_sum = metrics.pop("tvd_topk_sum")
+                    if _base > 0:
+                        metrics["tvd_gate_kept_frac"] = _kept / _base
+                        metrics["tvd_topk_mean"] = _tvd_sum / _base
+                    else:
+                        # Schema-stable NaN so downstream analysis pipelines
+                        # don't see the metric silently disappear on rare
+                        # empty-mask steps.
+                        metrics["tvd_gate_kept_frac"] = float("nan")
+                        metrics["tvd_topk_mean"] = float("nan")
                 metrics.update(rollout_metrics)
                 total_valid_tokens += metrics["global_valid_toks"]
 

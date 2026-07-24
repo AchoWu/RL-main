@@ -21,6 +21,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
     _default_distillation_save_state,
+    _resolve_tvd_gate_threshold,
     check_vocab_equality,
     distillation_train,
     validate,
@@ -651,3 +652,217 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
         # Configure mocks to skip checkpoint loading
         mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
         setup(master_config, tokenizer, dataset, None)
+
+
+# ---------------------------------------------------------------------------
+# TVD gate: threshold resolver + gate math sanity checks.
+# ---------------------------------------------------------------------------
+
+
+class TestResolveTvdGateThreshold:
+    def test_none_when_no_config(self):
+        mode, tau = _resolve_tvd_gate_threshold(None, 0, 100)
+        assert mode == "none" and tau == 0.0
+
+    def test_none_when_mode_none(self):
+        mode, tau = _resolve_tvd_gate_threshold({"mode": "none"}, 5, 100)
+        assert mode == "none" and tau == 0.0
+
+    def test_fixed_returns_scalar(self):
+        mode, tau = _resolve_tvd_gate_threshold(
+            {"mode": "fixed", "threshold": 0.3}, 0, 100
+        )
+        assert mode == "fixed" and tau == 0.3
+
+    def test_fixed_clamps(self):
+        _, tau_hi = _resolve_tvd_gate_threshold(
+            {"mode": "fixed", "threshold": 1.5}, 0, 100
+        )
+        _, tau_lo = _resolve_tvd_gate_threshold(
+            {"mode": "fixed", "threshold": -0.1}, 0, 100
+        )
+        assert tau_hi == 1.0 and tau_lo == 0.0
+
+    def test_warmup_endpoints(self):
+        cfg = {
+            "mode": "warmup",
+            "start_threshold": 0.8,
+            "end_threshold": 0.1,
+            "warmup_until_frac": 0.3,
+        }
+        _, tau_0 = _resolve_tvd_gate_threshold(cfg, 0, 1000)
+        _, tau_end = _resolve_tvd_gate_threshold(cfg, 300, 1000)
+        _, tau_after = _resolve_tvd_gate_threshold(cfg, 700, 1000)
+        assert tau_0 == pytest.approx(0.8, abs=1e-9)
+        assert tau_end == pytest.approx(0.1, abs=1e-9)
+        assert tau_after == pytest.approx(0.1, abs=1e-9)
+
+    def test_warmup_midpoint(self):
+        # progress=0.5 -> curve=0.5 -> τ = start + (end-start)*0.5
+        cfg = {
+            "mode": "warmup",
+            "start_threshold": 0.8,
+            "end_threshold": 0.1,
+            "warmup_until_frac": 0.3,
+        }
+        _, tau_mid = _resolve_tvd_gate_threshold(cfg, 150, 1000)
+        assert tau_mid == pytest.approx(0.45, abs=1e-9)
+
+    def test_warmup_monotone_decreasing(self):
+        cfg = {
+            "mode": "warmup",
+            "start_threshold": 0.8,
+            "end_threshold": 0.1,
+            "warmup_until_frac": 0.3,
+        }
+        prev = float("inf")
+        for step in range(0, 301, 10):
+            _, tau = _resolve_tvd_gate_threshold(cfg, step, 1000)
+            assert tau <= prev + 1e-9
+            prev = tau
+
+    def test_warmup_increasing(self):
+        cfg = {
+            "mode": "warmup",
+            "start_threshold": 0.1,
+            "end_threshold": 0.8,
+            "warmup_until_frac": 0.3,
+        }
+        _, tau_0 = _resolve_tvd_gate_threshold(cfg, 0, 1000)
+        _, tau_end = _resolve_tvd_gate_threshold(cfg, 300, 1000)
+        assert tau_0 == pytest.approx(0.1, abs=1e-9)
+        assert tau_end == pytest.approx(0.8, abs=1e-9)
+
+    def test_warmup_zero_until_frac(self):
+        # Degenerate: no warmup, stay at end_threshold immediately.
+        cfg = {
+            "mode": "warmup",
+            "start_threshold": 0.8,
+            "end_threshold": 0.1,
+            "warmup_until_frac": 0.0,
+        }
+        _, tau = _resolve_tvd_gate_threshold(cfg, 0, 1000)
+        assert tau == pytest.approx(0.1, abs=1e-9)
+
+    def test_unknown_mode_raises(self):
+        with pytest.raises(ValueError, match="Unknown tvd_gate mode"):
+            _resolve_tvd_gate_threshold({"mode": "bogus"}, 0, 100)
+
+
+class TestTvdGateMath:
+    """Sanity checks on the min-overlap → TVD identity and threshold semantics.
+
+    These don't touch the loss function directly; they verify the arithmetic
+    the gate relies on (torch.minimum + strict-> comparison) matches intent.
+    """
+
+    def test_identity_gives_zero_tvd(self):
+        # Any distribution vs itself: min(p,p).sum() == 1, TVD == 0.
+        torch.manual_seed(0)
+        p = torch.softmax(torch.randn(2, 5, 10), dim=-1)
+        tvd = 1.0 - torch.minimum(p, p).sum(-1)
+        assert tvd.max().item() < 1e-6
+
+    def test_disjoint_gives_tvd_one(self):
+        p_S = torch.zeros(10)
+        p_S[0] = 1.0
+        p_T = torch.zeros(10)
+        p_T[-1] = 1.0
+        tvd = 1.0 - torch.minimum(p_S, p_T).sum()
+        assert tvd.item() == pytest.approx(1.0, abs=1e-9)
+
+    def test_half_overlap(self):
+        # Both distributions concentrated on {0,1} vs {0,2} → overlap 0.5.
+        p_S = torch.zeros(10)
+        p_S[0] = 0.5
+        p_S[1] = 0.5
+        p_T = torch.zeros(10)
+        p_T[0] = 0.5
+        p_T[2] = 0.5
+        tvd = 1.0 - torch.minimum(p_S, p_T).sum()
+        assert tvd.item() == pytest.approx(0.5, abs=1e-9)
+
+    def test_gate_direction_keeps_high_tvd(self):
+        # Threshold semantics: keep iff tvd > τ (direction B).
+        tvd = torch.tensor([0.1, 0.4, 0.6, 0.9])
+        gate = (tvd > 0.5).float()
+        assert gate.tolist() == [0.0, 0.0, 1.0, 1.0]
+
+    def test_gate_all_out_at_tau_one(self):
+        # τ = 1 gates everything out (tvd is bounded by 1).
+        tvd = torch.tensor([0.1, 0.5, 0.9, 1.0])
+        gate = (tvd > 1.0).float()
+        assert gate.sum().item() == 0
+
+    def test_gate_all_in_at_tau_neg(self):
+        # τ = -1 keeps everything.
+        tvd = torch.tensor([0.0, 0.4, 0.9])
+        gate = (tvd > -1.0).float()
+        assert gate.sum().item() == 3
+
+
+class TestTvdGateInitValidation:
+    """Fail-fast at DistillationLossFn.__init__ when the gate is misconfigured.
+
+    Users copying the exemplar yaml commonly drop fields they don't use
+    (e.g. keep only `mode`+`threshold` for fixed) and later flip
+    `mode='warmup'`. Validation lives in __init__ so the failure surfaces
+    at controller construction time, BEFORE Ray workers spin up and teacher
+    rollouts run — the resolver itself uses direct dict access on the same
+    keys, so a misconfig would also fail there, but by that point the run
+    has already burned expensive setup.
+    """
+
+    def _kl_base(self):
+        return {
+            "kl_type": "forward",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": True,
+        }
+
+    def test_fixed_missing_threshold(self):
+        cfg = self._kl_base()
+        cfg["tvd_gate"] = {"mode": "fixed"}
+        with pytest.raises(AssertionError, match="threshold"):
+            DistillationLossFn(cfg)
+
+    def test_warmup_missing_start_threshold(self):
+        cfg = self._kl_base()
+        cfg["tvd_gate"] = {
+            "mode": "warmup",
+            "end_threshold": 0.1,
+            "warmup_until_frac": 0.3,
+        }
+        with pytest.raises(AssertionError, match="start_threshold"):
+            DistillationLossFn(cfg)
+
+    def test_warmup_missing_all_keys(self):
+        cfg = self._kl_base()
+        cfg["tvd_gate"] = {"mode": "warmup"}
+        with pytest.raises(AssertionError, match="start_threshold"):
+            DistillationLossFn(cfg)
+
+    def test_requires_zero_outside_topk(self):
+        cfg = self._kl_base()
+        cfg["zero_outside_topk"] = False
+        cfg["tvd_gate"] = {"mode": "fixed", "threshold": 0.3}
+        with pytest.raises(AssertionError, match="zero_outside_topk"):
+            DistillationLossFn(cfg)
+
+    def test_unknown_mode_raises(self):
+        cfg = self._kl_base()
+        cfg["tvd_gate"] = {"mode": "bogus"}
+        with pytest.raises(ValueError, match="Unknown tvd_gate.mode"):
+            DistillationLossFn(cfg)
+
+    def test_mode_none_accepted_without_extra_keys(self):
+        # Baseline / opt-out: mode=none should require no other keys.
+        cfg = self._kl_base()
+        cfg["tvd_gate"] = {"mode": "none"}
+        loss = DistillationLossFn(cfg)
+        assert loss._tvd_gate_state["mode"] == "none"
+
+    def test_no_gate_cfg_at_all(self):
+        # Absent tvd_gate key = feature completely disabled, same as mode=none.
+        loss = DistillationLossFn(self._kl_base())
+        assert loss._tvd_gate_state["mode"] == "none"
