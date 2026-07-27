@@ -42,7 +42,7 @@ sed -i 's/PY_EXECUTABLES.AUTOMODEL/PY_EXECUTABLES.SYSTEM/; s/PY_EXECUTABLES.FSDP
 # ====== 结束 ======
 
 # 让 Python 能找到 nemo_rl 包（项目本身就是 nemo_rl/ 在仓库根目录）
-export PYTHONPATH=/group/40143/howu/RL-main:$PYTHONPATH
+export PYTHONPATH=/group/40143/howu/RL-main:${PYTHONPATH:-}
 
 cd /group/40143/howu/RL-main && python examples/run_distillation_math.py \
       --config examples/configs/distillation_math.yaml \

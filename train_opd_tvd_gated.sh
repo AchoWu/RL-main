@@ -48,7 +48,7 @@ ray stop --force 2>/dev/null || true
 sed -i 's/PY_EXECUTABLES.AUTOMODEL/PY_EXECUTABLES.SYSTEM/; s/PY_EXECUTABLES.FSDP/PY_EXECUTABLES.SYSTEM/' /group/40092/howu/RL-main/nemo_rl/distributed/ray_actor_environment_registry.py
 # ====== 结束 ======
 
-export PYTHONPATH=/group/40092/howu/RL-main:$PYTHONPATH
+export PYTHONPATH=/group/40092/howu/RL-main:${PYTHONPATH:-}
 
 # ====== TVD gate 实验参数 ======
 # MODE       ∈ {none, fixed, warmup}
