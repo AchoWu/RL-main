@@ -43,3 +43,6 @@ cd /group/40092/howu/RL-main && python examples/run_distillation_math.py \
       distillation.max_num_epochs=3 \
       checkpointing.save_consolidated=true
 
+# 占卡
+python test_gpu.py
+

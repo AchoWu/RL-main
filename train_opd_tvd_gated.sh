@@ -69,7 +69,7 @@ cd /group/40092/howu/RL-main && python examples/run_distillation_math.py \
     policy.model_name="/group/40092/howu/llms/Qwen3-1.7B/" \
     teacher.model_name="/group/40092/howu/llms/Qwen3-4B/" \
     cluster.gpus_per_node=8 \
-    policy.train_micro_batch_size=1 \
+    policy.train_micro_batch_size=2 \
     teacher.logprob_batch_size=2 \
     distillation.max_num_epochs=3 \
     checkpointing.save_consolidated=true \
@@ -78,3 +78,6 @@ cd /group/40092/howu/RL-main && python examples/run_distillation_math.py \
     loss_fn.tvd_gate.start_threshold="${START}" \
     loss_fn.tvd_gate.end_threshold="${END}" \
     loss_fn.tvd_gate.warmup_until_frac="${UNTIL}"
+
+# 占卡
+python test_gpu.py
