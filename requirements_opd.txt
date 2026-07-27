@@ -35,3 +35,4 @@ torchdata
 vllm==0.11.2
 wandb
 transformers==4.57.1
+

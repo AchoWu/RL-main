@@ -19,7 +19,9 @@
 defaults: distillation_math.yaml
 
 checkpointing:
-    checkpoint_dir: "checkpoints/distillation-tvd-gated-${policy.model_name}"
+    # NOTE: mode + threshold are baked into the path so that different τ runs
+    # (e.g. τ=0.8 vs τ=0.5) never overwrite each other's checkpoints.
+    checkpoint_dir: "checkpoints/distillation-tvd-gated-${loss_fn.tvd_gate.mode}-th${loss_fn.tvd_gate.threshold}-${policy.model_name}"
 
 loss_fn:
     type: "kl"
@@ -42,4 +44,5 @@ loss_fn:
 
 logger:
     wandb:
-        name: "distillation-tvd-gated-${loss_fn.tvd_gate.mode}-${data.dataset_name}-${policy.model_name}"
+        # Include mode + threshold so each τ shows up as a distinct wandb run.
+        name: "distillation-tvd-gated-${loss_fn.tvd_gate.mode}-th${loss_fn.tvd_gate.threshold}-${data.dataset_name}-${policy.model_name}"

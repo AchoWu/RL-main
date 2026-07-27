@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
-# TVD-Gated KL Distillation 训练脚本.
-# See BASIC_OAD_PROPOSAL.md and inline comments in
-# examples/configs/distillation_math_tvd_gated.yaml.
+# TVD-Gated KL Distillation 训练脚本 (τ=0.8 主脚本).
+# 与 train_opd_tvd_gated.sh 的区别仅在于：
+#   1) (与 tau02 脚本仅 THRESHOLD 不同)
+#   2) WANDB_RUN_GROUP=tvd-gated-sweep（与其他阈值 run 归到同一 group 便于并排对比）
+#   3) wandb run name 显式带 tau、加 tags
+#   4) checkpoint_dir 带 tau，避免与其他阈值 run 覆盖同一目录
 #
-# 当前配置：fixed threshold, τ=0.3
-#
-# 含义：
-#   - Loss 主体是 KL（继承自 distillation_math.yaml 的 mixed KL）
-#   - 每个 token 额外算 TVD_topk = 1 - Σ min(p_S, p_T) on teacher top-k
-#   - 只有 TVD_topk > τ 的 token 参与 loss（差异大才学，strict >）
-#   - τ = 0 → 保留 TVD_topk > 0 的 token（严格意义上会漏掉 student==teacher 的
-#            极端一致 token；实际训练中稀有，接近 baseline 但不等价；
-#            想要真正的 baseline 请用 MODE=none）
-#   - τ = 1 → 什么都不学（sanity 下界，因 TVD ≤ 1 且严格 >）
-#   - 中间 → 越大越激进
-#
-# 切换实验时修改下面 MODE / THRESHOLD 或 START / END / UNTIL。
+# 其余环境/代理/模型路径/数据集/epoch 与原脚本完全一致，保证公平对比。
 set -euo pipefail
 
+# ====== 强制激活 env-3.12（否则 /root/custom.bashrc 会把当前 shell 切回 env-3.6.8） ======
+# shellcheck disable=SC1091
+source /data/miniconda3/etc/profile.d/conda.sh
+conda deactivate 2>/dev/null || true
+conda activate env-3.12
+echo "▶ Python: $(python -c 'import sys; print(sys.executable, sys.version.split()[0])')"
+
 # 环境与代理（与 train_opd.sh 保持一致）
+: "${ENV_VENUS_PROXY:=${http_proxy:-}}"
 export NO_PROXY=localhost,.woa.com,.oa.com,.tencent.com,tencentcos.cn,myqcloud.com
 export HTTP_PROXY=$ENV_VENUS_PROXY
 export HTTPS_PROXY=$ENV_VENUS_PROXY
@@ -31,7 +30,11 @@ export HF_DATASETS_OFFLINE=1
 export HF_HOME=/root/.cache/huggingface
 export HF_DATASETS_CACHE=/root/.cache/huggingface/datasets
 
-export WANDB_MODE=disabled
+# ====== WandB 在线上传 ======
+export WANDB_MODE=online
+export WANDB_PROJECT=nemo-distillation
+# 归到同一 sweep group，方便和 tau=0.8 等其他 run 在 wandb UI 上做对比
+export WANDB_RUN_GROUP=tvd-gated-sweep
 
 # ====== Attention 后端（flash-attn 可用时注释掉下面这行） ======
 # export VLLM_ATTENTION_BACKEND=XFORMERS
@@ -51,33 +54,43 @@ sed -i 's/PY_EXECUTABLES.AUTOMODEL/PY_EXECUTABLES.SYSTEM/; s/PY_EXECUTABLES.FSDP
 export PYTHONPATH=/group/40092/howu/RL-main:${PYTHONPATH:-}
 
 # ====== TVD gate 实验参数 ======
-# MODE       ∈ {none, fixed, warmup}
-# THRESHOLD  仅在 MODE=fixed 时生效；τ ∈ [0, 1]，越大越激进（只学分歧最大的）
-# START      仅在 MODE=warmup 时生效；step 0 时的 τ
-# END        仅在 MODE=warmup 时生效；warmup 结束后的 τ（一直保持到训练末尾）
-# UNTIL      仅在 MODE=warmup 时生效；warmup 结束的 step fraction
+# 本脚本固定 MODE=fixed，只改 THRESHOLD；改成别的阈值时同步 sed 一下下面的 tau 标签即可。
 MODE="fixed"
 THRESHOLD=0.8
 START=0.8
 END=0.1
 UNTIL=0.3
 
-echo "▶ Running TVD-gated KL: MODE=${MODE} THRESHOLD=${THRESHOLD} START=${START} END=${END} UNTIL=${UNTIL}"
+# tau 标签（用于 wandb name / checkpoint 路径），避免路径里出现小数点
+TAU_TAG="tau${THRESHOLD//./}"   # 0.8 -> tau08
+
+echo "▶ Running TVD-gated KL: MODE=${MODE} THRESHOLD=${THRESHOLD} (${TAU_TAG}) START=${START} END=${END} UNTIL=${UNTIL}"
+
+# ====== 用 /dev/shm/llms 上的内存盘缓存（提前拷贝好），避免走网盘 IO 加载慢 ======
+POLICY_MODEL="/dev/shm/llms/Qwen3-1.7B/"
+TEACHER_MODEL="/dev/shm/llms/Qwen3-4B/"
+if [[ ! -d "$POLICY_MODEL" || ! -d "$TEACHER_MODEL" ]]; then
+  echo "⚠️  /dev/shm 缓存缺失，回退到 /group/40092 网盘（加载会慢 ~20 分钟）"
+  POLICY_MODEL="/group/40092/howu/llms/Qwen3-1.7B/"
+  TEACHER_MODEL="/group/40092/howu/llms/Qwen3-4B/"
+fi
+echo "▶ Using policy=$POLICY_MODEL  teacher=$TEACHER_MODEL"
 
 cd /group/40092/howu/RL-main && python examples/run_distillation_math.py \
     --config examples/configs/distillation_math_tvd_gated.yaml \
-    policy.model_name="/group/40092/howu/llms/Qwen3-1.7B/" \
-    teacher.model_name="/group/40092/howu/llms/Qwen3-4B/" \
+    policy.model_name="$POLICY_MODEL" \
+    teacher.model_name="$TEACHER_MODEL" \
     cluster.gpus_per_node=8 \
-    policy.train_micro_batch_size=2 \
-    teacher.logprob_batch_size=2 \
+    policy.train_micro_batch_size=4 \
+    teacher.logprob_batch_size=4 \
     distillation.max_num_epochs=3 \
     checkpointing.save_consolidated=true \
+    checkpointing.checkpoint_dir="checkpoints/distillation-tvd-gated-${MODE}-${TAU_TAG}-qwen3-1.7B" \
     loss_fn.tvd_gate.mode="${MODE}" \
     loss_fn.tvd_gate.threshold="${THRESHOLD}" \
     loss_fn.tvd_gate.start_threshold="${START}" \
     loss_fn.tvd_gate.end_threshold="${END}" \
-    loss_fn.tvd_gate.warmup_until_frac="${UNTIL}"
-
-# 占卡
-python test_gpu.py
+    loss_fn.tvd_gate.warmup_until_frac="${UNTIL}" \
+    logger.wandb.name="distillation-tvd-gated-${MODE}-${TAU_TAG}-qwen3-1.7B" \
+    +logger.wandb.group="tvd-gated-sweep" \
+    +logger.wandb.tags="[tvd_gate,${MODE},${TAU_TAG}]"
