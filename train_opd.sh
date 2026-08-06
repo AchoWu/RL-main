@@ -33,10 +33,20 @@ sed -i 's/PY_EXECUTABLES.AUTOMODEL/PY_EXECUTABLES.SYSTEM/; s/PY_EXECUTABLES.FSDP
 # 让 Python 能找到 nemo_rl 包（项目本身就是 nemo_rl/ 在仓库根目录）
 export PYTHONPATH=/group/40092/howu/RL-main:$PYTHONPATH
 
+# ====== 用 /dev/shm/llms 上的内存盘缓存（提前拷贝好），避免走网盘 IO 加载慢 ======
+POLICY_MODEL="/dev/shm/llms/Qwen3-1.7B/"
+TEACHER_MODEL="/dev/shm/llms/Qwen3-4B/"
+if [[ ! -d "$POLICY_MODEL" || ! -d "$TEACHER_MODEL" ]]; then
+  echo "⚠️  /dev/shm 缓存缺失，回退到 /group/40092 网盘（加载会慢 ~20 分钟）"
+  POLICY_MODEL="/group/40092/howu/llms/Qwen3-1.7B/"
+  TEACHER_MODEL="/group/40092/howu/llms/Qwen3-4B/"
+fi
+echo "▶ Using policy=$POLICY_MODEL  teacher=$TEACHER_MODEL"
+
 cd /group/40092/howu/RL-main && python examples/run_distillation_math.py \
       --config examples/configs/distillation_math.yaml \
-      policy.model_name="/dev/shm/llms/Qwen3-1.7B/" \
-      teacher.model_name="/dev/shm/llms/Qwen3-4B/" \
+      policy.model_name="$POLICY_MODEL" \
+      teacher.model_name="$TEACHER_MODEL" \
       cluster.gpus_per_node=8 \
       policy.train_micro_batch_size=1 \
       teacher.logprob_batch_size=2 \
