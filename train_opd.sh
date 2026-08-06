@@ -31,18 +31,15 @@ sed -i 's/PY_EXECUTABLES.AUTOMODEL/PY_EXECUTABLES.SYSTEM/; s/PY_EXECUTABLES.FSDP
 # ====== 结束 ======
 
 # 让 Python 能找到 nemo_rl 包（项目本身就是 nemo_rl/ 在仓库根目录）
-export PYTHONPATH=/group/40092/howu/RL-main:${PYTHONPATH:-}
+export PYTHONPATH=/group/40092/howu/RL-main:$PYTHONPATH
 
 cd /group/40092/howu/RL-main && python examples/run_distillation_math.py \
       --config examples/configs/distillation_math.yaml \
-      policy.model_name="/group/40092/howu/llms/Qwen3-1.7B/" \
-      teacher.model_name="/group/40092/howu/llms/Qwen3-4B/" \
+      policy.model_name="/dev/shm/llms/Qwen3-1.7B/" \
+      teacher.model_name="/dev/shm/llms/Qwen3-4B/" \
       cluster.gpus_per_node=8 \
       policy.train_micro_batch_size=1 \
       teacher.logprob_batch_size=2 \
       distillation.max_num_epochs=3 \
       checkpointing.save_consolidated=true
-
-# 占卡
-python test_gpu.py
 

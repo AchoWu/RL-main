@@ -364,6 +364,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         # ------------------------------------------------
         # Build device mesh and parallelize
         # ------------------------------------------------
+
+        # howu: for cuda init
+        prev_local_rank = os.environ["LOCAL_RANK"]
+        os.environ["LOCAL_RANK"] = "0"
+
         manager = FSDP2Manager(
             dp_size=dp_size,
             dp_replicate_size=1,
@@ -388,6 +393,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             ],
             custom_tp_plan=self.cfg["dtensor_cfg"].get("custom_parallel_plan", None),
         )
+
+        # howu: for cuda init
+        os.environ["LOCAL_RANK"] = prev_local_rank
 
         # Force setup distributed for world size 1 as FSDP2Manager skips it.
         if world_size == 1:
