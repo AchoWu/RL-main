@@ -998,6 +998,15 @@ class DistillationLossConfig(TypedDict):
     mixed_kl_weight: float
     zero_outside_topk: bool
     tvd_gate: NotRequired[TvdGateConfig]
+    # If set, drops these token ids from the loss mask at their *target*
+    # positions (i.e. positions where the *next* token equals one of these
+    # ids). Motivation: on-policy rollouts that stop early on wrong answers
+    # put an EOS at a spot where the teacher — being a strong reasoner —
+    # prefers "wait/but/however" continuations. Training on these positions
+    # suppresses p_S(EOS), so the student stops emitting EOS and rollouts
+    # grow until they hit max_length. Common values: DeepSeek-R1-Distill
+    # tokenizer uses eos_token_id=151643.
+    mask_eos_positions: NotRequired[list[int]]
 
 
 class DistillationLossDataDict(TypedDict):
@@ -1027,6 +1036,14 @@ class DistillationLossFn(LossFunction):
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
+
+        # Optional list of token ids to drop from the loss mask at target
+        # positions. See DistillationLossConfig.mask_eos_positions docstring.
+        raw_mask_eos = cfg.get("mask_eos_positions")
+        if raw_mask_eos is None:
+            self.mask_eos_positions: list[int] = []
+        else:
+            self.mask_eos_positions = [int(x) for x in raw_mask_eos]
 
         # TVD gate: uses the OAD acceptance quantity as a *filter* on which
         # tokens contribute to the KL loss (not as a loss target itself). The
@@ -1299,6 +1316,23 @@ class DistillationLossFn(LossFunction):
             max_len = per_token_kl.shape[1]
             token_mask = token_mask[:, :max_len]
             base_mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
+
+            # Drop target positions whose target token is an EOS-like id.
+            # Rationale: on wrong-answer rollouts the student places EOS at
+            # a spot where the teacher (a strong reasoner) prefers to keep
+            # writing. Training that position suppresses p_S(EOS) — student
+            # then never stops, sequences grow to max_length. Applied before
+            # any TVD gate so the gate never sees these positions.
+            if self.mask_eos_positions and "input_ids" in data:
+                input_ids = data["input_ids"]
+                # Target for position t is input_ids[:, t+1]; per_token_kl is
+                # already aligned to targets, so slice [:, 1:1+max_len].
+                target_ids = input_ids[:, 1 : 1 + max_len]
+                not_eos = torch.ones_like(base_mask)
+                for eos_id in self.mask_eos_positions:
+                    not_eos = not_eos * (target_ids != eos_id).to(device=base_mask.device, dtype=base_mask.dtype)
+                base_mask = base_mask * not_eos
+
             mask = base_mask
 
             tvd_topk: Optional[torch.Tensor] = None

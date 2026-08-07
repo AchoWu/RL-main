@@ -14,6 +14,9 @@
 #   - 忽略师生词表一致性检查（两者 tokenizer 完全相同，仅 config.vocab_size 的 padding 不同：
 #     teacher 152064 vs student 151936；实测 teacher top-64 从不落到 >=151936 的 padding 区，
 #     padding 行 logit 最大 0.637 而真实 token 达 19.25，故安全）
+#   - **NEW**: 通过 loss_fn.mask_eos_positions=[151643] 把 EOS 目标位置从 loss 里剔除，
+#     防止"教师在错误 rollout 尾部推翻推理 → 学生学会永不停止 → 序列爆炸"的现象。
+#     其他一切保持原始 OPD（无 TVD gate、无其他改动）。
 set -euo pipefail
 
 # ====== conda 环境（用 opd，env-3.12 已被清空） ======
@@ -80,8 +83,17 @@ for d in "$TEACHER_MODEL" "$POLICY_MODEL"; do
 done
 echo "▶ Using policy=$POLICY_MODEL  teacher=$TEACHER_MODEL"
 
-RUN_NAME="opd-skywork7b-to-r1qwen1.5b"
+RUN_NAME="opd-skywork7b-to-r1qwen1.5b-mask-eos"
 mkdir -p /group/40092/howu/RL-main/logs
+
+# ====== 从 loss 里 mask 掉 EOS 目标位置 ======
+# DeepSeek-R1-Distill-Qwen-1.5B 的 EOS token id = 151643 (<｜end▁of▁sentence｜>)。
+# 动机：错误答案 rollout 里学生在 T 位置输出 EOS 提前停下，但教师（强推理器）
+# 在这个上下文更倾向于继续写 "wait/but/however"，KL 会去压低 p_S(EOS) → 学生
+# 越来越不敢停 → 序列长到 max_length 也答不出答案。这个开关把这些位置从
+# loss 里剔除，让 EOS/continuation 决策不进入蒸馏梯度。
+# 如需关闭对照，把这一整行注释掉即可（不传 mask_eos_positions ⇒ 走原始 OPD）。
+EOS_MASK_ARG="+loss_fn.mask_eos_positions=[151643]"
 
 cd /group/40092/howu/RL-main && python examples/run_distillation_math.py \
       --config examples/configs/distillation_math.yaml \
@@ -95,5 +107,6 @@ cd /group/40092/howu/RL-main && python examples/run_distillation_math.py \
       checkpointing.save_period=25 \
       checkpointing.save_consolidated=false \
       checkpointing.checkpoint_dir="checkpoints/distillation-${RUN_NAME}" \
+      ${EOS_MASK_ARG} \
       logger.wandb_enabled=true \
       logger.wandb.name="${RUN_NAME}"
