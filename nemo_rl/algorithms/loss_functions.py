@@ -1323,14 +1323,32 @@ class DistillationLossFn(LossFunction):
             # writing. Training that position suppresses p_S(EOS) — student
             # then never stops, sequences grow to max_length. Applied before
             # any TVD gate so the gate never sees these positions.
-            if self.mask_eos_positions and "input_ids" in data:
-                input_ids = data["input_ids"]
-                # Target for position t is input_ids[:, t+1]; per_token_kl is
-                # already aligned to targets, so slice [:, 1:1+max_len].
-                target_ids = input_ids[:, 1 : 1 + max_len]
+            if self.mask_eos_positions:
+                # `input_ids` is a CP buffer, so under context parallelism the
+                # worker hands us a seq-sharded DTensor. Two traps here:
+                #   1. base_mask is a plain tensor (token_mask/sample_mask are
+                #      not CP buffers), and plain * DTensor raises.
+                #   2. CP sharding is load-balanced, i.e. rank r holds chunks
+                #      r and 2*cp-1-r, so the local shards are *permuted* with
+                #      respect to sequence order. `.full_tensor()` would
+                #      silently give us out-of-order ids and mask the wrong
+                #      positions; allgather_cp_sharded_tensor undoes the
+                #      permutation the same way it does for student logprobs.
+                ids = data["input_ids"]
+                if isinstance(ids, torch.distributed.tensor.DTensor):
+                    ids = ids.to_local()
+                    if cp_size > 1:
+                        ids = allgather_cp_sharded_tensor(ids, cp_group, seq_dim=1)
+                # Target for position t is ids[:, t+1]; per_token_kl is already
+                # aligned to targets, so slice [:, 1:1+max_len] — the same
+                # convention token_mask[:, 1:][:, :max_len] uses above. `ids`
+                # may be padded to a multiple of 2*cp, which the slice drops.
+                target_ids = ids[:, 1 : 1 + max_len].to(device=base_mask.device)
                 not_eos = torch.ones_like(base_mask)
                 for eos_id in self.mask_eos_positions:
-                    not_eos = not_eos * (target_ids != eos_id).to(device=base_mask.device, dtype=base_mask.dtype)
+                    not_eos = not_eos * (target_ids != eos_id).to(
+                        dtype=base_mask.dtype
+                    )
                 base_mask = base_mask * not_eos
 
             mask = base_mask

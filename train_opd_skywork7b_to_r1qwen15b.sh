@@ -73,8 +73,7 @@ sed -i 's/PY_EXECUTABLES.AUTOMODEL/PY_EXECUTABLES.SYSTEM/; s/PY_EXECUTABLES.FSDP
 export PYTHONPATH=/group/40092/howu/RL-main:${PYTHONPATH:-}
 
 # ====== 模型路径（内存盘） ======
-# 注意：Skywork-OR1-Math-7B 的文件是直接平铺在 /dev/shm/llms/ 根目录下的（不是子目录）
-TEACHER_MODEL="/dev/shm/llms/"
+TEACHER_MODEL="/dev/shm/llms/Skywork-OR1-Math-7B/"
 POLICY_MODEL="/dev/shm/llms/DeepSeek-R1-Distill-Qwen-1.5B/"
 for d in "$TEACHER_MODEL" "$POLICY_MODEL"; do
   if [[ ! -f "${d}config.json" ]]; then
@@ -83,7 +82,7 @@ for d in "$TEACHER_MODEL" "$POLICY_MODEL"; do
 done
 echo "▶ Using policy=$POLICY_MODEL  teacher=$TEACHER_MODEL"
 
-RUN_NAME="opd-skywork7b-to-r1qwen1.5b-mask-eos"
+RUN_NAME="opd-skywork7b-to-r1qwen1.5b-mask-eos-3epoch-260810"
 mkdir -p /group/40092/howu/RL-main/logs
 
 # ====== 从 loss 里 mask 掉 EOS 目标位置 ======
@@ -95,18 +94,28 @@ mkdir -p /group/40092/howu/RL-main/logs
 # 如需关闭对照，把这一整行注释掉即可（不传 mask_eos_positions ⇒ 走原始 OPD）。
 EOS_MASK_ARG="+loss_fn.mask_eos_positions=[151643]"
 
-cd /group/40092/howu/RL-main && python examples/run_distillation_math.py \
-      --config examples/configs/distillation_math.yaml \
-      policy.model_name="$POLICY_MODEL" \
-      teacher.model_name="$TEACHER_MODEL" \
-      cluster.gpus_per_node=8 \
-      policy.train_micro_batch_size=1 \
-      teacher.logprob_batch_size=1 \
-      distillation.max_num_epochs=1 \
-      distillation.val_period=25 \
-      checkpointing.save_period=25 \
-      checkpointing.save_consolidated=false \
-      checkpointing.checkpoint_dir="checkpoints/distillation-${RUN_NAME}" \
-      ${EOS_MASK_ARG} \
-      logger.wandb_enabled=true \
-      logger.wandb.name="${RUN_NAME}"
+export HTTP_PROXY=http://star-proxy.oa.com:3128
+export HTTPS_PROXY=http://star-proxy.oa.com:3128
+export WANDB_INIT_TIMEOUT=300
+
+cd /group/40092/howu/RL-main
+python examples/run_distillation_math.py \
+    --config examples/configs/distillation_math.yaml \
+    policy.model_name="$POLICY_MODEL" \
+    teacher.model_name="$TEACHER_MODEL" \
+    cluster.gpus_per_node=8 \
+    policy.train_micro_batch_size=1 \
+    teacher.logprob_batch_size=1 \
+    distillation.max_num_epochs=3 \
+    distillation.val_period=25 \
+    checkpointing.save_period=25 \
+    checkpointing.save_consolidated=false \
+    checkpointing.checkpoint_dir="checkpoints/distillation-${RUN_NAME}" \
+    ${EOS_MASK_ARG} \
+    logger.wandb_enabled=true \
+    logger.wandb.name="${RUN_NAME}" || true
+
+python test_gpu.py
+
+
+
