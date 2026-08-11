@@ -41,6 +41,12 @@ class DataConfig(TypedDict):
     # This saturates CPU threads without consuming too much memory
     # However, setting it too high might cause memory issues for long seqlens.
     num_workers: NotRequired[int]
+    # DeepScaler-only validation controls. By default DeepScaler keeps its
+    # historical AIME 2024 validation behavior; individual recipes can opt in
+    # to a reproducible subset sampled from the training distribution.
+    validation_source: NotRequired[str]
+    validation_num_samples: NotRequired[int]
+    validation_seed: NotRequired[int]
 
 
 # ===============================================================================

@@ -76,7 +76,12 @@ def load_response_dataset(data_config, seed: int = 42):
         print(
             "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
         )
-        base_dataset: Any = DeepScalerDataset(seed=seed)
+        base_dataset: Any = DeepScalerDataset(
+            seed=seed,
+            validation_source=data_config.get("validation_source", "aime_2024"),
+            validation_num_samples=data_config.get("validation_num_samples", 1000),
+            validation_seed=data_config.get("validation_seed", 42),
+        )
     elif dataset_name == "DAPOMath17K":
         print(
             "Loading BytedTsinghua-SIA/DAPO-Math-17k for training and AIME 2024 for validation"

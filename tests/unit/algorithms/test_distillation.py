@@ -22,6 +22,7 @@ import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
     _default_distillation_save_state,
     _resolve_tvd_gate_threshold,
+    _summarize_validation_metrics,
     check_vocab_equality,
     distillation_train,
     validate,
@@ -194,24 +195,32 @@ def test_distillation_train_max_steps(mock_components):
 
     distillation_save_state = _default_distillation_save_state()
 
-    # Run training
-    distillation_train(
-        mock_components["student_policy"],
-        mock_components["teacher_policy"],
-        mock_components["student_generation"],
-        mock_components["train_dataloader"],
-        mock_components["val_dataloader"],
-        mock_components["tokenizer"],
-        mock_components["loss_fn"],
-        mock_components["task_to_env"],
-        mock_components["val_task_to_env"],
-        mock_components["logger"],
-        mock_components["checkpointer"],
-        distillation_save_state,
-        mock_components["master_config"],
-    )
+    # Run training. The final step must be validated even though it is not a
+    # multiple of val_period.
+    with patch.object(
+        distil_mod,
+        "validate",
+        return_value=({"accuracy": 0.5}, {}),
+    ) as mock_validate:
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            distillation_save_state,
+            mock_components["master_config"],
+        )
 
     assert mock_components["student_policy"].train.call_count == 5
+    assert mock_validate.call_count == 1
+    assert mock_validate.call_args.kwargs["step"] == 5
 
 
 def test_exit_on_timeout(mock_components, capsys):
@@ -273,6 +282,7 @@ def test_exit_on_timeout(mock_components, capsys):
 
 def test_validate_function(mock_components):
     """Test independent validation function to ensure validation logic correctness."""
+    mock_components["master_config"]["distillation"]["max_val_samples"] = 3
     # Run validation
     val_metrics, validation_timings = validate(
         mock_components["student_generation"],
@@ -286,9 +296,30 @@ def test_validate_function(mock_components):
     # Verify validation results
     assert isinstance(val_metrics, dict)
     assert isinstance(validation_timings, dict)
+    assert val_metrics["num_samples"] == 3
+    assert "response_length_p95" in val_metrics
+    assert "eos_termination_rate" in val_metrics
     # For distillation, we don't need environment interaction since max_rollout_turns=0
     # The validation focuses on generation and teacher-student knowledge transfer
     # Note: validate() function itself doesn't call logger.log_metrics - that's done by the caller
+
+
+def test_summarize_validation_metrics_uses_per_sample_lengths():
+    metrics = _summarize_validation_metrics(
+        rewards=[1.0, 0.0, 1.0],
+        prompt_lengths=[10, 20, 30],
+        response_lengths=[10, 20, 60],
+        ended_with_eos=[True, True, False],
+        exhausted_token_budget=[False, False, True],
+        rollout_truncated=[False, False, True],
+    )
+
+    assert metrics["accuracy"] == pytest.approx(2 / 3)
+    assert metrics["avg_length"] == pytest.approx(30.0)
+    assert metrics["correct_response_length_mean"] == pytest.approx(35.0)
+    assert metrics["incorrect_response_length_mean"] == pytest.approx(20.0)
+    assert metrics["eos_termination_rate"] == pytest.approx(2 / 3)
+    assert metrics["token_budget_exhaustion_rate"] == pytest.approx(1 / 3)
 
 
 def test_check_vocab_equality_pass(monkeypatch):

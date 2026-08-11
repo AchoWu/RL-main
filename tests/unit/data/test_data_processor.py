@@ -36,6 +36,9 @@ from nemo_rl.data.datasets.response_datasets import (
     DeepScalerDataset,
     OpenMathInstruct2Dataset,
 )
+from nemo_rl.data.datasets.response_datasets.deepscaler import (
+    prepare_deepscaler_dataset,
+)
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import (
     helpsteer3_data_processor,
@@ -67,6 +70,53 @@ class DummyTokenizer:
         if return_tensors == "pt":
             return {"input_ids": torch.tensor([encoded], dtype=torch.long)}
         return {"input_ids": encoded}
+
+
+def test_deepscaler_train_holdout_is_fixed_disjoint_and_without_replacement(
+    monkeypatch,
+):
+    raw_train = Dataset.from_list(
+        [
+            {"problem": f"problem-{idx}", "answer": str(idx)}
+            for idx in range(20)
+        ]
+    )
+
+    def mock_load_dataset(name, split):
+        assert name == "agentica-org/DeepScaleR-Preview-Dataset"
+        assert split == "train"
+        return raw_train
+
+    monkeypatch.setattr(
+        "nemo_rl.data.datasets.response_datasets.deepscaler.load_dataset",
+        mock_load_dataset,
+    )
+
+    kwargs = {
+        "seed": 11,
+        "validation_source": "train_holdout",
+        "validation_num_samples": 7,
+        "validation_seed": 123,
+    }
+    first = prepare_deepscaler_dataset(**kwargs)
+    second = prepare_deepscaler_dataset(**kwargs)
+
+    assert first["validation"] is not None
+    assert second["validation"] is not None
+    first_problems = [row["messages"][0]["content"] for row in first["validation"]]
+    second_problems = [row["messages"][0]["content"] for row in second["validation"]]
+
+    first_train_problems = [
+        row["messages"][0]["content"] for row in first["train"]
+    ]
+
+    assert len(first_train_problems) == 13
+    assert len(first_problems) == 7
+    assert len(set(first_problems)) == 7
+    assert first_problems == second_problems
+    assert set(first_train_problems).isdisjoint(first_problems)
+    assert len(set(first_train_problems) | set(first_problems)) == 20
+    assert set(first_problems).issubset({f"problem-{idx}" for idx in range(20)})
 
 
 def test_math_data_processor():

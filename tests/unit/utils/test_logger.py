@@ -332,6 +332,25 @@ class TestWandbLogger:
         mock_run.log.assert_called_once_with(expected_metrics, commit=False)
 
     @patch("nemo_rl.utils.logger.wandb")
+    def test_log_histogram_without_committing_step(self, mock_wandb):
+        logger = WandbLogger({})
+
+        logger.log_histogram(
+            [1, 2, 3],
+            step=10,
+            name="validation/response_length_histogram",
+            commit=False,
+        )
+
+        mock_histogram = mock_wandb.Histogram.return_value
+        mock_wandb.Histogram.assert_called_once_with([1, 2, 3])
+        mock_wandb.init.return_value.log.assert_called_once_with(
+            {"validation/response_length_histogram": mock_histogram},
+            step=10,
+            commit=False,
+        )
+
+    @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric(self, mock_wandb):
         """Test defining a metric with a custom step metric."""
         cfg = {}

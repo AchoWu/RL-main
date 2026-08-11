@@ -109,7 +109,9 @@ class LoggerInterface(ABC):
         pass
 
     @abstractmethod
-    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+    def log_histogram(
+        self, histogram: list[Any], step: int, name: str, commit: bool = True
+    ) -> None:
         """Log histogram metrics."""
         pass
 
@@ -171,7 +173,9 @@ class TensorboardLogger(LoggerInterface):
                 print(f"Warning: Failed to log metric '{name}' to TensorBoard: {e}")
                 continue
 
-    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+    def log_histogram(
+        self, histogram: list[Any], step: int, name: str, commit: bool = True
+    ) -> None:
         """Log histogram metrics to Tensorboard."""
         return
 
@@ -372,7 +376,9 @@ class WandbLogger(LoggerInterface):
         """
         self.run.log({name: figure}, step=step)
 
-    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+    def log_histogram(
+        self, histogram: list[Any], step: int, name: str, commit: bool = True
+    ) -> None:
         """Log histogram metrics to wandb.
 
         Args:
@@ -380,7 +386,13 @@ class WandbLogger(LoggerInterface):
             step: Global step value
             name: Name of the metric
         """
-        self.run.log({name: wandb.Histogram(histogram)}, step=step)
+        log_data = {name: wandb.Histogram(histogram)}
+        if commit:
+            self.run.log(log_data, step=step)
+        else:
+            # Allow several histograms to be accumulated into the same WandB
+            # step before the caller's scalar metrics commit the row.
+            self.run.log(log_data, step=step, commit=False)
 
 
 class SwanlabLogger(LoggerInterface):
@@ -438,7 +450,9 @@ class SwanlabLogger(LoggerInterface):
         """
         self.run.log({name: swanlab.Image(figure)}, step=step)
 
-    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+    def log_histogram(
+        self, histogram: list[Any], step: int, name: str, commit: bool = True
+    ) -> None:
         """Log histogram metrics to swanlab."""
         return
 
@@ -816,7 +830,9 @@ class MLflowLogger(LoggerInterface):
             figure.savefig(tmp_file.name, format="png", bbox_inches="tight")
             mlflow.log_artifact(tmp_file.name, f"plots/{name}")
 
-    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+    def log_histogram(
+        self, histogram: list[Any], step: int, name: str, commit: bool = True
+    ) -> None:
         """Log histogram metrics to MLflow."""
         return
 
@@ -1035,7 +1051,9 @@ class Logger(LoggerInterface):
             logger.log_plot(fig, step, f"{prefix}/average_{name}")
         plt.close(fig)
 
-    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+    def log_histogram(
+        self, histogram: list[Any], step: int, name: str, commit: bool = True
+    ) -> None:
         """Log histogram metrics to all backends if available.
 
         Args:
@@ -1044,7 +1062,10 @@ class Logger(LoggerInterface):
             name: Name of the metric
         """
         for logger in self.loggers:
-            logger.log_histogram(histogram, step, name)
+            if commit:
+                logger.log_histogram(histogram, step, name)
+            else:
+                logger.log_histogram(histogram, step, name, commit=False)
 
     def log_plot_token_mult_prob_error(
         self, data: dict[str, Any], step: int, name: str

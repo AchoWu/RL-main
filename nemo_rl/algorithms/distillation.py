@@ -620,6 +620,7 @@ def distillation_train(
             val_task_to_env,
             step=total_steps,
             master_config=master_config,
+            logger=logger,
         )
         student_generation.finish_generation()
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
@@ -809,8 +810,11 @@ def distillation_train(
                     and (current_step + 1 == len(dataloader))
                 )
 
-                # Run validation if it's a validation step
-                if val_period > 0 and (total_steps + 1) % val_period == 0:
+                # Run periodic validation and always validate the final model.
+                should_validate = val_period > 0 and (
+                    (total_steps + 1) % val_period == 0 or is_last_step
+                )
+                if should_validate:
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
                             student_policy, student_generation, colocated_inference
@@ -825,6 +829,7 @@ def distillation_train(
                         val_task_to_env,
                         step=total_steps + 1,
                         master_config=master_config,
+                        logger=logger,
                     )
                     student_generation.finish_generation()
                     logger.log_metrics(
@@ -1098,6 +1103,121 @@ def distillation_train(
         current_step = 0  # Reset step counter for new epoch
 
 
+def _message_token_count(message: dict[str, Any]) -> int:
+    """Return the number of token ids stored on a message."""
+    token_ids = message.get("token_ids")
+    if token_ids is None:
+        return 0
+    if torch.is_tensor(token_ids):
+        return int(token_ids.numel())
+    return len(token_ids)
+
+
+def _last_token_id(message: dict[str, Any]) -> Optional[int]:
+    """Return the final token id from a message, if one exists."""
+    token_ids = message.get("token_ids")
+    if token_ids is None or len(token_ids) == 0:
+        return None
+    last_token = token_ids[-1]
+    return int(last_token.item()) if torch.is_tensor(last_token) else int(last_token)
+
+
+def _validation_response_stats(
+    message_log: list[dict[str, Any]],
+    tokenizer,
+    master_config: MasterConfig,
+) -> tuple[int, int, bool, bool]:
+    """Collect prompt/response length and termination stats for one rollout."""
+    prompt_length = sum(
+        _message_token_count(message)
+        for message in message_log
+        if message["role"] not in {"assistant", "environment"}
+    )
+    assistant_messages = [
+        message for message in message_log if message["role"] == "assistant"
+    ]
+    response_length = sum(_message_token_count(message) for message in assistant_messages)
+
+    eos_token_id = tokenizer.eos_token_id
+    final_token_id = (
+        _last_token_id(assistant_messages[-1]) if assistant_messages else None
+    )
+    ended_with_eos = eos_token_id is not None and final_token_id == eos_token_id
+
+    max_sequence_length = master_config["policy"]["max_total_sequence_length"]
+    max_new_tokens = master_config["policy"]["generation"].get(
+        "max_new_tokens", max_sequence_length
+    )
+    available_sequence_tokens = max(max_sequence_length - prompt_length, 0)
+    response_token_budget = min(max_new_tokens, available_sequence_tokens)
+    exhausted_token_budget = (
+        response_token_budget > 0 and response_length >= response_token_budget
+    )
+
+    return prompt_length, response_length, ended_with_eos, exhausted_token_budget
+
+
+def _mean_or_nan(values: list[int]) -> float:
+    return float(np.mean(values)) if values else float("nan")
+
+
+def _summarize_validation_metrics(
+    rewards: list[float],
+    prompt_lengths: list[int],
+    response_lengths: list[int],
+    ended_with_eos: list[bool],
+    exhausted_token_budget: list[bool],
+    rollout_truncated: list[bool],
+) -> dict[str, Any]:
+    """Build scalar validation metrics suitable for WandB/TensorBoard."""
+    num_samples = len(rewards)
+    if num_samples == 0:
+        return {
+            "accuracy": 0.0,
+            "avg_length": 0.0,
+            "num_samples": 0,
+        }
+
+    reward_array = np.asarray(rewards, dtype=np.float64)
+    response_length_array = np.asarray(response_lengths, dtype=np.float64)
+    accuracy = float(reward_array.mean())
+    accuracy_stderr = math.sqrt(accuracy * (1.0 - accuracy) / num_samples)
+    ci95_half_width = 1.96 * accuracy_stderr
+
+    correct_lengths = [
+        length for length, reward in zip(response_lengths, rewards) if reward > 0.5
+    ]
+    incorrect_lengths = [
+        length for length, reward in zip(response_lengths, rewards) if reward <= 0.5
+    ]
+
+    return {
+        # Keep the original names for checkpoint selection and existing dashboards.
+        "accuracy": accuracy,
+        "avg_length": float(response_length_array.mean()),
+        "num_samples": num_samples,
+        "num_correct": int((reward_array > 0.5).sum()),
+        "num_incorrect": int((reward_array <= 0.5).sum()),
+        "accuracy_stderr": accuracy_stderr,
+        "accuracy_ci95_low": max(0.0, accuracy - ci95_half_width),
+        "accuracy_ci95_high": min(1.0, accuracy + ci95_half_width),
+        "prompt_length_mean": float(np.mean(prompt_lengths)),
+        "response_length_mean": float(response_length_array.mean()),
+        "response_length_std": float(response_length_array.std()),
+        "response_length_min": int(response_length_array.min()),
+        "response_length_p50": float(np.quantile(response_length_array, 0.50)),
+        "response_length_p90": float(np.quantile(response_length_array, 0.90)),
+        "response_length_p95": float(np.quantile(response_length_array, 0.95)),
+        "response_length_p99": float(np.quantile(response_length_array, 0.99)),
+        "response_length_max": int(response_length_array.max()),
+        "correct_response_length_mean": _mean_or_nan(correct_lengths),
+        "incorrect_response_length_mean": _mean_or_nan(incorrect_lengths),
+        "eos_termination_rate": float(np.mean(ended_with_eos)),
+        "token_budget_exhaustion_rate": float(np.mean(exhausted_token_budget)),
+        "rollout_truncation_rate": float(np.mean(rollout_truncated)),
+    }
+
+
 def validate(
     policy_generation: GenerationInterface,
     val_dataloader: Optional[StatefulDataLoader],
@@ -1105,6 +1225,7 @@ def validate(
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
     master_config: MasterConfig,
+    logger: Optional[Logger] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
@@ -1122,22 +1243,26 @@ def validate(
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
-        total_rewards = []  # Can be any metric. Setted to 'accuracy' by default.
-        total_lengths = []
+        total_rewards: list[float] = []
+        prompt_lengths: list[int] = []
+        response_lengths: list[int] = []
+        ended_with_eos: list[bool] = []
+        exhausted_token_budget: list[bool] = []
+        rollout_truncated: list[bool] = []
         all_message_logs = []  # Collect all message logs
 
-        max_batches = (
-            master_config["distillation"]["max_val_samples"]
-            // master_config["distillation"]["val_batch_size"]
-        )
-        for batch_idx, val_batch in enumerate(val_dataloader):
-            if batch_idx >= max_batches:
+        max_val_samples = master_config["distillation"]["max_val_samples"]
+        for val_batch in val_dataloader:
+            remaining_samples = max_val_samples - len(total_rewards)
+            if remaining_samples <= 0:
                 break
+            if val_batch.size > remaining_samples:
+                val_batch = val_batch.select_indices(list(range(remaining_samples)))
 
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts if vLLM async engine is enabled
             if _should_use_async_rollouts(master_config):
-                val_batch, gen_metrics = run_async_multi_turn_rollout(
+                val_batch, _gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
                     val_batch,
                     tokenizer,
@@ -1149,7 +1274,7 @@ def validate(
                     greedy=False,
                 )
             else:
-                val_batch, gen_metrics = run_multi_turn_rollout(
+                val_batch, _gen_metrics = run_multi_turn_rollout(
                     policy_generation,
                     val_batch,
                     tokenizer,
@@ -1163,7 +1288,16 @@ def validate(
             rewards = val_batch["total_reward"]
 
             total_rewards.extend(rewards.tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+            rollout_truncated.extend(val_batch["truncated"].bool().tolist())
+
+            for message_log in val_batch["message_log"]:
+                prompt_length, response_length, eos_ended, budget_exhausted = (
+                    _validation_response_stats(message_log, tokenizer, master_config)
+                )
+                prompt_lengths.append(prompt_length)
+                response_lengths.append(response_length)
+                ended_with_eos.append(eos_ended)
+                exhausted_token_budget.append(budget_exhausted)
 
             # Collect message logs for later display
             to_env = [
@@ -1175,18 +1309,46 @@ def validate(
 
             all_message_logs.extend(to_env)
 
-        # Calculate validation metrics
-        accuracy = (
-            sum(total_rewards) / len(total_rewards) if len(total_rewards) > 0 else 0
-        )
-        avg_length = (
-            sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0
+        val_metrics = _summarize_validation_metrics(
+            total_rewards,
+            prompt_lengths,
+            response_lengths,
+            ended_with_eos,
+            exhausted_token_budget,
+            rollout_truncated,
         )
 
-        val_metrics = {
-            "accuracy": accuracy,
-            "avg_length": avg_length,
-        }
+        if logger is not None and response_lengths:
+            logger.log_histogram(
+                response_lengths,
+                step,
+                "validation/response_length_histogram",
+                commit=False,
+            )
+            correct_lengths = [
+                length
+                for length, reward in zip(response_lengths, total_rewards)
+                if reward > 0.5
+            ]
+            incorrect_lengths = [
+                length
+                for length, reward in zip(response_lengths, total_rewards)
+                if reward <= 0.5
+            ]
+            if correct_lengths:
+                logger.log_histogram(
+                    correct_lengths,
+                    step,
+                    "validation/correct_response_length_histogram",
+                    commit=False,
+                )
+            if incorrect_lengths:
+                logger.log_histogram(
+                    incorrect_lengths,
+                    step,
+                    "validation/incorrect_response_length_histogram",
+                    commit=False,
+                )
 
         # Print sample conversations only once at the end of validation
         try:
@@ -1208,9 +1370,18 @@ def validate(
     validation_time = timing_metrics.get("total_validation_time", 0)
 
     # Print summary of validation results
+    accuracy = val_metrics["accuracy"]
+    avg_length = val_metrics["avg_length"]
     print("\n📊 Validation Results:")
     print(f"    • Accuracy: {accuracy:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
+    if val_metrics["num_samples"] > 0:
+        print(
+            "    • EOS termination / token-budget exhaustion / rollout truncation: "
+            f"{val_metrics['eos_termination_rate']:.2%} / "
+            f"{val_metrics['token_budget_exhaustion_rate']:.2%} / "
+            f"{val_metrics['rollout_truncation_rate']:.2%}"
+        )
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
 
     # Print timing information

@@ -217,6 +217,11 @@ data:
     system_prompt_file: null
     dataset_name: "DeepScaler"
     shuffle: true
+    # DeepScaler defaults preserve the historical AIME 2024 validation set.
+    # Set validation_source=train_holdout for a fixed, disjoint train/val split.
+    validation_source: "aime_2024"
+    validation_num_samples: 1000
+    validation_seed: 42
 
 env:
     math:

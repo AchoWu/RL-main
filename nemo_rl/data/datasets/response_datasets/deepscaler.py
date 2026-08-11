@@ -39,14 +39,40 @@ def format_math(
 
 
 def prepare_deepscaler_dataset(
-    seed: int = 42, task_name: str = "DeepScaler"
+    seed: int = 42,
+    task_name: str = "DeepScaler",
+    validation_source: str = "aime_2024",
+    validation_num_samples: int = 1000,
+    validation_seed: int = 42,
 ) -> dict[str, Dataset | None]:
-    """Load and split the DeepScaler dataset into train and test sets."""
+    """Load DeepScaler and build its configured validation set.
+
+    ``validation_source="train_holdout"`` creates a reproducible random
+    partition with ``validation_seed``. Validation examples are removed from
+    the training dataset, so train and validation remain strictly disjoint.
+    """
     # Load the original dataset for training
     train_ds = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train")
 
-    # Load hendrydong/aime24 dataset for validation
-    val_ds = load_dataset("HuggingFaceH4/aime_2024", split="train")
+    if validation_source == "aime_2024":
+        val_ds = load_dataset("HuggingFaceH4/aime_2024", split="train")
+    elif validation_source == "train_holdout":
+        if not 0 < validation_num_samples < len(train_ds):
+            raise ValueError(
+                "validation_num_samples must be in [1, len(train_ds) - 1] when "
+                f"validation_source='train_holdout'; got {validation_num_samples} "
+                f"for {len(train_ds)} training samples"
+            )
+        partitioned_ds = train_ds.shuffle(seed=validation_seed)
+        val_ds = partitioned_ds.select(range(validation_num_samples))
+        train_ds = partitioned_ds.select(
+            range(validation_num_samples, len(partitioned_ds))
+        )
+    else:
+        raise ValueError(
+            "Unknown DeepScaler validation_source "
+            f"{validation_source!r}; expected 'aime_2024' or 'train_holdout'"
+        )
 
     # Shuffle the training dataset with the specified seed
     train_ds = train_ds.shuffle(seed=seed)
@@ -63,11 +89,12 @@ def prepare_deepscaler_dataset(
         fn_kwargs={"task_name": task_name},
     )
 
-    # Compute accuracy 16 times per sample (matching the DeepScaleR evaluation setting)
-    val_repeated = []
-    for _ in range(16):
-        val_repeated.extend(val_formatted)
-    val_formatted = val_formatted.from_list(val_repeated)
+    if validation_source == "aime_2024":
+        # Preserve the historical DeepScaleR evaluation behavior for existing recipes.
+        val_repeated = []
+        for _ in range(16):
+            val_repeated.extend(val_formatted)
+        val_formatted = val_formatted.from_list(val_repeated)
 
     return {
         "train": train_formatted,
@@ -76,7 +103,13 @@ def prepare_deepscaler_dataset(
 
 
 class DeepScalerDataset(RawDataset):
-    def __init__(self, seed: int = 42) -> None:
+    def __init__(
+        self,
+        seed: int = 42,
+        validation_source: str = "aime_2024",
+        validation_num_samples: int = 1000,
+        validation_seed: int = 42,
+    ) -> None:
         """Initialize the DeepScaler dataset with train/test split.
 
         Args:
@@ -84,5 +117,9 @@ class DeepScalerDataset(RawDataset):
         """
         self.task_name = "DeepScaler"
         self.formatted_ds = prepare_deepscaler_dataset(
-            seed=seed, task_name=self.task_name
+            seed=seed,
+            task_name=self.task_name,
+            validation_source=validation_source,
+            validation_num_samples=validation_num_samples,
+            validation_seed=validation_seed,
         )

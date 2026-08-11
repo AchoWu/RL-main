@@ -2,8 +2,9 @@
 # OPD 蒸馏：Skywork-OR1-Math-7B (teacher) → DeepSeek-R1-Distill-Qwen-1.5B (student)
 # 参考 train_opd.sh，改动：
 #   - 换模型（教师 7B / 学生 1.5B，均在 /dev/shm 内存盘）
-#   - 训练 1 个 epoch（40315 样本 / 128 = 314 步）
-#   - 每 25 步测评一次 + 保存一次权重
+#   - 从训练集固定抽取并剔除 1000 道题作为验证集（seed=42，train/val 严格互斥）
+#   - 训练 1 个 epoch（剩余 39315 样本，drop_last 后 307 步）
+#   - 训练前、每 25 步及最后一步测评；每 25 步及最后一步保存权重
 #   - checkpoint 保存超时放宽到 30 分钟（默认 NCCL 集合通信 10 分钟，存权重容易超时）
 #   - save_consolidated=false：nemo_automodel 的 consolidate_safetensors_files_on_every_rank
 #     里 all_gather_object 会误算尺寸、试图分配 1024GiB 直接 OOM（当时还有 79GiB 空闲），
@@ -83,7 +84,7 @@ done
 echo "▶ Using policy=$POLICY_MODEL  teacher=$TEACHER_MODEL"
 
 # 修改：更新实验名，避免自动加载原来 3 epoch 实验的 checkpoint
-RUN_NAME="opd-skywork7b-to-r1qwen1.5b-mask-eos-lr1e-6-1epoch"
+RUN_NAME="opd-skywork7b-to-r1qwen1.5b-mask-eos-lr1e-6-1epoch-holdout1k-seed42"
 
 mkdir -p /group/40092/howu/RL-main/logs
 
@@ -111,8 +112,13 @@ python examples/run_distillation_math.py \
     policy.optimizer.kwargs.lr=1.0e-6 \
     teacher.logprob_batch_size=1 \
     distillation.max_num_epochs=1 \
-    distillation.max_num_steps=314 \
+    distillation.max_num_steps=307 \
     distillation.val_period=25 \
+    distillation.val_at_start=true \
+    distillation.max_val_samples=1000 \
+    data.validation_source=train_holdout \
+    data.validation_num_samples=1000 \
+    data.validation_seed=42 \
     checkpointing.save_period=25 \
     checkpointing.save_consolidated=false \
     checkpointing.checkpoint_dir="checkpoints/distillation-${RUN_NAME}" \
