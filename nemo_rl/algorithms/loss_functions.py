@@ -1085,6 +1085,12 @@ class DistillationLossFn(LossFunction):
             if self.tvd_gate_cfg is not None
             else "none"
         )
+        # A TVD-gated loss is accumulated as an unnormalized token-loss sum.
+        # The DTensor worker sees every microbatch and DP shard, so it can divide
+        # the accumulated gradients by the exact global number of kept tokens
+        # once, immediately before clipping/stepping. Normalizing here would only
+        # see one local microbatch and would weight microbatches/ranks incorrectly.
+        self.normalize_by_kept_tokens = gate_mode != "none"
         if gate_mode != "none":
             # Reject unknown modes up-front so users see the full valid list.
             if gate_mode not in ("fixed", "warmup"):
@@ -1425,23 +1431,27 @@ class DistillationLossFn(LossFunction):
                 else:
                     gate_w = (tvd_topk > tvd_gate_tau).to(base_mask.dtype)
                 # These sums are computed once and reused: mask -> loss, and
-                # base/kept/tvd sums -> diagnostics. Loss uses `global_valid_toks`
-                # (the pre-gate DP-aware count) as its denominator — the gate
-                # only zeros tokens in the numerator, so both loss and gradient
-                # scale by roughly kept_frac. Treat it as an implicit learning
-                # rate scaler; if kept_frac swings (warmup mode) factor it into
-                # your lr schedule.
+                # base/kept/tvd sums -> diagnostics. The gated branch returns an
+                # unnormalized numerator below. The DTensor worker accumulates
+                # all microbatches, all-reduces kept_valid_sum over DP, then
+                # divides the accumulated gradients by that exact global count.
                 mask = base_mask * gate_w
                 with torch.no_grad():
                     base_valid_sum = base_mask.sum()
                     kept_valid_sum = mask.sum()
                     tvd_sum = (tvd_topk * base_mask).sum()
 
-            kl_loss = masked_mean(
-                per_token_kl,
-                mask,
-                global_normalization_factor=global_valid_toks,
-            )
+            # For a gated loss, defer normalization until the worker has seen
+            # every microbatch and DP shard. For the baseline, preserve the
+            # existing global-valid-token normalization exactly.
+            if tvd_gate_active:
+                kl_loss = torch.sum(per_token_kl * mask)
+            else:
+                kl_loss = masked_mean(
+                    per_token_kl,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
         else:
             kl_loss = per_token_kl.mean()
 

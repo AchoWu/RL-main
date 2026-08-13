@@ -549,6 +549,11 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             losses = []
             all_mb_metrics = []
+            normalize_by_kept_tokens = bool(
+                getattr(loss_fn, "normalize_by_kept_tokens", False)
+                and getattr(loss_fn, "_tvd_gate_state", {}).get("mode", "none")
+                != "none"
+            )
             for gb_idx in range(num_global_batches):
                 global_batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
 
@@ -582,6 +587,8 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                 self.optimizer.zero_grad()
                 mb_losses = []
+                gb_mb_metrics = []
+                local_kept_tokens = 0.0
                 batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
                 # Calculate number of microbatches to process
                 # make_microbatch_iterator assumes that the batch size is a multiple of the microbatch size
@@ -795,9 +802,18 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                             global_valid_toks,
                         )
                         del logits
+                        # Gated distillation returns a token-loss numerator. Save
+                        # its unscaled value for reporting; gradient normalization
+                        # is applied once after every microbatch has contributed.
+                        unscaled_loss_value = loss.item()
 
                         # skip the update for dummy batches
-                        if mb_idx < iterator_len:
+                        is_real_microbatch = mb_idx < iterator_len
+                        if is_real_microbatch:
+                            if normalize_by_kept_tokens:
+                                local_kept_tokens += float(
+                                    loss_metrics["tvd_gate_kept_tokens_sum"]
+                                )
                             ## scale by the number of global batches so we get the correct
                             ## value when summing metrics across all microbatches
                             for k in loss_metrics.keys():
@@ -820,13 +836,42 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                             loss *= self.dp_size * self.cp_size
                             loss.backward()
 
-                    if num_valid_samples > 0:
-                        mb_losses.append(loss.item())
+                    if num_valid_samples > 0 and (
+                        is_real_microbatch or not normalize_by_kept_tokens
+                    ):
+                        mb_losses.append(
+                            unscaled_loss_value
+                            if normalize_by_kept_tokens and is_real_microbatch
+                            else loss.item()
+                        )
                         all_mb_metrics.append(loss_metrics)
+                        if is_real_microbatch:
+                            gb_mb_metrics.append(loss_metrics)
+
+                kept_token_normalizer = 1.0
+                if normalize_by_kept_tokens:
+                    global_kept_tokens = torch.tensor(
+                        local_kept_tokens, device="cuda", dtype=torch.float32
+                    )
+                    torch.distributed.all_reduce(
+                        global_kept_tokens, group=self.dp_mesh.get_group()
+                    )
+                    # An empty gate has a zero numerator and therefore a zero
+                    # gradient. Clamp only the divisor to avoid NaNs.
+                    kept_token_normalizer = max(global_kept_tokens.item(), 1.0)
+
+                    # Metrics are aggregated across DP workers later, so each
+                    # worker contributes its local numerator / global token count.
+                    for loss_metrics in gb_mb_metrics:
+                        loss_metrics["loss"] /= kept_token_normalizer
 
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
                     with torch.no_grad():
+                        if normalize_by_kept_tokens:
+                            for param in self.model.parameters():
+                                if param.grad is not None:
+                                    param.grad.div_(kept_token_normalizer)
                         grad_norm = get_grad_norm(
                             self.model.parameters(),
                             dp_cp_group=self.dp_cp_mesh.get_group(),
@@ -844,7 +889,10 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Update parameters
                     self.optimizer.step()
 
-                losses.append(torch.tensor(mb_losses).sum().item())
+                global_batch_loss = torch.tensor(mb_losses).sum().item()
+                if normalize_by_kept_tokens:
+                    global_batch_loss /= kept_token_normalizer
+                losses.append(global_batch_loss)
 
             # release gradient memory before rollouts
             self.optimizer.zero_grad()

@@ -73,7 +73,7 @@ START=0.05
 END=1.0
 UNTIL=0.5
 
-RUN_NAME="opd-skywork7b-to-r1qwen1.5b-tvdwarm-${DIRECTION}-s${START}-e${END}-u${UNTIL}"
+RUN_NAME="opd-skywork7b-to-r1qwen1.5b-reverse-tvdwarm-${DIRECTION}-s${START}-e${END}-u${UNTIL}"
 mkdir -p /group/40092/howu/RL-main/logs
 
 export WANDB_INIT_TIMEOUT=300
@@ -99,10 +99,11 @@ python examples/run_distillation_math.py \
     checkpointing.save_period=25 \
     checkpointing.save_consolidated=false \
     checkpointing.checkpoint_dir="checkpoints/distillation-${RUN_NAME}" \
+    loss_fn.kl_type=reverse \
     loss_fn.tvd_gate.mode="${MODE}" \
     loss_fn.tvd_gate.direction="${DIRECTION}" \
     loss_fn.tvd_gate.start_threshold="${START}" \
     loss_fn.tvd_gate.end_threshold="${END}" \
     loss_fn.tvd_gate.warmup_until_frac="${UNTIL}" \
     logger.wandb_enabled=true \
-    logger.wandb.name="${RUN_NAME}" || true
+    logger.wandb.name="${RUN_NAME}"

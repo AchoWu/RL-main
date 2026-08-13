@@ -1806,6 +1806,65 @@ def test_distillation_loss_zero_outside_topk():
             assert loss.item() != 0.0  # Should have some meaningful loss
 
 
+def test_tvd_gated_distillation_defers_kept_token_normalization():
+    """The loss returns a numerator; the DTensor worker divides by global K."""
+    torch.manual_seed(0)
+    data, student_logits = setup_distillation_test_data(topk=8)
+    global_valid_toks = torch.sum(
+        data["sample_mask"].unsqueeze(-1) * data["token_mask"][:, 1:]
+    )
+
+    base_cfg = {
+        "kl_type": "forward",
+        "mixed_kl_weight": 0.5,
+        "zero_outside_topk": True,
+    }
+    baseline_loss, _ = DistillationLossFn(base_cfg)(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=global_valid_toks,
+    )
+
+    gated_data = dict(data)
+    gated_data["teacher_logsumexp"] = torch.logsumexp(
+        data["teacher_topk_logits"], dim=-1
+    )
+    gated_cfg = {
+        **base_cfg,
+        "tvd_gate": {
+            "mode": "fixed",
+            "threshold": 1.0,
+            "direction": "low",
+        },
+    }
+    gated_loss_fn = DistillationLossFn(gated_cfg)
+    gated_loss_fn._tvd_gate_state = {"mode": "fixed", "tau": 1.0}
+    gated_loss, metrics = gated_loss_fn(
+        student_logits,
+        gated_data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=global_valid_toks,
+    )
+
+    assert metrics["tvd_gate_kept_tokens_sum"] == pytest.approx(
+        global_valid_toks.item()
+    )
+    torch.testing.assert_close(gated_loss, baseline_loss * global_valid_toks)
+
+    # Strict `TVD < 0` keeps nothing. The worker will clamp only the divisor
+    # to one, so this zero numerator remains a finite zero loss/gradient.
+    gated_loss_fn._tvd_gate_state = {"mode": "fixed", "tau": 0.0}
+    empty_loss, empty_metrics = gated_loss_fn(
+        student_logits,
+        gated_data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=global_valid_toks,
+    )
+    assert empty_metrics["tvd_gate_kept_tokens_sum"] == 0.0
+    torch.testing.assert_close(empty_loss, torch.zeros_like(empty_loss))
+
+
 def test_distillation_loss_gradient_flow():
     """Test gradient flow in distillation loss function."""
     data, student_logits = setup_distillation_test_data()
