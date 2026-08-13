@@ -967,18 +967,27 @@ class SequencePackingLossWrapper:
 class TvdGateConfig(TypedDict, total=False):
     """Config for TVD-based token gating on top of the KL distillation loss.
 
-    Gates the KL loss to only the tokens where the student and teacher
-    disagree the most, using the truncated total-variation distance
+    Gates the KL loss based on the truncated total-variation distance
     TVD_topk = 1 - sum_y min(p_S(y), p_T(y)) over the teacher's top-k support
-    as the disagreement signal. This is the OAD `acceptance` quantity turned
-    into a *filter* rather than a loss target — direct OAD optimization was
-    observed to collapse into repetition; using TVD only as a gate leaves
-    the KL loss shape intact.
+    as the per-token disagreement signal. This is the OAD `acceptance`
+    quantity turned into a *filter* rather than a loss target — direct OAD
+    optimization was observed to collapse into repetition; using TVD only
+    as a gate leaves the KL loss shape intact.
+
+    Directions (which tokens PASS the gate):
+        - "high" (default): keep iff TVD > τ.  Learn the tokens where
+                            student and teacher disagree the most first.
+                            Sweep τ 0→1: 0 keeps everything, 1 keeps nothing.
+        - "low":            keep iff TVD < τ.  Curriculum-style: start by
+                            learning tokens the student already almost
+                            matches the teacher on, then gradually open up
+                            to the harder / more-disagreeing tokens as τ
+                            grows toward 1.
 
     Modes:
         - "none":   no gating (baseline; token_mask is untouched).
-        - "fixed":  keep tokens with TVD > threshold (single scalar).
-        - "warmup": threshold anneals from `start_threshold` at step 0 to
+        - "fixed":  constant scalar τ from cfg["threshold"].
+        - "warmup": τ anneals from `start_threshold` at step 0 to
                     `end_threshold` at global_step / max_num_steps ==
                     warmup_until_frac, then stays constant. S-shaped cosine
                     curve (matches prefix_length_warmup cosine mode).
@@ -987,7 +996,8 @@ class TvdGateConfig(TypedDict, total=False):
     """
 
     mode: str  # "none" | "fixed" | "warmup"
-    threshold: float  # used when mode == "fixed"; TVD > threshold ⇒ keep
+    direction: str  # "high" (default) | "low"
+    threshold: float  # used when mode == "fixed"; interpretation depends on direction
     start_threshold: float  # used when mode == "warmup"; τ at step 0
     end_threshold: float  # used when mode == "warmup"; τ at (and after) warmup_until_frac
     warmup_until_frac: float  # fraction of max_num_steps to finish annealing
@@ -1052,6 +1062,14 @@ class DistillationLossFn(LossFunction):
         # When mode == "none" (or no gate cfg at all) the gate is off — the
         # loss is byte-identical to a baseline run.
         self.tvd_gate_cfg = cfg.get("tvd_gate")
+        # Direction is a stable-per-run choice, not a per-step state, so we
+        # freeze it at __init__ time from cfg (default "high" preserves the
+        # semantics of every experiment prior to this feature).
+        self.tvd_gate_direction: str = (
+            self.tvd_gate_cfg.get("direction", "high")
+            if self.tvd_gate_cfg is not None
+            else "high"
+        )
         self._tvd_gate_state: dict[str, Any] = {
             "tau": float("-inf"),
             "mode": "none",
@@ -1073,6 +1091,11 @@ class DistillationLossFn(LossFunction):
                 raise ValueError(
                     f"Unknown tvd_gate.mode={gate_mode!r}. "
                     "Expected one of: 'none', 'fixed', 'warmup'."
+                )
+            if self.tvd_gate_direction not in ("high", "low"):
+                raise ValueError(
+                    f"Unknown tvd_gate.direction={self.tvd_gate_direction!r}. "
+                    "Expected one of: 'high', 'low'."
                 )
             assert self.zero_outside_topk, (
                 "tvd_gate requires loss_fn.zero_outside_topk=true; "
@@ -1388,7 +1411,19 @@ class DistillationLossFn(LossFunction):
                 ).sum(-1)  # [B, S-1]
                 tvd_topk = (1.0 - acceptance_topk).clamp(0.0, 1.0)  # [B, S-1]
 
-                gate_w = (tvd_topk > tvd_gate_tau).to(base_mask.dtype)
+                # Direction selects which side of τ passes the gate:
+                #   "high" -> tvd > τ   (learn the hardest tokens first;
+                #                        sweep τ 0→1 shrinks the surviving set)
+                #   "low"  -> tvd < τ   (curriculum: learn easy overlap first;
+                #                        sweep τ 0→1 grows the surviving set,
+                #                        eventually including everything)
+                # Strict comparison in both cases keeps the boundary case
+                # (`tvd == τ`) out of the loss — matches the original design
+                # of the "high" direction and is symmetric.
+                if self.tvd_gate_direction == "low":
+                    gate_w = (tvd_topk < tvd_gate_tau).to(base_mask.dtype)
+                else:
+                    gate_w = (tvd_topk > tvd_gate_tau).to(base_mask.dtype)
                 # These sums are computed once and reused: mask -> loss, and
                 # base/kept/tvd sums -> diagnostics. Loss uses `global_valid_toks`
                 # (the pre-gate DP-aware count) as its denominator — the gate

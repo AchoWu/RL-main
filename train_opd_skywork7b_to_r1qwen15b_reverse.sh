@@ -95,7 +95,6 @@ mkdir -p /group/40092/howu/RL-main/logs
 # 越来越不敢停 → 序列长到 max_length 也答不出答案。这个开关把这些位置从
 # loss 里剔除，让 EOS/continuation 决策不进入蒸馏梯度。
 # 如需关闭对照，把这一整行注释掉即可（不传 mask_eos_positions ⇒ 走原始 OPD）。
-EOS_MASK_ARG="+loss_fn.mask_eos_positions=[151643]"
 
 export HTTP_PROXY=http://star-proxy.oa.com:3128
 export HTTPS_PROXY=http://star-proxy.oa.com:3128
@@ -125,7 +124,6 @@ python examples/run_distillation_math.py \
     logger.wandb_enabled=true \
     loss_fn.kl_type=reverse \
     logger.wandb.name="${RUN_NAME}" || true
-#    ${EOS_MASK_ARG} || true
 
 python test_gpu.py
 

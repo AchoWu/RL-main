@@ -1,0 +1,55 @@
+# TVD-gated KL distillation, "low → high" curriculum variant.
+#
+# Same TVD-gate machinery as distillation_math_tvd_gated.yaml, but the gate
+# passes the OPPOSITE side of τ:
+#
+#   direction: "low"   ⇒   keep iff TVD_topk < τ
+#
+# Combined with a warmup schedule that grows τ from a small value (learn only
+# the tokens where student ≈ teacher — TVD_topk ≈ 0) up to 1.0 (τ=1 admits
+# every token since TVD is bounded by 1), this yields a curriculum:
+#
+#   step 0:            τ = start_threshold → only "easy" (already-similar)
+#                                              tokens contribute to loss
+#   warmup_until_frac: τ = end_threshold  = 1.0 → every token contributes
+#                                                (equivalent to baseline KL)
+#
+# Motivation: prevent the loss from being dominated by high-TVD outlier
+# positions early in training (which can destabilize the student), and only
+# take on the harder tokens once the student has caught up on the easy ones.
+#
+# Requires:
+#   - loss_fn.zero_outside_topk = true   (needs true global student probs)
+#   - Path B teacher logsumexp (DTensor backend; Megatron path unsupported)
+defaults: distillation_math.yaml
+
+checkpointing:
+    # NOTE: direction is baked into the path so "low" and "high" runs never
+    # overwrite each other's checkpoints.
+    checkpoint_dir: "checkpoints/distillation-tvd-warmup-${loss_fn.tvd_gate.direction}-${policy.model_name}"
+
+loss_fn:
+    type: "kl"
+    kl_type: "mixed"
+    mixed_kl_weight: 0.5
+    zero_outside_topk: true  # REQUIRED for tvd_gate
+
+    tvd_gate:
+        mode: "warmup"
+        direction: "low"       # keep iff TVD < τ (curriculum: easy → hard)
+        # start_threshold is small: at step 0 only tokens with TVD < 0.05
+        # (student and teacher near-agreement) pass the gate.
+        start_threshold: 0.05
+        # end_threshold = 1.0: TVD is bounded by 1, so `tvd < 1.0` admits
+        # essentially every token. Once warmup completes the gate becomes a
+        # no-op and training is byte-identical to the baseline KL loss.
+        end_threshold: 1.0
+        # Spend 50% of max_num_steps on the curriculum. Beyond that τ stays
+        # at end_threshold, i.e. full-token training for the second half.
+        warmup_until_frac: 0.5
+
+logger:
+    wandb:
+        # Bake direction + endpoints into the run name so different curricula
+        # (e.g. start=0.1 end=1.0 vs start=0.05 end=0.5) don't share a name.
+        name: "distillation-tvd-warmup-${loss_fn.tvd_gate.direction}-s${loss_fn.tvd_gate.start_threshold}-e${loss_fn.tvd_gate.end_threshold}-${data.dataset_name}-${policy.model_name}"

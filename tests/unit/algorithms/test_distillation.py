@@ -897,3 +897,76 @@ class TestTvdGateInitValidation:
         # Absent tvd_gate key = feature completely disabled, same as mode=none.
         loss = DistillationLossFn(self._kl_base())
         assert loss._tvd_gate_state["mode"] == "none"
+
+    def test_direction_defaults_to_high(self):
+        # Legacy configs (no `direction` key) must resolve to "high" so every
+        # experiment that predates this feature keeps its exact prior semantics.
+        cfg = self._kl_base()
+        cfg["tvd_gate"] = {"mode": "fixed", "threshold": 0.3}
+        loss = DistillationLossFn(cfg)
+        assert loss.tvd_gate_direction == "high"
+
+    def test_direction_low_accepted(self):
+        cfg = self._kl_base()
+        cfg["tvd_gate"] = {"mode": "fixed", "threshold": 0.3, "direction": "low"}
+        loss = DistillationLossFn(cfg)
+        assert loss.tvd_gate_direction == "low"
+
+    def test_unknown_direction_raises(self):
+        cfg = self._kl_base()
+        cfg["tvd_gate"] = {
+            "mode": "fixed",
+            "threshold": 0.3,
+            "direction": "sideways",
+        }
+        with pytest.raises(ValueError, match="Unknown tvd_gate.direction"):
+            DistillationLossFn(cfg)
+
+    def test_direction_none_when_mode_none(self):
+        # mode=none should short-circuit direction validation — a stray
+        # `direction=bogus` on a disabled gate is not the user's problem.
+        cfg = self._kl_base()
+        cfg["tvd_gate"] = {"mode": "none", "direction": "sideways"}
+        loss = DistillationLossFn(cfg)
+        assert loss._tvd_gate_state["mode"] == "none"
+
+
+class TestTvdGateDirectionMath:
+    """Direction semantics: 'high' keeps tvd > τ, 'low' keeps tvd < τ.
+
+    These verify the boolean comparison the gate uses, not the loss function
+    end-to-end (which would need a full teacher/student mock).
+    """
+
+    def test_low_direction_keeps_similar_tokens(self):
+        # Curriculum start: only near-agreement tokens (low TVD) survive.
+        tvd = torch.tensor([0.01, 0.2, 0.5, 0.9])
+        # τ = 0.1 — only the 0.01 token passes.
+        gate = (tvd < 0.1).float()
+        assert gate.tolist() == [1.0, 0.0, 0.0, 0.0]
+
+    def test_low_direction_at_tau_one_keeps_all(self):
+        # τ = 1.0 admits every token because TVD is clamped to [0, 1].
+        # (Strict < means tvd == 1.0 exactly is dropped, but such positions
+        # are vanishingly rare — only when student and teacher are literally
+        # disjoint on the top-k support.)
+        tvd = torch.tensor([0.0, 0.4, 0.9])
+        gate = (tvd < 1.0).float()
+        assert gate.sum().item() == 3
+
+    def test_low_direction_at_tau_zero_keeps_none(self):
+        # τ = 0 keeps nothing (TVD is bounded below by 0, strict <).
+        tvd = torch.tensor([0.0, 0.1, 0.5])
+        gate = (tvd < 0.0).float()
+        assert gate.sum().item() == 0
+
+    def test_high_and_low_are_complementary_off_boundary(self):
+        # Away from the boundary (tvd != τ), every token is kept by exactly
+        # one direction. Together they cover the full base mask — useful as
+        # a sanity check that the two directions really are "either side".
+        tvd = torch.tensor([0.1, 0.3, 0.7, 0.95])
+        tau = 0.5
+        high = (tvd > tau).float()
+        low = (tvd < tau).float()
+        # No tvd equals τ here, so high + low == 1 everywhere.
+        assert torch.equal(high + low, torch.ones_like(high))

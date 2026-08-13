@@ -84,7 +84,7 @@ done
 echo "▶ Using policy=$POLICY_MODEL  teacher=$TEACHER_MODEL"
 
 # 修改：更新实验名，避免自动加载原来 3 epoch 实验的 checkpoint
-RUN_NAME="opd-skywork7b-to-r1qwen1.5b-mask-eos-lr1e-6-1epoch-holdout1k-seed42"
+RUN_NAME="opd-skywork7b-to-r1qwen1.5b-nomask-mixkl-260811"
 
 mkdir -p /group/40092/howu/RL-main/logs
 
@@ -122,8 +122,8 @@ python examples/run_distillation_math.py \
     checkpointing.save_period=25 \
     checkpointing.save_consolidated=false \
     checkpointing.checkpoint_dir="checkpoints/distillation-${RUN_NAME}" \
-    ${EOS_MASK_ARG} \
     logger.wandb_enabled=true \
     logger.wandb.name="${RUN_NAME}" || true
+#    ${EOS_MASK_ARG} || true
 
 python test_gpu.py
