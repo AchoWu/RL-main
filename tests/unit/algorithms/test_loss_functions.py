@@ -1975,6 +1975,99 @@ def test_distillation_loss_fn_initialization():
     assert loss_fn.mixed_kl_weight == 0.3
     assert loss_fn.zero_outside_topk
 
+    factorized_config = {
+        "kl_type": "reverse",
+        "mixed_kl_weight": 0.5,
+        "zero_outside_topk": False,
+        "stop_content": {
+            "enabled": True,
+            "eos_token_id": 7,
+            "stop_kl_type": "forward",
+            "stop_kl_weight": 1.0,
+            "probability_eps": 1.0e-7,
+        },
+    }
+    loss_fn = DistillationLossFn(factorized_config)
+    assert loss_fn.stop_content_enabled
+    assert loss_fn.stop_content_stop_kl_type == "forward"
+
+
+def test_stop_content_requires_reverse_content_kl():
+    with pytest.raises(AssertionError, match="kl_type='reverse'"):
+        DistillationLossFn(
+            {
+                "kl_type": "forward",
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": False,
+                "stop_content": {
+                    "enabled": True,
+                    "eos_token_id": 7,
+                    "stop_kl_type": "forward",
+                    "stop_kl_weight": 1.0,
+                    "probability_eps": 1.0e-7,
+                },
+            }
+        )
+
+
+def test_stop_content_decouples_eos_outside_teacher_topk():
+    """A pure EOS-logit change contributes only through the stop term."""
+    eos_token_id = 4
+    seq_len = 3
+    student_logits = torch.tensor(
+        [[[1.0, 0.0, -1.0, -2.0, -3.0]] * seq_len], requires_grad=True
+    )
+    teacher_full_logits = torch.tensor(
+        [[[1.0, 0.0, -1.0, -2.0, 1.5]] * seq_len]
+    )
+    teacher_topk_indices = torch.tensor([[[0, 1, 2, 3]] * seq_len])
+    teacher_topk_logits = teacher_full_logits.gather(-1, teacher_topk_indices)
+    data = {
+        "input_ids": torch.tensor([[0, 1, eos_token_id]]),
+        "input_lengths": torch.tensor([seq_len]),
+        "token_mask": torch.tensor([[0.0, 1.0, 1.0]]),
+        "sample_mask": torch.tensor([1.0]),
+        "teacher_topk_logits": teacher_topk_logits,
+        "teacher_topk_indices": teacher_topk_indices,
+        "teacher_logsumexp": torch.logsumexp(teacher_full_logits, dim=-1),
+        "teacher_eos_logits": teacher_full_logits[..., eos_token_id],
+    }
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+            "stop_content": {
+                "enabled": True,
+                "eos_token_id": eos_token_id,
+                "stop_kl_type": "forward",
+                "stop_kl_weight": 1.0,
+                "probability_eps": 1.0e-7,
+            },
+        }
+    )
+
+    loss, metrics = loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(2.0),
+    )
+
+    student_stop = student_logits.softmax(-1)[0, 0, eos_token_id]
+    teacher_stop = teacher_full_logits.softmax(-1)[0, 0, eos_token_id]
+    expected_stop_kl = teacher_stop * torch.log(teacher_stop / student_stop) + (
+        1.0 - teacher_stop
+    ) * torch.log((1.0 - teacher_stop) / (1.0 - student_stop))
+    assert loss.item() == pytest.approx(expected_stop_kl.item(), rel=1.0e-5)
+    assert metrics["stop_content_content_kl"] == pytest.approx(0.0, abs=1.0e-6)
+    assert metrics["stop_content_stop_kl"] == pytest.approx(
+        expected_stop_kl.item(), rel=1.0e-5
+    )
+    loss.backward()
+    assert student_logits.grad is not None
+    assert student_logits.grad[..., eos_token_id].abs().sum() > 0
+
 
 def test_distillation_loss_fn_call():
     """Test DistillationLossFn call interface."""
