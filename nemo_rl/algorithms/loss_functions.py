@@ -1003,11 +1003,22 @@ class TvdGateConfig(TypedDict, total=False):
     warmup_until_frac: float  # fraction of max_num_steps to finish annealing
 
 
+class StopContentConfig(TypedDict):
+    """Configuration for factorized content and stopping distillation."""
+
+    enabled: bool
+    eos_token_id: int
+    stop_kl_type: str  # "forward" | "reverse"
+    stop_kl_weight: float
+    probability_eps: float
+
+
 class DistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float
     zero_outside_topk: bool
     tvd_gate: NotRequired[TvdGateConfig]
+    stop_content: NotRequired[StopContentConfig]
     # If set, drops these token ids from the loss mask at their *target*
     # positions (i.e. positions where the *next* token equals one of these
     # ids). Motivation: on-policy rollouts that stop early on wrong answers
@@ -1030,6 +1041,9 @@ class DistillationLossDataDict(TypedDict):
     # gate to convert teacher_topk_logits into true global probabilities.
     # Populated by the DTensor teacher worker (see Path B plumbing).
     teacher_logsumexp: NotRequired[torch.Tensor]
+    # Exact teacher EOS logit at every position. Required by stop-content
+    # factorization even when EOS is not among the teacher's top-k tokens.
+    teacher_eos_logits: NotRequired[torch.Tensor]
 
 
 class DistillationLossFn(LossFunction):
@@ -1046,6 +1060,56 @@ class DistillationLossFn(LossFunction):
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
+
+        self.stop_content_cfg = cfg.get("stop_content")
+        self.stop_content_enabled = bool(
+            self.stop_content_cfg is not None
+            and self.stop_content_cfg.get("enabled", False)
+        )
+        self.stop_content_eos_token_id = -1
+        self.stop_content_stop_kl_type = "reverse"
+        self.stop_content_stop_kl_weight = 1.0
+        self.stop_content_probability_eps = 1.0e-7
+        if self.stop_content_enabled:
+            assert self.stop_content_cfg is not None
+            for required_key in (
+                "eos_token_id",
+                "stop_kl_type",
+                "stop_kl_weight",
+                "probability_eps",
+            ):
+                assert required_key in self.stop_content_cfg, (
+                    "loss_fn.stop_content.enabled=true requires "
+                    f"{required_key!r}."
+                )
+            assert self.kl_type == "reverse", (
+                "stop-content factorization requires loss_fn.kl_type='reverse' "
+                "for the conditional content term."
+            )
+            self.stop_content_eos_token_id = int(
+                self.stop_content_cfg["eos_token_id"]
+            )
+            self.stop_content_stop_kl_type = str(
+                self.stop_content_cfg["stop_kl_type"]
+            )
+            self.stop_content_stop_kl_weight = float(
+                self.stop_content_cfg["stop_kl_weight"]
+            )
+            self.stop_content_probability_eps = float(
+                self.stop_content_cfg["probability_eps"]
+            )
+            assert self.stop_content_stop_kl_type in ("forward", "reverse"), (
+                "loss_fn.stop_content.stop_kl_type must be 'forward' or 'reverse'."
+            )
+            assert self.stop_content_eos_token_id >= 0, (
+                "loss_fn.stop_content.eos_token_id must be non-negative."
+            )
+            assert self.stop_content_stop_kl_weight >= 0.0, (
+                "loss_fn.stop_content.stop_kl_weight must be non-negative."
+            )
+            assert 0.0 < self.stop_content_probability_eps < 0.5, (
+                "loss_fn.stop_content.probability_eps must be in (0, 0.5)."
+            )
 
         # Optional list of token ids to drop from the loss mask at target
         # positions. See DistillationLossConfig.mask_eos_positions docstring.
@@ -1152,6 +1216,11 @@ class DistillationLossFn(LossFunction):
                 f"topk must be positive, got {teacher_topk_indices.shape[-1]}. "
                 "topk=0 is not supported as it would result in empty tensor operations."
             )
+        if self.stop_content_enabled and teacher_topk_indices.shape[-1] < 2:
+            raise ValueError(
+                "stop-content factorization requires topk >= 2 so the conditional "
+                "content support remains non-empty when EOS is in the top-k."
+            )
 
         # Determine processing path and setup variables
         if vocab_parallel_group is not None:
@@ -1187,6 +1256,59 @@ class DistillationLossFn(LossFunction):
         else:
             parallel_group = None
             logits_tensor = next_token_logits
+
+        # EOS is frequently outside the teacher's top-k support. Gather its
+        # exact full-vocabulary student log-probability separately so the stop
+        # decision does not inherit the top-k approximation used for content.
+        student_eos_logprobs: Optional[torch.Tensor] = None
+        if self.stop_content_enabled:
+            eos_indices = torch.full(
+                (*teacher_topk_indices.shape[:2], 1),
+                self.stop_content_eos_token_id,
+                dtype=torch.long,
+                device=teacher_topk_indices.device,
+            )
+            if parallel_group is not None:
+                eos_indices_local = eos_indices
+                eos_pad_len = 0
+                if cp_size > 1:
+                    eos_pad_len = (
+                        logits_tensor.shape[1] * cp_size - eos_indices_local.shape[1]
+                    )
+                    if eos_pad_len > 0:
+                        eos_indices_local = torch.nn.functional.pad(
+                            eos_indices_local, (0, 0, 0, eos_pad_len), value=0
+                        )
+                    cp_rank = torch.distributed.get_rank(cp_group)
+                    eos_indices_local = _get_tokens_on_this_cp_rank(
+                        eos_indices_local, cp_rank, cp_size, seq_dim=1
+                    )
+
+                eos_chunk_size = max(1, min(int(logits_tensor.shape[1]), 1024))
+                student_eos_logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
+                    logits_tensor,
+                    eos_indices_local,
+                    vocab_start_index,
+                    vocab_end_index,
+                    eos_chunk_size,
+                    parallel_group,
+                    False,
+                )
+                if cp_size > 1:
+                    student_eos_logprobs = allgather_cp_sharded_tensor(
+                        student_eos_logprobs, cp_group, seq_dim=1
+                    )
+                    if eos_pad_len > 0:
+                        student_eos_logprobs = student_eos_logprobs[
+                            :, :-eos_pad_len, :
+                        ]
+            else:
+                student_full_logprobs = torch.nn.functional.log_softmax(
+                    logits_tensor, dim=-1
+                )
+                student_eos_logprobs = student_full_logprobs.gather(
+                    dim=-1, index=eos_indices.to(student_full_logprobs.device)
+                )
 
         # Process based on zero_outside_topk setting
         if self.zero_outside_topk and parallel_group is not None:
@@ -1293,6 +1415,11 @@ class DistillationLossFn(LossFunction):
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
+        content_kl_component: Optional[torch.Tensor] = None
+        stop_kl_component: Optional[torch.Tensor] = None
+        student_stop_probability: Optional[torch.Tensor] = None
+        teacher_stop_probability: Optional[torch.Tensor] = None
+
         loss_correction_term = torch.zeros_like(student_probs[..., 0])  # [B, S-1]
         if self.zero_outside_topk and self.kl_type != "forward":
             H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
@@ -1304,7 +1431,85 @@ class DistillationLossFn(LossFunction):
                     1.0 - self.mixed_kl_weight
                 )
 
-        if self.kl_type == "forward":
+        if self.stop_content_enabled:
+            if "teacher_logsumexp" not in data or "teacher_eos_logits" not in data:
+                raise KeyError(
+                    "stop-content factorization requires `teacher_logsumexp` and "
+                    "`teacher_eos_logits` from the teacher DTensor worker."
+                )
+            assert student_eos_logprobs is not None
+
+            # Conditional content distributions on the same teacher top-k
+            # support as the existing baseline, but with EOS removed before
+            # normalization. This isolates "what to write next" from whether
+            # the model should stop.
+            content_support = (
+                teacher_topk_indices[:, :-1, :].to(student_topk_logprobs.device)
+                != self.stop_content_eos_token_id
+            )
+            teacher_content_scores = teacher_topk_logits[:, :-1, :].masked_fill(
+                ~content_support, float("-inf")
+            )
+            student_content_scores = student_topk_logprobs.masked_fill(
+                ~content_support, float("-inf")
+            )
+            teacher_content_logprobs = torch.nn.functional.log_softmax(
+                teacher_content_scores, dim=-1
+            )
+            student_content_logprobs = torch.nn.functional.log_softmax(
+                student_content_scores, dim=-1
+            )
+            student_content_probs = student_content_logprobs.exp()
+            content_log_ratio = torch.where(
+                content_support,
+                student_content_logprobs - teacher_content_logprobs,
+                torch.zeros_like(student_content_logprobs),
+            )
+            content_kl_component = (
+                student_content_probs * content_log_ratio
+            ).sum(dim=-1)
+
+            eps = self.stop_content_probability_eps
+            student_stop_probability = student_eos_logprobs[:, :-1, 0].exp().clamp(
+                min=eps, max=1.0 - eps
+            )
+            teacher_stop_logprob = (
+                data["teacher_eos_logits"].to(
+                    device=student_topk_logprobs.device, dtype=torch.float32
+                )
+                - data["teacher_logsumexp"].to(
+                    device=student_topk_logprobs.device, dtype=torch.float32
+                )
+            )[:, :-1]
+            teacher_stop_probability = teacher_stop_logprob.exp().clamp(
+                min=eps, max=1.0 - eps
+            )
+
+            log_student_stop = student_stop_probability.log()
+            log_teacher_stop = teacher_stop_probability.log()
+            log_student_continue = torch.log1p(-student_stop_probability)
+            log_teacher_continue = torch.log1p(-teacher_stop_probability)
+            if self.stop_content_stop_kl_type == "forward":
+                stop_kl_component = teacher_stop_probability * (
+                    log_teacher_stop - log_student_stop
+                ) + (1.0 - teacher_stop_probability) * (
+                    log_teacher_continue - log_student_continue
+                )
+            else:
+                stop_kl_component = student_stop_probability * (
+                    log_student_stop - log_teacher_stop
+                ) + (1.0 - student_stop_probability) * (
+                    log_student_continue - log_teacher_continue
+                )
+
+            # Reverse-KL chain rule weights the conditional content term by
+            # the student's probability of continuing. A forward stop term
+            # changes only the binary termination geometry.
+            per_token_kl = (
+                (1.0 - student_stop_probability) * content_kl_component
+                + self.stop_content_stop_kl_weight * stop_kl_component
+            )
+        elif self.kl_type == "forward":
             # p_i * (log p_i - log q_i)  = p_i * log(p_i / q_i)
             # [B, S-1, k] = [B, S-1, k] * [B, S-1, k]
             per_token_kl = teacher_probs * (
@@ -1326,8 +1531,10 @@ class DistillationLossFn(LossFunction):
                 + (1.0 - self.mixed_kl_weight) * kl_reverse
             )
 
-        # [B, S-1, k] → [B, S-1]
-        per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
+        # [B, S-1, k] → [B, S-1]. The factorized path already reduced the
+        # support dimension above.
+        if not self.stop_content_enabled:
+            per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term
 
         # Masking and reduction.
         # The optional TVD gate lives entirely inside the branch that has
@@ -1459,6 +1666,28 @@ class DistillationLossFn(LossFunction):
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
             "num_valid_samples": int(batch_size),
         }
+
+        if self.stop_content_enabled and content_kl_component is not None:
+            assert stop_kl_component is not None
+            assert student_stop_probability is not None
+            assert teacher_stop_probability is not None
+            component_mask = base_mask if "token_mask" in data else None
+            component_tensors = {
+                "stop_content_content_kl": content_kl_component,
+                "stop_content_stop_kl": stop_kl_component,
+                "stop_content_student_eos_probability": student_stop_probability,
+                "stop_content_teacher_eos_probability": teacher_stop_probability,
+            }
+            for metric_name, metric_tensor in component_tensors.items():
+                if component_mask is None:
+                    metric_value = metric_tensor.mean()
+                else:
+                    metric_value = masked_mean(
+                        metric_tensor,
+                        component_mask,
+                        global_normalization_factor=global_valid_toks,
+                    )
+                metrics[metric_name] = float(metric_value.detach().item())
 
         # Gate diagnostics: only emitted when the gate ran and per-token mask
         # was available. Values are RAW SUMS. The outer worker will pre-divide

@@ -763,6 +763,8 @@ def distillation_train(
                     # not set this key, and OADLossFn will surface a clear error.
                     if "logsumexp" in teacher_topk:
                         train_data["teacher_logsumexp"] = teacher_topk["logsumexp"]
+                    if "eos_logits" in teacher_topk:
+                        train_data["teacher_eos_logits"] = teacher_topk["eos_logits"]
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
