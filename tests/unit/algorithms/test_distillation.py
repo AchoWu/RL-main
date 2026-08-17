@@ -20,7 +20,9 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
+    _add_distillation_loss_masks,
     _default_distillation_save_state,
+    _generate_teacher_prefixes,
     _resolve_tvd_gate_threshold,
     _summarize_validation_metrics,
     check_vocab_equality,
@@ -29,7 +31,74 @@ from nemo_rl.algorithms.distillation import (
 )
 from nemo_rl.algorithms.loss_functions import DistillationLossFn
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def test_teacher_prefix_generation_appends_masked_context():
+    batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "token_ids": torch.tensor([1, 2]),
+                        "role": "user",
+                        "content": "problem",
+                    }
+                ]
+            ],
+            "loss_multiplier": torch.tensor([1.0]),
+        }
+    )
+    teacher_generation = MagicMock()
+    teacher_generation.generate.return_value = BatchedDataDict(
+        {
+            "output_ids": torch.tensor([[1, 2, 10, 11]]),
+            "generation_lengths": torch.tensor([2]),
+            "unpadded_sequence_lengths": torch.tensor([4]),
+            "logprobs": torch.zeros(1, 4),
+        }
+    )
+    tokenizer = MagicMock()
+    tokenizer.pad_token_id = 0
+    tokenizer.batch_decode.return_value = ["teacher prefix"]
+
+    result, metrics = _generate_teacher_prefixes(
+        teacher_generation, batch, tokenizer, requested_length=2
+    )
+
+    prefix = result["message_log"][0][-1]
+    assert prefix["token_ids"].tolist() == [10, 11]
+    assert prefix["token_loss_mask"].tolist() == [0, 0]
+    assert metrics["teacher_prefix_mean_tokens"] == 2.0
+    assert metrics["teacher_prefix_reached_requested_rate"] == 1.0
+
+
+def test_distillation_masks_preserve_teacher_prefix_and_unmask_student_suffix():
+    message_logs = [
+        [
+            {"role": "user", "token_ids": torch.tensor([1, 2])},
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([3, 4]),
+                "token_loss_mask": torch.tensor([0, 0]),
+            },
+            {"role": "assistant", "token_ids": torch.tensor([5, 6])},
+        ]
+    ]
+
+    _add_distillation_loss_masks(message_logs)
+
+    assert message_logs[0][0]["token_loss_mask"].tolist() == [0, 0]
+    assert message_logs[0][1]["token_loss_mask"].tolist() == [0, 0]
+    assert message_logs[0][2]["token_loss_mask"].tolist() == [1, 1]
+
+    flat, _ = batched_message_log_to_flat_message(
+        message_logs, pad_value_dict={"token_ids": 0}
+    )
+    # DistillationLossFn slices token_mask[:, 1:]. Both student targets,
+    # including the first token after the teacher prefix, remain unmasked.
+    assert flat["token_loss_mask"][:, 1:].tolist() == [[0, 0, 0, 1, 1]]
 
 
 @pytest.fixture
