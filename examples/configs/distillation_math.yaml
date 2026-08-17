@@ -11,6 +11,9 @@ distillation:
     max_val_samples: 512
     topk_logits_k: 64
     seed: 42
+    # 0 keeps vanilla OPD. A positive value lets the teacher generate up to
+    # this many context-only tokens before the student continues the rollout.
+    teacher_prefix_length: 0
 
 loss_fn:
     type: "kl"  # "kl" (default) or "oad" (Overlap-Aligned Distillation, see BASIC_OAD_PROPOSAL.md)
