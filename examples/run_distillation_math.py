@@ -169,6 +169,7 @@ def main() -> None:
         student_policy,
         teacher_policy,
         student_generation,
+        teacher_generation,
         dataloader,
         val_dataloader,
         loss_fn,
@@ -192,6 +193,7 @@ def main() -> None:
         checkpointer,
         distillation_state,
         master_config,
+        teacher_generation=teacher_generation,
     )
 
 
