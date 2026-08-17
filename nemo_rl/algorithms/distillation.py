@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations.
 # limitations under the License.
-import os
+import copy
 import math
+import os
 import warnings
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
@@ -50,7 +51,9 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import (
+    GenerationDatumSpec,
     GenerationInterface,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -85,6 +88,7 @@ class DistillationConfig(TypedDict):
     max_val_samples: int
     topk_logits_k: int
     seed: int
+    teacher_prefix_length: NotRequired[int]
 
 
 class DistillationSaveState(TypedDict):
@@ -207,6 +211,7 @@ def setup(
     ColocatablePolicyInterface,  # student_policy
     ColocatablePolicyInterface,  # teacher_policy
     Optional[GenerationInterface],  # student_generation
+    Optional[GenerationInterface],  # teacher_generation
     StatefulDataLoader,
     Optional[StatefulDataLoader],
     DistillationLossFn | OADLossFn,
@@ -218,7 +223,7 @@ def setup(
     """Main entry point for distillation algorithm.
 
     Returns:
-        tuple of student_policy, teacher_policy, student_generation,
+        tuple of student_policy, teacher_policy, student_generation, teacher_generation,
         train_dataloader, val_dataloader,
         loss_fn, logger, checkpointer, distillation_save_state, master_config
     """
@@ -235,6 +240,19 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
     )
+
+    teacher_prefix_length = int(distillation_config.get("teacher_prefix_length", 0))
+    if teacher_prefix_length < 0:
+        raise ValueError(
+            "distillation.teacher_prefix_length must be greater than or equal to 0"
+        )
+    if teacher_prefix_length > 0:
+        if generation_config["backend"] != "vllm":
+            raise ValueError("Teacher-prefix OPD currently requires the vLLM backend")
+        if not generation_config["colocated"]["enabled"]:
+            raise ValueError(
+                "Teacher-prefix OPD currently requires colocated vLLM generation"
+            )
 
     # Disallow SP + packing for dtensor path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
@@ -331,9 +349,11 @@ def setup(
             * cluster_config["num_nodes"],
             use_gpus=True,
             num_gpus_per_node=cluster_config["gpus_per_node"],
-            max_colocated_worker_groups=1
-            if generation_config["backend"] == "megatron"
-            else 3,
+            max_colocated_worker_groups=(
+                1
+                if generation_config["backend"] == "megatron"
+                else (4 if teacher_prefix_length > 0 else 3)
+            ),
         )
         train_cluster = cluster
         inference_cluster = cluster
@@ -465,6 +485,34 @@ def setup(
         )
 
     # ==========================
+    #    Teacher Prefix Generation
+    # ==========================
+    teacher_generation: Optional[GenerationInterface] = None
+    if teacher_prefix_length > 0:
+        teacher_generation_config = copy.deepcopy(teacher_config["generation"])
+        assert teacher_generation_config is not None
+        teacher_generation_config["model_name"] = teacher_config["model_name"]
+        teacher_generation_config["max_new_tokens"] = teacher_prefix_length
+        teacher_generation_config = configure_generation_config(
+            teacher_generation_config, tokenizer, is_eval=True
+        )
+        if "vllm_cfg" in teacher_generation_config:
+            teacher_generation_config["vllm_cfg"]["hf_overrides"] = (
+                teacher_config.get("hf_config_overrides", {})
+            )
+        teacher_generation = VllmGeneration(
+            cluster=inference_cluster,
+            config=cast(VllmConfig, teacher_generation_config),
+            name_prefix="teacher_prefix_vllm",
+        )
+        teacher_generation.finish_generation()
+        print(
+            "  ✓ Using teacher vLLM for fixed-prefix generation "
+            f"(max {teacher_prefix_length} tokens)",
+            flush=True,
+        )
+
+    # ==========================
     #      Student Policy
     # ==========================
     print("\n▶ Setting up student policy...", flush=True)
@@ -537,6 +585,7 @@ def setup(
         student_policy,
         teacher_policy,
         student_generation,
+        teacher_generation,
         dataloader,
         val_dataloader,
         loss_fn,
@@ -550,6 +599,86 @@ def setup(
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
+
+
+def _generate_teacher_prefixes(
+    teacher_generation: GenerationInterface,
+    batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    requested_length: int,
+) -> tuple[BatchedDataDict[DatumSpec], dict[str, float]]:
+    """Append teacher-generated assistant prefixes without environment interaction."""
+    flat_messages, input_lengths = batched_message_log_to_flat_message(
+        batch["message_log"],
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+    )
+    generation_input = BatchedDataDict[GenerationDatumSpec](
+        {
+            "input_ids": flat_messages["token_ids"],
+            "input_lengths": input_lengths,
+            "stop_strings": batch.get("stop_strings", [None] * batch.size),
+        }
+    )
+    generation_input.update(flat_messages.get_multimodal_dict(as_tensors=False))
+    if "vllm_content" in batch:
+        generation_input["vllm_content"] = batch["vllm_content"]
+    if "vllm_images" in batch:
+        generation_input["vllm_images"] = batch["vllm_images"]
+    if "vllm_videos" in batch:
+        generation_input["vllm_videos"] = batch["vllm_videos"]
+
+    outputs = teacher_generation.generate(generation_input, greedy=False)
+    prefix_ids: list[torch.Tensor] = []
+    for i, input_length in enumerate(input_lengths.tolist()):
+        total_length = int(outputs["unpadded_sequence_lengths"][i].item())
+        prefix_ids.append(outputs["output_ids"][i, input_length:total_length])
+
+    prefix_texts = tokenizer.batch_decode(prefix_ids, skip_special_tokens=True)
+    for message_log, text, token_ids in zip(
+        batch["message_log"], prefix_texts, prefix_ids
+    ):
+        message_log.append(
+            {
+                "role": "assistant",
+                "content": text,
+                "token_ids": token_ids,
+                # This prefix is context only. The first student suffix token remains
+                # unmasked because masks are aligned to target token ownership.
+                "token_loss_mask": torch.zeros_like(token_ids),
+            }
+        )
+
+    actual_lengths = torch.tensor([len(ids) for ids in prefix_ids], dtype=torch.float32)
+    reached_requested = actual_lengths >= requested_length
+    eos_token_id = tokenizer.eos_token_id
+    ended_with_eos = torch.tensor(
+        [
+            bool(len(ids) > 0 and eos_token_id is not None and ids[-1] == eos_token_id)
+            for ids in prefix_ids
+        ],
+        dtype=torch.float32,
+    )
+    metrics = {
+        "teacher_prefix_requested_tokens": float(requested_length),
+        "teacher_prefix_mean_tokens": actual_lengths.mean().item(),
+        "teacher_prefix_reached_requested_rate": reached_requested.float()
+        .mean()
+        .item(),
+        "teacher_prefix_ended_with_eos_rate": ended_with_eos.mean().item(),
+    }
+    return batch, metrics
+
+
+def _add_distillation_loss_masks(message_logs: list[list[dict[str, Any]]]) -> None:
+    """Mask context and teacher prefixes while training on student targets."""
+    for message_log in message_logs:
+        for message in message_log:
+            if "token_loss_mask" in message:
+                continue
+            if message["role"] == "assistant":
+                message["token_loss_mask"] = torch.ones_like(message["token_ids"])
+            else:
+                message["token_loss_mask"] = torch.zeros_like(message["token_ids"])
 
 
 def distillation_train(
@@ -566,6 +695,7 @@ def distillation_train(
     checkpointer: CheckpointManager,
     distillation_save_state: DistillationSaveState,
     master_config: MasterConfig,
+    teacher_generation: Optional[GenerationInterface] = None,
 ) -> None:
     """Run Distillation training algorithm."""
     timer = Timer()
@@ -673,6 +803,30 @@ def distillation_train(
                     else:
                         student_generation.prepare_for_generation()
 
+                teacher_prefix_metrics: dict[str, float] = {}
+                if teacher_generation is not None:
+                    # Student refit above leaves the training policy offloaded. Sleep
+                    # student vLLM while the fixed teacher vLLM owns the GPU memory.
+                    student_generation.finish_generation()
+                    with timer.time("teacher_prefix_generation"):
+                        teacher_generation.prepare_for_generation()
+                        try:
+                            repeated_batch, teacher_prefix_metrics = (
+                                _generate_teacher_prefixes(
+                                    teacher_generation,
+                                    repeated_batch,
+                                    tokenizer,
+                                    requested_length=int(
+                                        master_config["distillation"][
+                                            "teacher_prefix_length"
+                                        ]
+                                    ),
+                                )
+                            )
+                        finally:
+                            teacher_generation.finish_generation()
+                    student_generation.prepare_for_generation()
+
                 with timer.time("generation"):
                     # Use async rollouts if vLLM async engine is enabled
                     if _should_use_async_rollouts(master_config):
@@ -709,17 +863,9 @@ def distillation_train(
                     student_generation.finish_generation()
 
                 with timer.time("data_processing"):
-                    # Add loss mask and advantages to each message in LLMMessageLogType
-                    for message_log in repeated_batch["message_log"]:
-                        for message in message_log:
-                            if message["role"] == "assistant":
-                                message["token_loss_mask"] = torch.ones_like(
-                                    message["token_ids"]
-                                )
-                            else:
-                                message["token_loss_mask"] = torch.zeros_like(
-                                    message["token_ids"]
-                                )
+                    # Explicit masks on teacher prefixes are preserved; newly
+                    # generated student assistant targets are unmasked.
+                    _add_distillation_loss_masks(repeated_batch["message_log"])
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -891,6 +1037,7 @@ def distillation_train(
                         metrics["tvd_gate_kept_frac"] = float("nan")
                         metrics["tvd_topk_mean"] = float("nan")
                 metrics.update(rollout_metrics)
+                metrics.update(teacher_prefix_metrics)
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
