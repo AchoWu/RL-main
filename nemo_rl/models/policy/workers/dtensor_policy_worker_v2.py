@@ -68,6 +68,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
+    gather_logits_at_global_indices,
     get_logprobs_from_vocab_parallel_logits,
     vocab_cp_logsumexp,
 )
@@ -1462,6 +1463,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         out_topk_vals = []
         out_topk_idx = []
         out_lse = []
+        out_eos_logits = []
+        eos_token_id = self.tokenizer.eos_token_id
+        if eos_token_id is None:
+            raise ValueError("Distillation requires tokenizer.eos_token_id.")
         self.model.eval()
 
         with torch.no_grad():
@@ -1619,6 +1624,20 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                             cp_group=cp_group,
                             full_seq_len=seq_len,
                         )  # [B, S]
+                        eos_indices = torch.full(
+                            (batch_size, seq_len, 1),
+                            eos_token_id,
+                            dtype=torch.long,
+                            device=local_logits.device,
+                        )
+                        eos_logits = gather_logits_at_global_indices(
+                            local_logits,
+                            eos_indices,
+                            tp_group=tp_group,
+                            cp_group=cp_group,
+                            vocab_start_index=vocab_start_index,
+                            vocab_end_index=vocab_end_index,
+                        ).squeeze(-1)
 
                         vals = allgather_cp_sharded_tensor(
                             vals, cp_group, seq_dim=sequence_dim
@@ -1649,10 +1668,25 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 tp_group=tp_group,
                                 cp_group=None,
                             )  # [B, S]
+                            eos_indices = torch.full(
+                                (batch_size, seq_len, 1),
+                                eos_token_id,
+                                dtype=torch.long,
+                                device=local_logits.device,
+                            )
+                            eos_logits = gather_logits_at_global_indices(
+                                local_logits,
+                                eos_indices,
+                                tp_group=tp_group,
+                                cp_group=None,
+                                vocab_start_index=vocab_start_index,
+                                vocab_end_index=vocab_end_index,
+                            ).squeeze(-1)
                         else:
                             full_logits = logits.to(torch.float32)
                             vals, idx = torch.topk(full_logits, k=k, dim=-1)
                             lse = torch.logsumexp(full_logits, dim=-1)  # [B, S]
+                            eos_logits = full_logits[..., eos_token_id]
 
                 # Handle sequence packing unpacking
                 if self.enable_seq_packing:
@@ -1677,6 +1711,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         dtype=lse.dtype,
                         device=lse.device,
                     )
+                    unpacked_eos_logits = torch.zeros(
+                        (original_batch_size, original_seq_len),
+                        dtype=eos_logits.dtype,
+                        device=eos_logits.device,
+                    )
 
                     # Get cumulative sequence lengths for unpacking
                     cu_seqlens = flash_attn_kwargs.cu_seqlens_q
@@ -1691,11 +1730,15 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         unpacked_vals[i, :seq_len_actual, :] = vals[0, start:end, :]
                         unpacked_idx[i, :seq_len_actual, :] = idx[0, start:end, :]
                         unpacked_lse[i, :seq_len_actual] = lse[0, start:end]
+                        unpacked_eos_logits[i, :seq_len_actual] = eos_logits[
+                            0, start:end
+                        ]
 
                     # Replace with unpacked results
                     vals = unpacked_vals
                     idx = unpacked_idx
                     lse = unpacked_lse
+                    eos_logits = unpacked_eos_logits
 
                     # Update batch_size and seq_len for consistency
                     batch_size = original_batch_size
@@ -1706,14 +1749,18 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 out_topk_vals.append(vals.cpu())
                 out_topk_idx.append(idx.cpu())
                 out_lse.append(lse.cpu())
+                out_eos_logits.append(eos_logits.cpu())
 
         ret = BatchedDataDict[Any]()
         # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
         all_topk_vals_padded = []
         all_topk_idx_padded = []
         all_lse_padded = []
+        all_eos_logits_padded = []
         target_seq_len = seq_dim_size
-        for vals, idx, lse in zip(out_topk_vals, out_topk_idx, out_lse):
+        for vals, idx, lse, eos_logits in zip(
+            out_topk_vals, out_topk_idx, out_lse, out_eos_logits
+        ):
             pad_needed = target_seq_len - vals.shape[1]
             if pad_needed > 0:
                 # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
@@ -1727,9 +1774,16 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 lse = torch.nn.functional.pad(
                     lse, (0, pad_needed, 0, 0), mode="constant", value=0.0
                 )
+                eos_logits = torch.nn.functional.pad(
+                    eos_logits,
+                    (0, pad_needed, 0, 0),
+                    mode="constant",
+                    value=0.0,
+                )
             all_topk_vals_padded.append(vals)
             all_topk_idx_padded.append(idx)
             all_lse_padded.append(lse)
+            all_eos_logits_padded.append(eos_logits)
 
         ret["topk_logits"] = (
             torch.cat(all_topk_vals_padded, dim=0)
@@ -1745,6 +1799,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             torch.cat(all_lse_padded, dim=0)
             if len(all_lse_padded) > 1
             else all_lse_padded[0]
+        ).cpu()
+        ret["eos_logits"] = (
+            torch.cat(all_eos_logits_padded, dim=0)
+            if len(all_eos_logits_padded) > 1
+            else all_eos_logits_padded[0]
         ).cpu()
         return ret
 
