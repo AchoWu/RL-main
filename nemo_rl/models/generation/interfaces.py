@@ -137,6 +137,8 @@ class GenerationDatumSpec(TypedDict):
     - input_ids: Tensor of token IDs representing the input sequences (right padded)
     - input_lengths: Tensor containing the actual length of each sequence (without padding)
     - stop_strings: Optional list of strings to stop generation (per sample)
+    - max_new_tokens: Optional per-sample tensor. All entries in one worker
+      batch must match; it overrides the configured generation cap for that call.
     - __extra__: Additional model-specific data fields
 
     Example of a batch with 4 entries with different sequence lengths:
@@ -158,6 +160,8 @@ class GenerationDatumSpec(TypedDict):
     All functions receiving or returning GenerationDatumSpec should ensure
     right padding is maintained. Use verify_right_padding() to check.
     """
+
+    max_new_tokens: NotRequired[torch.Tensor]
 
     input_ids: torch.Tensor
     input_lengths: torch.Tensor
