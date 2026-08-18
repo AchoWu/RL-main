@@ -23,6 +23,7 @@ from nemo_rl.algorithms.distillation import (
     _add_distillation_loss_masks,
     _default_distillation_save_state,
     _generate_teacher_prefixes,
+    _resolve_progressive_teacher_block,
     _resolve_tvd_gate_threshold,
     _summarize_validation_metrics,
     check_vocab_equality,
@@ -72,6 +73,55 @@ def test_teacher_prefix_generation_appends_masked_context():
     assert prefix["token_loss_mask"].tolist() == [0, 0]
     assert metrics["teacher_prefix_mean_tokens"] == 2.0
     assert metrics["teacher_prefix_reached_requested_rate"] == 1.0
+    generation_input = teacher_generation.generate.call_args.args[0]
+    assert generation_input["max_new_tokens"].tolist() == [2]
+
+
+@pytest.mark.parametrize(
+    ("global_step", "expected_prefix", "expected_stage"),
+    [
+        (0, 0, 0),
+        (24, 0, 0),
+        (25, 256, 1),
+        (49, 256, 1),
+        (50, 512, 2),
+        (74, 512, 2),
+        (75, 768, 3),
+        (99, 768, 3),
+    ],
+)
+def test_progressive_teacher_block_schedule(
+    global_step, expected_prefix, expected_stage
+):
+    config = {
+        "teacher_prefix_length": 0,
+        "progressive_teacher_blocks": {
+            "enabled": True,
+            "block_size": 256,
+            "steps_per_stage": 25,
+        },
+    }
+
+    prefix_length, student_block_size, stage = _resolve_progressive_teacher_block(
+        config, global_step
+    )
+
+    assert prefix_length == expected_prefix
+    assert student_block_size == 256
+    assert stage == expected_stage
+
+
+def test_progressive_teacher_block_disabled_preserves_fixed_prefix():
+    config = {
+        "teacher_prefix_length": 512,
+        "progressive_teacher_blocks": {
+            "enabled": False,
+            "block_size": 256,
+            "steps_per_stage": 25,
+        },
+    }
+
+    assert _resolve_progressive_teacher_block(config, 75) == (512, None, 0)
 
 
 def test_distillation_masks_preserve_teacher_prefix_and_unmask_student_suffix():
