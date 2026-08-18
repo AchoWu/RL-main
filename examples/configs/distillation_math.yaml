@@ -14,6 +14,12 @@ distillation:
     # 0 keeps vanilla OPD. A positive value lets the teacher generate up to
     # this many context-only tokens before the student continues the rollout.
     teacher_prefix_length: 0
+    # Optional block curriculum. At stage s, the teacher supplies s*block_size
+    # context tokens and the student generates/trains on the next block.
+    progressive_teacher_blocks:
+        enabled: false
+        block_size: 256
+        steps_per_stage: 25
 
 loss_fn:
     type: "kl"  # "kl" (default) or "oad" (Overlap-Aligned Distillation, see BASIC_OAD_PROPOSAL.md)
