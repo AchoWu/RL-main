@@ -75,6 +75,12 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+class ProgressiveTeacherBlocksConfig(TypedDict):
+    enabled: bool
+    block_size: int
+    steps_per_stage: int
+
+
 class DistillationConfig(TypedDict):
     # Training configuration
     num_prompts_per_step: int
@@ -89,6 +95,7 @@ class DistillationConfig(TypedDict):
     topk_logits_k: int
     seed: int
     teacher_prefix_length: NotRequired[int]
+    progressive_teacher_blocks: NotRequired[ProgressiveTeacherBlocksConfig]
 
 
 class DistillationSaveState(TypedDict):
@@ -111,6 +118,29 @@ def _default_distillation_save_state() -> DistillationSaveState:
         "consumed_samples": 0,
         "total_valid_tokens": 0,
     }
+
+
+def _resolve_progressive_teacher_block(
+    distillation_config: DistillationConfig, global_step: int
+) -> tuple[int, Optional[int], int]:
+    """Return teacher-prefix length, student block cap, and curriculum stage."""
+    progressive_cfg = distillation_config.get("progressive_teacher_blocks")
+    if not progressive_cfg or not progressive_cfg.get("enabled", False):
+        return int(distillation_config.get("teacher_prefix_length", 0)), None, 0
+
+    block_size = int(progressive_cfg["block_size"])
+    steps_per_stage = int(progressive_cfg["steps_per_stage"])
+    if block_size <= 0:
+        raise ValueError("progressive_teacher_blocks.block_size must be greater than 0")
+    if steps_per_stage <= 0:
+        raise ValueError(
+            "progressive_teacher_blocks.steps_per_stage must be greater than 0"
+        )
+    if global_step < 0:
+        raise ValueError("global_step must be greater than or equal to 0")
+
+    stage = global_step // steps_per_stage
+    return stage * block_size, block_size, stage
 
 
 def _resolve_tvd_gate_threshold(
@@ -246,7 +276,32 @@ def setup(
         raise ValueError(
             "distillation.teacher_prefix_length must be greater than or equal to 0"
         )
-    if teacher_prefix_length > 0:
+    progressive_cfg = distillation_config.get("progressive_teacher_blocks")
+    progressive_enabled = bool(
+        progressive_cfg is not None and progressive_cfg.get("enabled", False)
+    )
+    max_teacher_prefix_length = teacher_prefix_length
+    if progressive_enabled:
+        assert progressive_cfg is not None
+        if teacher_prefix_length != 0:
+            raise ValueError(
+                "teacher_prefix_length must be 0 when progressive_teacher_blocks "
+                "is enabled"
+            )
+        _, block_size, _ = _resolve_progressive_teacher_block(
+            distillation_config, global_step=0
+        )
+        assert block_size is not None
+        steps_per_stage = int(progressive_cfg["steps_per_stage"])
+        max_stage = max(0, (distillation_config["max_num_steps"] - 1) // steps_per_stage)
+        max_teacher_prefix_length = max_stage * block_size
+        if generation_config.get("vllm_cfg", {}).get("async_engine", False):
+            raise ValueError(
+                "progressive_teacher_blocks currently requires synchronous vLLM "
+                "generation"
+            )
+
+    if max_teacher_prefix_length > 0:
         if generation_config["backend"] != "vllm":
             raise ValueError("Teacher-prefix OPD currently requires the vLLM backend")
         if not generation_config["colocated"]["enabled"]:
@@ -352,7 +407,7 @@ def setup(
             max_colocated_worker_groups=(
                 1
                 if generation_config["backend"] == "megatron"
-                else (4 if teacher_prefix_length > 0 else 3)
+                else (4 if max_teacher_prefix_length > 0 else 3)
             ),
         )
         train_cluster = cluster
@@ -488,11 +543,11 @@ def setup(
     #    Teacher Prefix Generation
     # ==========================
     teacher_generation: Optional[GenerationInterface] = None
-    if teacher_prefix_length > 0:
+    if max_teacher_prefix_length > 0:
         teacher_generation_config = copy.deepcopy(teacher_config["generation"])
         assert teacher_generation_config is not None
         teacher_generation_config["model_name"] = teacher_config["model_name"]
-        teacher_generation_config["max_new_tokens"] = teacher_prefix_length
+        teacher_generation_config["max_new_tokens"] = max_teacher_prefix_length
         teacher_generation_config = configure_generation_config(
             teacher_generation_config, tokenizer, is_eval=True
         )
@@ -507,8 +562,8 @@ def setup(
         )
         teacher_generation.finish_generation()
         print(
-            "  ✓ Using teacher vLLM for fixed-prefix generation "
-            f"(max {teacher_prefix_length} tokens)",
+            "  ✓ Using teacher vLLM for teacher-prefix generation "
+            f"(max {max_teacher_prefix_length} tokens)",
             flush=True,
         )
 
@@ -617,6 +672,9 @@ def _generate_teacher_prefixes(
             "input_ids": flat_messages["token_ids"],
             "input_lengths": input_lengths,
             "stop_strings": batch.get("stop_strings", [None] * batch.size),
+            "max_new_tokens": torch.full(
+                (batch.size,), requested_length, dtype=torch.long
+            ),
         }
     )
     generation_input.update(flat_messages.get_multimodal_dict(as_tensors=False))
@@ -803,26 +861,55 @@ def distillation_train(
                     else:
                         student_generation.prepare_for_generation()
 
+                (
+                    current_teacher_prefix_length,
+                    student_block_size,
+                    curriculum_stage,
+                ) = _resolve_progressive_teacher_block(
+                    master_config["distillation"], global_step=total_steps
+                )
+                progressive_cfg = master_config["distillation"].get(
+                    "progressive_teacher_blocks"
+                )
+                progressive_enabled = bool(
+                    progressive_cfg is not None
+                    and progressive_cfg.get("enabled", False)
+                )
                 teacher_prefix_metrics: dict[str, float] = {}
-                if teacher_generation is not None:
+                if progressive_enabled:
+                    assert student_block_size is not None
+                    teacher_prefix_metrics = {
+                        "curriculum_stage": float(curriculum_stage),
+                        "curriculum_teacher_prefix_tokens": float(
+                            current_teacher_prefix_length
+                        ),
+                        "curriculum_student_block_tokens": float(student_block_size),
+                        "teacher_prefix_requested_tokens": float(
+                            current_teacher_prefix_length
+                        ),
+                        "teacher_prefix_mean_tokens": 0.0,
+                        "teacher_prefix_reached_requested_rate": 1.0,
+                        "teacher_prefix_ended_with_eos_rate": 0.0,
+                    }
+                if (
+                    teacher_generation is not None
+                    and current_teacher_prefix_length > 0
+                ):
                     # Student refit above leaves the training policy offloaded. Sleep
                     # student vLLM while the fixed teacher vLLM owns the GPU memory.
                     student_generation.finish_generation()
                     with timer.time("teacher_prefix_generation"):
                         teacher_generation.prepare_for_generation()
                         try:
-                            repeated_batch, teacher_prefix_metrics = (
+                            repeated_batch, generated_prefix_metrics = (
                                 _generate_teacher_prefixes(
                                     teacher_generation,
                                     repeated_batch,
                                     tokenizer,
-                                    requested_length=int(
-                                        master_config["distillation"][
-                                            "teacher_prefix_length"
-                                        ]
-                                    ),
+                                    requested_length=current_teacher_prefix_length,
                                 )
                             )
+                            teacher_prefix_metrics.update(generated_prefix_metrics)
                         finally:
                             teacher_generation.finish_generation()
                     student_generation.prepare_for_generation()
@@ -859,6 +946,7 @@ def distillation_train(
                                 "max_rollout_turns"
                             ],
                             greedy=False,
+                            max_new_tokens_per_turn=student_block_size,
                         )
                     student_generation.finish_generation()
 
