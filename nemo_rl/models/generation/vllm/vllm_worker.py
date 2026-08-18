@@ -550,9 +550,22 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         input_lengths = data["input_lengths"]
         batch_stop_strings: list[list[str]] = data.get("stop_strings", [])
         stop_strings = self._merge_stop_strings(batch_stop_strings)
+        request_max_new_tokens: Optional[int] = None
+        if "max_new_tokens" in data:
+            per_sample_limits = data["max_new_tokens"]
+            unique_limits = torch.unique(per_sample_limits)
+            if unique_limits.numel() != 1:
+                raise ValueError(
+                    "Synchronous vLLM generation requires one max_new_tokens "
+                    "value per worker batch"
+                )
+            request_max_new_tokens = int(unique_limits.item())
+            if request_max_new_tokens <= 0:
+                raise ValueError("max_new_tokens must be greater than 0")
         sampling_params = self._build_sampling_params(
             greedy=greedy,
             stop_strings=stop_strings,
+            max_new_tokens=request_max_new_tokens,
         )
 
         # verify inputs have correct padding
