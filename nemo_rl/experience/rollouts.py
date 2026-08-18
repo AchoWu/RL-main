@@ -337,6 +337,7 @@ def run_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    max_new_tokens_per_turn: int | None = None,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
     """Runs a multi-turn rollout loop, interacting with the environment.
 
@@ -348,6 +349,7 @@ def run_multi_turn_rollout(
         max_rollout_turns: Maximum number of agent-environment interaction turns.
         max_seq_len: Maximum sequence length allowed.
         greedy: Whether to use greedy decoding.
+        max_new_tokens_per_turn: Optional generation cap for each rollout turn.
 
     Returns:
         Tuple containing:
@@ -404,6 +406,14 @@ def run_multi_turn_rollout(
                 "stop_strings": active_stop_strings,
             }
         )
+        if max_new_tokens_per_turn is not None:
+            if max_new_tokens_per_turn <= 0:
+                raise ValueError("max_new_tokens_per_turn must be greater than 0")
+            generation_input_data["max_new_tokens"] = torch.full(
+                (len(active_input_lengths),),
+                max_new_tokens_per_turn,
+                dtype=torch.long,
+            )
         # add the multimodal data to the generation input data
         multimodal_data = active_flat_messages.get_multimodal_dict(as_tensors=False)
         generation_input_data.update(multimodal_data)
