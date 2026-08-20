@@ -1,0 +1,12 @@
+# Weight every valid token by the teacher's top-1/top-2 probability margin.
+# Weights are normalized to mean 1 independently in each sequence, preserving
+# the old baseline's effective loss scale while emphasizing confident targets.
+defaults: distillation_math.yaml
+
+loss_fn:
+    zero_outside_topk: false
+    reduction: "token_mean"
+    teacher_margin_weight:
+        enabled: true
+        power: 1.0
+        eps: 1.0e-8
