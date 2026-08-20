@@ -1002,6 +1002,28 @@ def _sequence_balanced_mean(
     )
 
 
+def _mean_normalized_token_weights(
+    scores: torch.Tensor,
+    valid_mask: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Normalize non-negative scores to mean one within each sequence."""
+    valid = valid_mask.to(dtype=scores.dtype)
+    valid_counts = valid.sum(dim=-1, keepdim=True)
+    score_means = (scores * valid).sum(dim=-1, keepdim=True) / valid_counts.clamp_min(
+        1.0
+    )
+    normalized = scores / score_means.clamp_min(eps)
+    # A completely flat zero-margin sequence carries no confidence signal.
+    # Fall back to baseline weights instead of silently dropping the sequence.
+    normalized = torch.where(
+        score_means > eps,
+        normalized,
+        torch.ones_like(normalized),
+    )
+    return normalized * valid
+
+
 class TvdGateConfig(TypedDict, total=False):
     """Config for TVD-based token gating on top of the KL distillation loss.
 
@@ -1052,6 +1074,14 @@ class TvdGateConfig(TypedDict, total=False):
     keep_fraction: float  # used when mode == "top_fraction"; in (0, 1]
 
 
+class TeacherMarginWeightConfig(TypedDict, total=False):
+    """Continuous token weights based on the teacher's top-1/top-2 margin."""
+
+    enabled: bool
+    power: float
+    eps: float
+
+
 class StopContentConfig(TypedDict):
     """Configuration for factorized content and stopping distillation."""
 
@@ -1068,6 +1098,7 @@ class DistillationLossConfig(TypedDict):
     zero_outside_topk: bool
     reduction: NotRequired[str]  # "token_mean" (default) | "sequence_mean"
     tvd_gate: NotRequired[TvdGateConfig]
+    teacher_margin_weight: NotRequired[TeacherMarginWeightConfig]
     stop_content: NotRequired[StopContentConfig]
     # If set, drops these token ids from the loss mask at their *target*
     # positions (i.e. positions where the *next* token equals one of these
@@ -1170,6 +1201,28 @@ class DistillationLossFn(LossFunction):
         else:
             self.mask_eos_positions = [int(x) for x in raw_mask_eos]
 
+        self.teacher_margin_weight_cfg = cfg.get("teacher_margin_weight")
+        self.teacher_margin_weight_enabled = bool(
+            self.teacher_margin_weight_cfg is not None
+            and self.teacher_margin_weight_cfg.get("enabled", False)
+        )
+        self.teacher_margin_weight_power = 1.0
+        self.teacher_margin_weight_eps = 1.0e-8
+        if self.teacher_margin_weight_enabled:
+            assert self.teacher_margin_weight_cfg is not None
+            self.teacher_margin_weight_power = float(
+                self.teacher_margin_weight_cfg.get("power", 1.0)
+            )
+            self.teacher_margin_weight_eps = float(
+                self.teacher_margin_weight_cfg.get("eps", 1.0e-8)
+            )
+            assert self.teacher_margin_weight_power > 0.0, (
+                "loss_fn.teacher_margin_weight.power must be positive."
+            )
+            assert self.teacher_margin_weight_eps > 0.0, (
+                "loss_fn.teacher_margin_weight.eps must be positive."
+            )
+
         # TVD gate: uses the OAD acceptance quantity as a *filter* on which
         # tokens contribute to the KL loss (not as a loss target itself). The
         # main training loop stamps `_tvd_gate_state` before each train call
@@ -1200,6 +1253,11 @@ class DistillationLossFn(LossFunction):
             else "none"
         )
         self.tvd_gate_config_mode = gate_mode
+        if self.teacher_margin_weight_enabled and gate_mode != "none":
+            raise ValueError(
+                "teacher_margin_weight and tvd_gate cannot be enabled together. "
+                "Run confidence weighting as an isolated baseline ablation."
+            )
         # A TVD-gated loss is accumulated as an unnormalized token-loss sum.
         # The DTensor worker sees every microbatch and DP shard, so it can divide
         # the accumulated gradients by the exact global number of kept tokens
@@ -1627,6 +1685,10 @@ class DistillationLossFn(LossFunction):
         tvd_gate_mode = str(self._tvd_gate_state.get("mode", "none"))
         tvd_gate_tau = float(self._tvd_gate_state.get("tau", float("-inf")))
         tvd_gate_active = tvd_gate_mode != "none"
+        confidence_base_sum: Optional[torch.Tensor] = None
+        confidence_margin_sum: Optional[torch.Tensor] = None
+        confidence_weight_sum: Optional[torch.Tensor] = None
+        confidence_weight_sq_sum: Optional[torch.Tensor] = None
 
         if "token_mask" in data and "sample_mask" in data:
             token_mask = data["token_mask"][:, 1:]
@@ -1678,6 +1740,56 @@ class DistillationLossFn(LossFunction):
             confident_disagreement_sum: Optional[torch.Tensor] = None
             selected_confident_disagreement_sum: Optional[torch.Tensor] = None
 
+            teacher_p_topk_true: Optional[torch.Tensor] = None
+            teacher_margin: Optional[torch.Tensor] = None
+
+            if tvd_gate_active or self.teacher_margin_weight_enabled:
+                if "teacher_logsumexp" not in data:
+                    feature_name = (
+                        "tvd_gate" if tvd_gate_active else "teacher_margin_weight"
+                    )
+                    raise KeyError(
+                        f"{feature_name} requires `teacher_logsumexp` in train_data "
+                        "(Path B). The teacher worker must return exact "
+                        "full-vocab logsumexp (DTensor backend only)."
+                    )
+                needs_teacher_margin = (
+                    self.teacher_margin_weight_enabled
+                    or tvd_gate_mode == "top_fraction"
+                )
+                if needs_teacher_margin and teacher_topk_logits.shape[-1] < 2:
+                    raise ValueError(
+                        "teacher confidence weighting requires teacher topk >= 2."
+                    )
+                teacher_lse = data["teacher_logsumexp"].to(
+                    device=student_topk_logprobs.device, dtype=torch.float32
+                )
+                teacher_true_log_p_topk = (
+                    teacher_topk_logits.to(torch.float32) - teacher_lse.unsqueeze(-1)
+                )[:, :-1, :]
+                teacher_p_topk_true = teacher_true_log_p_topk.exp()
+
+            if self.teacher_margin_weight_enabled:
+                assert teacher_p_topk_true is not None
+                top_two_teacher_probs = torch.topk(
+                    teacher_p_topk_true, k=2, dim=-1
+                ).values
+                teacher_margin = (
+                    top_two_teacher_probs[..., 0] - top_two_teacher_probs[..., 1]
+                ).clamp_min(0.0)
+                confidence_scores = teacher_margin.pow(self.teacher_margin_weight_power)
+                confidence_weights = _mean_normalized_token_weights(
+                    confidence_scores,
+                    base_mask,
+                    eps=self.teacher_margin_weight_eps,
+                ).to(base_mask.dtype)
+                mask = base_mask * confidence_weights
+                with torch.no_grad():
+                    confidence_base_sum = base_mask.sum()
+                    confidence_margin_sum = (teacher_margin * base_mask).sum()
+                    confidence_weight_sum = mask.sum()
+                    confidence_weight_sq_sum = mask.square().sum()
+
             if tvd_gate_active:
                 # Gate scores use true global probabilities regardless of
                 # whether the KL uses a global or top-k conditional student
@@ -1686,19 +1798,7 @@ class DistillationLossFn(LossFunction):
                     raise RuntimeError(
                         "tvd_gate requires global student top-k probabilities."
                     )
-                if "teacher_logsumexp" not in data:
-                    raise KeyError(
-                        "tvd_gate requires `teacher_logsumexp` in train_data "
-                        "(Path B). The teacher worker must return exact "
-                        "full-vocab logsumexp (DTensor backend only)."
-                    )
-                teacher_lse = data["teacher_logsumexp"].to(
-                    device=student_topk_logprobs.device, dtype=torch.float32
-                )  # [B, S]
-                teacher_true_log_p_topk = (
-                    teacher_topk_logits.to(torch.float32) - teacher_lse.unsqueeze(-1)
-                )[:, :-1, :]  # [B, S-1, k]
-                teacher_p_topk_true = teacher_true_log_p_topk.exp()
+                assert teacher_p_topk_true is not None
                 student_p_topk_true = student_topk_global_logprobs.to(
                     torch.float32
                 ).exp()
@@ -1708,16 +1808,14 @@ class DistillationLossFn(LossFunction):
                 tvd_topk = (1.0 - acceptance_topk).clamp(0.0, 1.0)  # [B, S-1]
 
                 if tvd_gate_mode == "top_fraction":
-                    if teacher_p_topk_true.shape[-1] < 2:
-                        raise ValueError(
-                            "confident_disagreement requires teacher topk >= 2."
+                    if teacher_margin is None:
+                        top_two_teacher_probs = torch.topk(
+                            teacher_p_topk_true, k=2, dim=-1
+                        ).values
+                        teacher_margin = (
+                            top_two_teacher_probs[..., 0]
+                            - top_two_teacher_probs[..., 1]
                         )
-                    top_two_teacher_probs = torch.topk(
-                        teacher_p_topk_true, k=2, dim=-1
-                    ).values
-                    teacher_margin = (
-                        top_two_teacher_probs[..., 0] - top_two_teacher_probs[..., 1]
-                    )
                     confident_disagreement = tvd_topk * teacher_margin
                     gate_w = _top_fraction_mask(
                         confident_disagreement,
@@ -1735,7 +1833,7 @@ class DistillationLossFn(LossFunction):
                 # unnormalized numerator below. The DTensor worker accumulates
                 # all microbatches, all-reduces kept_valid_sum over DP, then
                 # divides the accumulated gradients by that exact global count.
-                mask = base_mask * gate_w
+                mask = mask * gate_w
                 with torch.no_grad():
                     base_valid_sum = base_mask.sum()
                     kept_valid_sum = mask.sum()
@@ -1822,6 +1920,19 @@ class DistillationLossFn(LossFunction):
                 metrics["tvd_selected_confident_disagreement_sum"] = float(
                     selected_confident_disagreement_sum.item()
                 )
+
+        if self.teacher_margin_weight_enabled and confidence_base_sum is not None:
+            assert confidence_margin_sum is not None
+            assert confidence_weight_sum is not None
+            assert confidence_weight_sq_sum is not None
+            metrics["teacher_margin_base_tokens_sum"] = float(
+                confidence_base_sum.item()
+            )
+            metrics["teacher_margin_sum"] = float(confidence_margin_sum.item())
+            metrics["teacher_margin_weight_sum"] = float(confidence_weight_sum.item())
+            metrics["teacher_margin_weight_sq_sum"] = float(
+                confidence_weight_sq_sum.item()
+            )
 
         return kl_loss, metrics
 

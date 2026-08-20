@@ -1155,6 +1155,25 @@ def distillation_train(
                             metrics[
                                 "tvd_selected_confident_disagreement_mean"
                             ] = float("nan")
+                if "teacher_margin_base_tokens_sum" in metrics:
+                    _base = metrics.pop("teacher_margin_base_tokens_sum")
+                    _margin_sum = metrics.pop("teacher_margin_sum")
+                    _weight_sum = metrics.pop("teacher_margin_weight_sum")
+                    _weight_sq_sum = metrics.pop("teacher_margin_weight_sq_sum")
+                    if _base > 0:
+                        metrics["teacher_margin_mean"] = _margin_sum / _base
+                        metrics["teacher_margin_weight_mean"] = _weight_sum / _base
+                        metrics["teacher_margin_weight_rms"] = math.sqrt(
+                            _weight_sq_sum / _base
+                        )
+                        metrics["teacher_margin_weight_ess_frac"] = (
+                            _weight_sum * _weight_sum
+                        ) / max(_base * _weight_sq_sum, 1.0e-12)
+                    else:
+                        metrics["teacher_margin_mean"] = float("nan")
+                        metrics["teacher_margin_weight_mean"] = float("nan")
+                        metrics["teacher_margin_weight_rms"] = float("nan")
+                        metrics["teacher_margin_weight_ess_frac"] = float("nan")
                 metrics.update(rollout_metrics)
                 metrics.update(teacher_prefix_metrics)
                 total_valid_tokens += metrics["global_valid_toks"]
