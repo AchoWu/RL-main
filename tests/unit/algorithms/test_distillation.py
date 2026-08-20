@@ -894,6 +894,19 @@ class TestResolveTvdGateThreshold:
         _, tau = _resolve_tvd_gate_threshold(cfg, 0, 1000)
         assert tau == pytest.approx(0.1, abs=1e-9)
 
+    def test_top_fraction_returns_fixed_keep_fraction(self):
+        mode, keep_fraction = _resolve_tvd_gate_threshold(
+            {
+                "mode": "top_fraction",
+                "score": "confident_disagreement",
+                "keep_fraction": 0.5,
+            },
+            25,
+            100,
+        )
+        assert mode == "top_fraction"
+        assert keep_fraction == pytest.approx(0.5)
+
     def test_unknown_mode_raises(self):
         with pytest.raises(ValueError, match="Unknown tvd_gate mode"):
             _resolve_tvd_gate_threshold({"mode": "bogus"}, 0, 100)

@@ -23,6 +23,8 @@ from nemo_rl.algorithms.loss_functions import (
     DistillationLossFn,
     DPOLossFn,
     NLLLoss,
+    _sequence_balanced_mean,
+    _top_fraction_mask,
 )
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -43,6 +45,77 @@ basic_pg_loss_test_config: ClippedPGLossConfig = {
     "token_level_loss": True,
     "force_on_policy_ratio": False,
 }
+
+
+def test_sequence_balanced_mean_weights_sequences_equally():
+    values = torch.tensor([[1.0, 2.0, 99.0, 99.0], [10.0, 10.0, 10.0, 10.0]])
+    token_mask = torch.tensor([[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]])
+    sample_mask = torch.ones(2)
+
+    loss = _sequence_balanced_mean(
+        values, token_mask, sample_mask, global_valid_seqs=torch.tensor(2.0)
+    )
+
+    assert loss.item() == pytest.approx((1.5 + 10.0) / 2.0)
+
+
+def test_top_fraction_mask_ranks_each_sequence_and_ignores_padding():
+    scores = torch.tensor(
+        [[0.1, 0.9, 0.2, 0.8], [0.7, 0.1, 0.6, 100.0]], dtype=torch.float32
+    )
+    valid_mask = torch.tensor(
+        [[1, 1, 1, 1], [1, 1, 1, 0]], dtype=torch.float32
+    )
+
+    selected = _top_fraction_mask(scores, valid_mask, keep_fraction=0.5)
+
+    torch.testing.assert_close(
+        selected,
+        torch.tensor(
+            [[False, True, False, True], [True, False, True, False]]
+        ),
+    )
+
+
+def test_distillation_reduction_and_confident_gate_config_validation():
+    sequence_loss = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": True,
+            "reduction": "sequence_mean",
+            "tvd_gate": {
+                "mode": "fixed",
+                "direction": "low",
+                "threshold": 1.0,
+            },
+        }
+    )
+    assert not sequence_loss.normalize_by_kept_tokens
+
+    confident_loss = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": True,
+            "tvd_gate": {
+                "mode": "top_fraction",
+                "score": "confident_disagreement",
+                "keep_fraction": 0.5,
+            },
+        }
+    )
+    assert confident_loss.normalize_by_kept_tokens
+
+    with pytest.raises(ValueError, match="Unknown loss_fn.reduction"):
+        DistillationLossFn(
+            {
+                "kl_type": "reverse",
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": True,
+                "reduction": "bogus",
+            }
+        )
 
 
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
@@ -1863,6 +1936,81 @@ def test_tvd_gated_distillation_defers_kept_token_normalization():
     )
     assert empty_metrics["tvd_gate_kept_tokens_sum"] == 0.0
     torch.testing.assert_close(empty_loss, torch.zeros_like(empty_loss))
+
+
+def test_confident_disagreement_gate_keeps_fraction_per_sequence():
+    torch.manual_seed(0)
+    data, student_logits = setup_distillation_test_data(
+        batch_size=2, seq_len=5, vocab_size=8, topk=8
+    )
+    data["teacher_logsumexp"] = torch.logsumexp(
+        data["teacher_topk_logits"], dim=-1
+    )
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": True,
+            "tvd_gate": {
+                "mode": "top_fraction",
+                "score": "confident_disagreement",
+                "keep_fraction": 0.5,
+            },
+        }
+    )
+    loss_fn._tvd_gate_state = {"mode": "top_fraction", "tau": 0.5}
+
+    loss, metrics = loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"][:, 1:]
+        ),
+    )
+
+    # Four valid target positions per sequence; ceil(4 * 0.5) keeps two each.
+    assert metrics["tvd_gate_kept_tokens_sum"] == pytest.approx(4.0)
+    assert "tvd_teacher_margin_sum" in metrics
+    assert "tvd_confident_disagreement_sum" in metrics
+    assert torch.isfinite(loss)
+
+
+def test_sequence_mean_distillation_returns_normalized_loss_with_gate():
+    torch.manual_seed(0)
+    data, student_logits = setup_distillation_test_data(
+        batch_size=2, seq_len=5, vocab_size=8, topk=8
+    )
+    data["token_mask"][0, -2:] = 0
+    data["teacher_logsumexp"] = torch.logsumexp(
+        data["teacher_topk_logits"], dim=-1
+    )
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": True,
+            "reduction": "sequence_mean",
+            "tvd_gate": {
+                "mode": "fixed",
+                "direction": "low",
+                "threshold": 1.0,
+            },
+        }
+    )
+    loss_fn._tvd_gate_state = {"mode": "fixed", "tau": 1.0}
+
+    loss, _ = loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"][:, 1:]
+        ),
+    )
+
+    assert torch.isfinite(loss)
+    assert not loss_fn.normalize_by_kept_tokens
 
 
 def test_distillation_loss_gradient_flow():
