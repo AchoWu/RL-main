@@ -1,0 +1,15 @@
+# Reproduce the original s0.05/e0.4/u1.0 TVD curriculum while retaining the
+# old baseline's conditional top-k KL objective (zero_outside_topk=false).
+# TVD scoring still uses global teacher/student probabilities, but that scoring
+# path is detached from the KL gradient path.
+defaults: distillation_math.yaml
+
+loss_fn:
+    zero_outside_topk: false
+    reduction: "token_mean"
+    tvd_gate:
+        mode: "warmup"
+        direction: "low"
+        start_threshold: 0.05
+        end_threshold: 0.4
+        warmup_until_frac: 1.0
