@@ -23,6 +23,7 @@ from nemo_rl.algorithms.loss_functions import (
     DistillationLossFn,
     DPOLossFn,
     NLLLoss,
+    _mean_normalized_token_weights,
     _sequence_balanced_mean,
     _top_fraction_mask,
 )
@@ -57,6 +58,17 @@ def test_sequence_balanced_mean_weights_sequences_equally():
     )
 
     assert loss.item() == pytest.approx((1.5 + 10.0) / 2.0)
+
+
+def test_teacher_margin_weights_preserve_each_sequence_weight_sum():
+    scores = torch.tensor([[0.1, 0.3, 99.0], [0.0, 0.0, 0.0]])
+    valid_mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
+
+    weights = _mean_normalized_token_weights(scores, valid_mask, eps=1.0e-8)
+
+    torch.testing.assert_close(weights.sum(dim=-1), valid_mask.sum(dim=-1))
+    assert weights[0, 1].item() == pytest.approx(3.0 * weights[0, 0].item())
+    torch.testing.assert_close(weights[1], torch.ones(3))
 
 
 def test_top_fraction_mask_ranks_each_sequence_and_ignores_padding():
@@ -97,6 +109,36 @@ def test_distillation_reduction_and_confident_gate_config_validation():
         }
     )
     assert confident_loss.normalize_by_kept_tokens
+
+    margin_weighted_loss = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+            "teacher_margin_weight": {
+                "enabled": True,
+                "power": 1.0,
+                "eps": 1.0e-8,
+            },
+        }
+    )
+    assert margin_weighted_loss.teacher_margin_weight_enabled
+    assert not margin_weighted_loss.normalize_by_kept_tokens
+
+    with pytest.raises(ValueError, match="cannot be enabled together"):
+        DistillationLossFn(
+            {
+                "kl_type": "reverse",
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": False,
+                "teacher_margin_weight": {"enabled": True},
+                "tvd_gate": {
+                    "mode": "top_fraction",
+                    "score": "confident_disagreement",
+                    "keep_fraction": 0.5,
+                },
+            }
+        )
 
     with pytest.raises(ValueError, match="Unknown loss_fn.reduction"):
         DistillationLossFn(
@@ -2048,6 +2090,46 @@ def test_sequence_mean_distillation_returns_normalized_loss_without_gate():
 
     assert torch.isfinite(loss)
     assert not loss_fn.normalize_by_kept_tokens
+
+
+def test_teacher_margin_weighted_distillation_preserves_total_token_weight():
+    torch.manual_seed(0)
+    data, student_logits = setup_distillation_test_data(
+        batch_size=2, seq_len=5, vocab_size=8, topk=8
+    )
+    data["teacher_logsumexp"] = torch.logsumexp(data["teacher_topk_logits"], dim=-1)
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+            "teacher_margin_weight": {
+                "enabled": True,
+                "power": 1.0,
+                "eps": 1.0e-8,
+            },
+        }
+    )
+    global_valid_toks = torch.sum(
+        data["sample_mask"].unsqueeze(-1) * data["token_mask"][:, 1:]
+    )
+
+    loss, metrics = loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=global_valid_toks,
+    )
+
+    assert torch.isfinite(loss)
+    assert metrics["teacher_margin_base_tokens_sum"] == pytest.approx(
+        global_valid_toks.item()
+    )
+    assert metrics["teacher_margin_weight_sum"] == pytest.approx(
+        global_valid_toks.item(), rel=1.0e-5
+    )
+    assert metrics["teacher_margin_weight_sq_sum"] > 0.0
+    assert metrics["teacher_margin_sum"] > 0.0
 
 
 def test_distillation_loss_gradient_flow():
