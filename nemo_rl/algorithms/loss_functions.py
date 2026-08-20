@@ -964,6 +964,44 @@ class SequencePackingLossWrapper:
         return loss_accum, metrics_accum
 
 
+def _top_fraction_mask(
+    scores: torch.Tensor,
+    valid_mask: torch.Tensor,
+    keep_fraction: float,
+) -> torch.Tensor:
+    """Keep the highest-scoring fraction independently in each sequence."""
+    valid = valid_mask.bool()
+    valid_counts = valid.sum(dim=-1)
+    keep_counts = torch.ceil(valid_counts.to(torch.float32) * keep_fraction).to(
+        torch.long
+    )
+
+    ranked_indices = torch.argsort(
+        scores.masked_fill(~valid, float("-inf")), dim=-1, descending=True
+    )
+    ranks = torch.empty_like(ranked_indices)
+    sequence_positions = torch.arange(
+        scores.shape[-1], device=scores.device, dtype=ranked_indices.dtype
+    ).expand_as(ranked_indices)
+    ranks.scatter_(dim=-1, index=ranked_indices, src=sequence_positions)
+    return (ranks < keep_counts.unsqueeze(-1)) & valid
+
+
+def _sequence_balanced_mean(
+    values: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    global_valid_seqs: torch.Tensor,
+) -> torch.Tensor:
+    """Give every valid sequence equal total weight regardless of its length."""
+    per_sequence_mean = masked_mean(values, token_mask, dim=-1)
+    return masked_mean(
+        per_sequence_mean,
+        sample_mask,
+        global_normalization_factor=global_valid_seqs,
+    )
+
+
 class TvdGateConfig(TypedDict, total=False):
     """Config for TVD-based token gating on top of the KL distillation loss.
 
@@ -991,16 +1029,25 @@ class TvdGateConfig(TypedDict, total=False):
                     `end_threshold` at global_step / max_num_steps ==
                     warmup_until_frac, then stays constant. S-shaped cosine
                     curve (matches prefix_length_warmup cosine mode).
+        - "top_fraction": rank valid positions independently in every sequence
+                          and keep a fixed fraction with the largest score.
+
+    Scores for mode="top_fraction":
+        - "confident_disagreement": TVD * (teacher top-1 prob - top-2 prob).
+          This selects positions where teacher and student disagree while the
+          teacher has a clear preferred next token.
 
     Reference: opd-improvements-proposal.md (future §), BASIC_OAD_PROPOSAL.md.
     """
 
-    mode: str  # "none" | "fixed" | "warmup"
+    mode: str  # "none" | "fixed" | "warmup" | "top_fraction"
     direction: str  # "high" (default) | "low"
     threshold: float  # used when mode == "fixed"; interpretation depends on direction
     start_threshold: float  # used when mode == "warmup"; τ at step 0
     end_threshold: float  # used when mode == "warmup"; τ at (and after) warmup_until_frac
     warmup_until_frac: float  # fraction of max_num_steps to finish annealing
+    score: str  # used when mode == "top_fraction"
+    keep_fraction: float  # used when mode == "top_fraction"; in (0, 1]
 
 
 class StopContentConfig(TypedDict):
@@ -1017,6 +1064,7 @@ class DistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float
     zero_outside_topk: bool
+    reduction: NotRequired[str]  # "token_mean" (default) | "sequence_mean"
     tvd_gate: NotRequired[TvdGateConfig]
     stop_content: NotRequired[StopContentConfig]
     # If set, drops these token ids from the loss mask at their *target*
@@ -1053,6 +1101,7 @@ class DistillationLossFn(LossFunction):
         self.kl_type = cfg["kl_type"]
         self.mixed_kl_weight = cfg["mixed_kl_weight"]
         self.zero_outside_topk = cfg["zero_outside_topk"]
+        self.reduction = str(cfg.get("reduction", "token_mean"))
         self.log_infinitesimal = -100
         self.loss_type = LossType.TOKEN_LEVEL
 
@@ -1060,6 +1109,11 @@ class DistillationLossFn(LossFunction):
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
+        if self.reduction not in ("token_mean", "sequence_mean"):
+            raise ValueError(
+                f"Unknown loss_fn.reduction={self.reduction!r}. "
+                "Expected one of: 'token_mean', 'sequence_mean'."
+            )
 
         self.stop_content_cfg = cfg.get("stop_content")
         self.stop_content_enabled = bool(
@@ -1154,15 +1208,20 @@ class DistillationLossFn(LossFunction):
         # the accumulated gradients by the exact global number of kept tokens
         # once, immediately before clipping/stepping. Normalizing here would only
         # see one local microbatch and would weight microbatches/ranks incorrectly.
-        self.normalize_by_kept_tokens = gate_mode != "none"
+        self.normalize_by_kept_tokens = (
+            gate_mode != "none" and self.reduction == "token_mean"
+        )
         if gate_mode != "none":
             # Reject unknown modes up-front so users see the full valid list.
-            if gate_mode not in ("fixed", "warmup"):
+            if gate_mode not in ("fixed", "warmup", "top_fraction"):
                 raise ValueError(
                     f"Unknown tvd_gate.mode={gate_mode!r}. "
-                    "Expected one of: 'none', 'fixed', 'warmup'."
+                    "Expected one of: 'none', 'fixed', 'warmup', 'top_fraction'."
                 )
-            if self.tvd_gate_direction not in ("high", "low"):
+            if gate_mode != "top_fraction" and self.tvd_gate_direction not in (
+                "high",
+                "low",
+            ):
                 raise ValueError(
                     f"Unknown tvd_gate.direction={self.tvd_gate_direction!r}. "
                     "Expected one of: 'high', 'low'."
@@ -1175,7 +1234,7 @@ class DistillationLossFn(LossFunction):
                 assert "threshold" in self.tvd_gate_cfg, (
                     "tvd_gate.mode='fixed' requires 'threshold' in config."
                 )
-            else:  # gate_mode == "warmup"
+            elif gate_mode == "warmup":
                 for required_key in (
                     "start_threshold",
                     "end_threshold",
@@ -1184,6 +1243,19 @@ class DistillationLossFn(LossFunction):
                     assert required_key in self.tvd_gate_cfg, (
                         f"tvd_gate.mode='warmup' requires {required_key!r} in config."
                     )
+            else:  # gate_mode == "top_fraction"
+                assert self.tvd_gate_cfg.get("score") == "confident_disagreement", (
+                    "loss_fn.tvd_gate.mode='top_fraction' currently requires "
+                    "score='confident_disagreement'."
+                )
+                assert "keep_fraction" in self.tvd_gate_cfg, (
+                    "loss_fn.tvd_gate.mode='top_fraction' requires "
+                    "'keep_fraction' in config."
+                )
+                keep_fraction = float(self.tvd_gate_cfg["keep_fraction"])
+                assert 0.0 < keep_fraction <= 1.0, (
+                    "loss_fn.tvd_gate.keep_fraction must be in (0, 1]."
+                )
 
     def __call__(
         self,
@@ -1593,6 +1665,9 @@ class DistillationLossFn(LossFunction):
             base_valid_sum: Optional[torch.Tensor] = None
             kept_valid_sum: Optional[torch.Tensor] = None
             tvd_sum: Optional[torch.Tensor] = None
+            teacher_margin_sum: Optional[torch.Tensor] = None
+            confident_disagreement_sum: Optional[torch.Tensor] = None
+            selected_confident_disagreement_sum: Optional[torch.Tensor] = None
 
             if tvd_gate_active:
                 # Preconditions: gate needs true global student probs on
@@ -1624,19 +1699,30 @@ class DistillationLossFn(LossFunction):
                 ).sum(-1)  # [B, S-1]
                 tvd_topk = (1.0 - acceptance_topk).clamp(0.0, 1.0)  # [B, S-1]
 
-                # Direction selects which side of τ passes the gate:
-                #   "high" -> tvd > τ   (learn the hardest tokens first;
-                #                        sweep τ 0→1 shrinks the surviving set)
-                #   "low"  -> tvd < τ   (curriculum: learn easy overlap first;
-                #                        sweep τ 0→1 grows the surviving set,
-                #                        eventually including everything)
-                # Strict comparison in both cases keeps the boundary case
-                # (`tvd == τ`) out of the loss — matches the original design
-                # of the "high" direction and is symmetric.
-                if self.tvd_gate_direction == "low":
-                    gate_w = (tvd_topk < tvd_gate_tau).to(base_mask.dtype)
+                if tvd_gate_mode == "top_fraction":
+                    if teacher_p_topk_true.shape[-1] < 2:
+                        raise ValueError(
+                            "confident_disagreement requires teacher topk >= 2."
+                        )
+                    top_two_teacher_probs = torch.topk(
+                        teacher_p_topk_true, k=2, dim=-1
+                    ).values
+                    teacher_margin = (
+                        top_two_teacher_probs[..., 0]
+                        - top_two_teacher_probs[..., 1]
+                    )
+                    confident_disagreement = tvd_topk * teacher_margin
+                    gate_w = _top_fraction_mask(
+                        confident_disagreement,
+                        base_mask,
+                        keep_fraction=tvd_gate_tau,
+                    ).to(base_mask.dtype)
                 else:
-                    gate_w = (tvd_topk > tvd_gate_tau).to(base_mask.dtype)
+                    # Strict comparison leaves the boundary outside the loss.
+                    if self.tvd_gate_direction == "low":
+                        gate_w = (tvd_topk < tvd_gate_tau).to(base_mask.dtype)
+                    else:
+                        gate_w = (tvd_topk > tvd_gate_tau).to(base_mask.dtype)
                 # These sums are computed once and reused: mask -> loss, and
                 # base/kept/tvd sums -> diagnostics. The gated branch returns an
                 # unnormalized numerator below. The DTensor worker accumulates
@@ -1647,11 +1733,26 @@ class DistillationLossFn(LossFunction):
                     base_valid_sum = base_mask.sum()
                     kept_valid_sum = mask.sum()
                     tvd_sum = (tvd_topk * base_mask).sum()
+                    if tvd_gate_mode == "top_fraction":
+                        teacher_margin_sum = (teacher_margin * base_mask).sum()
+                        confident_disagreement_sum = (
+                            confident_disagreement * base_mask
+                        ).sum()
+                        selected_confident_disagreement_sum = (
+                            confident_disagreement * mask
+                        ).sum()
 
             # For a gated loss, defer normalization until the worker has seen
             # every microbatch and DP shard. For the baseline, preserve the
             # existing global-valid-token normalization exactly.
-            if tvd_gate_active:
+            if self.reduction == "sequence_mean":
+                kl_loss = _sequence_balanced_mean(
+                    per_token_kl,
+                    mask,
+                    sample_mask,
+                    global_valid_seqs,
+                )
+            elif tvd_gate_active:
                 kl_loss = torch.sum(per_token_kl * mask)
             else:
                 kl_loss = masked_mean(
@@ -1704,6 +1805,18 @@ class DistillationLossFn(LossFunction):
             metrics["tvd_gate_base_tokens_sum"] = float(base_valid_sum.item())
             metrics["tvd_gate_kept_tokens_sum"] = float(kept_valid_sum.item())
             metrics["tvd_topk_sum"] = float(tvd_sum.item())
+            if teacher_margin_sum is not None:
+                assert confident_disagreement_sum is not None
+                assert selected_confident_disagreement_sum is not None
+                metrics["tvd_teacher_margin_sum"] = float(
+                    teacher_margin_sum.item()
+                )
+                metrics["tvd_confident_disagreement_sum"] = float(
+                    confident_disagreement_sum.item()
+                )
+                metrics["tvd_selected_confident_disagreement_sum"] = float(
+                    selected_confident_disagreement_sum.item()
+                )
 
         return kl_loss, metrics
 

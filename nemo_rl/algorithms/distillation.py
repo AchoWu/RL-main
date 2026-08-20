@@ -156,6 +156,8 @@ def _resolve_tvd_gate_threshold(
       to end_threshold at global_step / max_num_steps == warmup_until_frac,
       then stays at end_threshold. Slope is 0 at both endpoints — no jump
       when the gate "opens up" at the end of warmup.
+    - mode="top_fraction" ⇒ the returned scalar is the fixed per-sequence
+      keep fraction used by score-based ranking inside DistillationLossFn.
 
     Config-shape validation (required keys per mode, valid mode names) lives
     in `DistillationLossFn.__init__` — this resolver assumes it's been
@@ -184,6 +186,9 @@ def _resolve_tvd_gate_threshold(
         curve = 0.5 * (1.0 - math.cos(math.pi * progress))
         tau = start + (end - start) * curve
         return "warmup", max(min(tau, 1.0), 0.0)
+    if mode == "top_fraction":
+        keep_fraction = float(gate_cfg["keep_fraction"])
+        return "top_fraction", max(min(keep_fraction, 1.0), 0.0)
     raise ValueError(f"Unknown tvd_gate mode: {mode!r}")
 
 
@@ -1008,6 +1013,7 @@ def distillation_train(
 
                 print("▶ Training policy...", flush=True)
                 tvd_gate_threshold_current: Optional[float] = None
+                tvd_gate_target_keep_frac: Optional[float] = None
                 with timer.time("policy_training"):
                     # Stamp the TVD gate state on the loss function BEFORE handing
                     # it to Ray workers. `loss_fn` is picklable and shipped as a
@@ -1036,7 +1042,9 @@ def distillation_train(
                         # would silently rescale τ. Threshold is a per-step
                         # scalar, not a per-microbatch sum, so it belongs to the
                         # outer training-loop metrics dict.
-                        if mode != "none":
+                        if mode == "top_fraction":
+                            tvd_gate_target_keep_frac = tau
+                        elif mode != "none":
                             tvd_gate_threshold_current = tau
                     # nemo_rl/models/policy/workers/dtensor_policy_worker.py 506
                     train_results = student_policy.train(train_data, loss_fn)
@@ -1111,6 +1119,8 @@ def distillation_train(
                 # the pre-divide pipeline entirely).
                 if tvd_gate_threshold_current is not None:
                     metrics["tvd_gate_threshold_current"] = tvd_gate_threshold_current
+                if tvd_gate_target_keep_frac is not None:
+                    metrics["tvd_gate_target_keep_frac"] = tvd_gate_target_keep_frac
                 if "tvd_gate_base_tokens_sum" in metrics:
                     _base = metrics.pop("tvd_gate_base_tokens_sum")
                     _kept = metrics.pop("tvd_gate_kept_tokens_sum")
@@ -1118,12 +1128,33 @@ def distillation_train(
                     if _base > 0:
                         metrics["tvd_gate_kept_frac"] = _kept / _base
                         metrics["tvd_topk_mean"] = _tvd_sum / _base
+                        if "tvd_teacher_margin_sum" in metrics:
+                            metrics["tvd_teacher_margin_mean"] = metrics.pop(
+                                "tvd_teacher_margin_sum"
+                            ) / _base
+                            metrics["tvd_confident_disagreement_mean"] = metrics.pop(
+                                "tvd_confident_disagreement_sum"
+                            ) / _base
+                            metrics[
+                                "tvd_selected_confident_disagreement_mean"
+                            ] = metrics.pop(
+                                "tvd_selected_confident_disagreement_sum"
+                            ) / max(_kept, 1.0)
                     else:
                         # Schema-stable NaN so downstream analysis pipelines
                         # don't see the metric silently disappear on rare
                         # empty-mask steps.
                         metrics["tvd_gate_kept_frac"] = float("nan")
                         metrics["tvd_topk_mean"] = float("nan")
+                        if "tvd_teacher_margin_sum" in metrics:
+                            metrics.pop("tvd_teacher_margin_sum")
+                            metrics.pop("tvd_confident_disagreement_sum")
+                            metrics.pop("tvd_selected_confident_disagreement_sum")
+                            metrics["tvd_teacher_margin_mean"] = float("nan")
+                            metrics["tvd_confident_disagreement_mean"] = float("nan")
+                            metrics[
+                                "tvd_selected_confident_disagreement_mean"
+                            ] = float("nan")
                 metrics.update(rollout_metrics)
                 metrics.update(teacher_prefix_metrics)
                 total_valid_tokens += metrics["global_valid_toks"]
