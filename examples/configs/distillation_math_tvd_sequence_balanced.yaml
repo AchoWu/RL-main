@@ -1,0 +1,7 @@
+# Matched full-token OPD with equal total weight for every valid sequence.
+# The fixed low-direction TVD gate at 1.0 preserves the matched baseline's
+# zero_outside_topk and global-probability path while admitting almost all tokens.
+defaults: distillation_math_tvd_matched_full.yaml
+
+loss_fn:
+    reduction: "sequence_mean"

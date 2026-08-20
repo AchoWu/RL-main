@@ -1,0 +1,10 @@
+# Keep the 50% highest confident-disagreement positions in every sequence.
+# score = TVD(student, teacher) * (teacher_top1_prob - teacher_top2_prob)
+defaults: distillation_math_tvd_matched_full.yaml
+
+loss_fn:
+    reduction: "token_mean"
+    tvd_gate:
+        mode: "top_fraction"
+        score: "confident_disagreement"
+        keep_fraction: 0.5

@@ -1,0 +1,13 @@
+# Matched full-token reverse-OPD baseline configuration.
+defaults: distillation_math.yaml
+
+loss_fn:
+    type: "kl"
+    kl_type: "mixed"
+    mixed_kl_weight: 0.5
+    zero_outside_topk: true
+    reduction: "token_mean"
+    tvd_gate:
+        mode: "fixed"
+        direction: "low"
+        threshold: 1.0
