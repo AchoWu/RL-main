@@ -1,8 +1,11 @@
 # Keep the 50% highest confident-disagreement positions in every sequence.
 # score = TVD(student, teacher) * (teacher_top1_prob - teacher_top2_prob)
-defaults: distillation_math_tvd_matched_full.yaml
+# Gate scores use global probabilities, while reverse KL retains the old
+# baseline's top-k conditional objective (zero_outside_topk=false).
+defaults: distillation_math.yaml
 
 loss_fn:
+    zero_outside_topk: false
     reduction: "token_mean"
     tvd_gate:
         mode: "top_fraction"
