@@ -1044,7 +1044,9 @@ class TvdGateConfig(TypedDict, total=False):
     direction: str  # "high" (default) | "low"
     threshold: float  # used when mode == "fixed"; interpretation depends on direction
     start_threshold: float  # used when mode == "warmup"; τ at step 0
-    end_threshold: float  # used when mode == "warmup"; τ at (and after) warmup_until_frac
+    end_threshold: (
+        float  # used when mode == "warmup"; τ at (and after) warmup_until_frac
+    )
     warmup_until_frac: float  # fraction of max_num_steps to finish annealing
     score: str  # used when mode == "top_fraction"
     keep_fraction: float  # used when mode == "top_fraction"; in (0, 1]
@@ -1133,19 +1135,14 @@ class DistillationLossFn(LossFunction):
                 "probability_eps",
             ):
                 assert required_key in self.stop_content_cfg, (
-                    "loss_fn.stop_content.enabled=true requires "
-                    f"{required_key!r}."
+                    f"loss_fn.stop_content.enabled=true requires {required_key!r}."
                 )
             assert self.kl_type == "reverse", (
                 "stop-content factorization requires loss_fn.kl_type='reverse' "
                 "for the conditional content term."
             )
-            self.stop_content_eos_token_id = int(
-                self.stop_content_cfg["eos_token_id"]
-            )
-            self.stop_content_stop_kl_type = str(
-                self.stop_content_cfg["stop_kl_type"]
-            )
+            self.stop_content_eos_token_id = int(self.stop_content_cfg["eos_token_id"])
+            self.stop_content_stop_kl_type = str(self.stop_content_cfg["stop_kl_type"])
             self.stop_content_stop_kl_weight = float(
                 self.stop_content_cfg["stop_kl_weight"]
             )
@@ -1193,16 +1190,16 @@ class DistillationLossFn(LossFunction):
             "mode": "none",
         }
 
-        # Fail-fast on misconfig at controller construction time: with a gate
-        # configured, we need true global student probs on the teacher's top-k
-        # support, which only zero_outside_topk=True guarantees. Waiting until
-        # the first training step would waste teacher rollout time and Ray
-        # worker init before crashing.
+        # A gate needs true global student probabilities on the teacher's
+        # top-k support. Keep that scoring path independent from the KL's
+        # zero_outside_topk choice: a gate may score with global probabilities
+        # while the loss retains the baseline top-k conditional KL.
         gate_mode = (
             self.tvd_gate_cfg.get("mode", "none")
             if self.tvd_gate_cfg is not None
             else "none"
         )
+        self.tvd_gate_config_mode = gate_mode
         # A TVD-gated loss is accumulated as an unnormalized token-loss sum.
         # The DTensor worker sees every microbatch and DP shard, so it can divide
         # the accumulated gradients by the exact global number of kept tokens
@@ -1226,10 +1223,6 @@ class DistillationLossFn(LossFunction):
                     f"Unknown tvd_gate.direction={self.tvd_gate_direction!r}. "
                     "Expected one of: 'high', 'low'."
                 )
-            assert self.zero_outside_topk, (
-                "tvd_gate requires loss_fn.zero_outside_topk=true; "
-                f"got {self.zero_outside_topk!r}."
-            )
             if gate_mode == "fixed":
                 assert "threshold" in self.tvd_gate_cfg, (
                     "tvd_gate.mode='fixed' requires 'threshold' in config."
@@ -1371,9 +1364,7 @@ class DistillationLossFn(LossFunction):
                         student_eos_logprobs, cp_group, seq_dim=1
                     )
                     if eos_pad_len > 0:
-                        student_eos_logprobs = student_eos_logprobs[
-                            :, :-eos_pad_len, :
-                        ]
+                        student_eos_logprobs = student_eos_logprobs[:, :-eos_pad_len, :]
             else:
                 student_full_logprobs = torch.nn.functional.log_softmax(
                     logits_tensor, dim=-1
@@ -1382,9 +1373,15 @@ class DistillationLossFn(LossFunction):
                     dim=-1, index=eos_indices.to(student_full_logprobs.device)
                 )
 
-        # Process based on zero_outside_topk setting
-        if self.zero_outside_topk and parallel_group is not None:
-            # Distributed processing with chunking
+        # TVD/confident-disagreement scoring requires probabilities normalized
+        # over the full vocabulary. Compute them independently of the KL path;
+        # when the KL is top-k conditional this branch is diagnostic-only and
+        # must not add another gradient path.
+        needs_global_student_topk = (
+            self.zero_outside_topk or self.tvd_gate_config_mode != "none"
+        )
+        student_topk_global_logprobs: Optional[torch.Tensor] = None
+        if needs_global_student_topk and parallel_group is not None:
             indices_local = teacher_topk_indices
             pad_len = 0
             if cp_size > 1:
@@ -1400,43 +1397,55 @@ class DistillationLossFn(LossFunction):
 
             S_local = int(logits_tensor.shape[1])
             chunk_size = max(1, min(S_local, 1024))
-            student_topk_logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
-                logits_tensor,
-                indices_local,
-                vocab_start_index,
-                vocab_end_index,
-                chunk_size,
-                parallel_group,
-                False,
-            )
-
-            if self.kl_type != "forward":
-                H_all = ChunkedDistributedEntropy.apply(  # type: ignore
+            with torch.set_grad_enabled(self.zero_outside_topk):
+                student_topk_global_logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
                     logits_tensor,
+                    indices_local,
+                    vocab_start_index,
+                    vocab_end_index,
                     chunk_size,
                     parallel_group,
                     False,
                 )
 
+                if self.zero_outside_topk and self.kl_type != "forward":
+                    H_all = ChunkedDistributedEntropy.apply(  # type: ignore
+                        logits_tensor,
+                        chunk_size,
+                        parallel_group,
+                        False,
+                    )
+
             if cp_size > 1:
-                student_topk_logprobs = allgather_cp_sharded_tensor(
-                    student_topk_logprobs, cp_group, seq_dim=1
+                student_topk_global_logprobs = allgather_cp_sharded_tensor(
+                    student_topk_global_logprobs, cp_group, seq_dim=1
                 )
-                if self.kl_type != "forward":
+                if self.zero_outside_topk and self.kl_type != "forward":
                     H_all = allgather_cp_sharded_tensor(H_all, cp_group, seq_dim=1)
                 if pad_len > 0:
-                    student_topk_logprobs = student_topk_logprobs[:, :-pad_len, :]
-                    if self.kl_type != "forward":
+                    student_topk_global_logprobs = student_topk_global_logprobs[
+                        :, :-pad_len, :
+                    ]
+                    if self.zero_outside_topk and self.kl_type != "forward":
                         H_all = H_all[:, :-pad_len]
-        elif self.zero_outside_topk:
-            # Non-distributed processing
-            student_logprobs = torch.nn.functional.log_softmax(logits_tensor, dim=-1)
-            student_topk_logprobs = student_logprobs.gather(
-                dim=-1, index=teacher_topk_indices.to(student_logprobs.device)
-            )
-            if self.kl_type != "forward":
-                H_all = (student_logprobs.exp() * student_logprobs).sum(-1)
+        elif needs_global_student_topk:
+            with torch.set_grad_enabled(self.zero_outside_topk):
+                student_full_logprobs = torch.nn.functional.log_softmax(
+                    logits_tensor,
+                    dim=-1,
+                )
+                student_topk_global_logprobs = student_full_logprobs.gather(
+                    dim=-1,
+                    index=teacher_topk_indices.to(student_full_logprobs.device),
+                )
+                if self.zero_outside_topk and self.kl_type != "forward":
+                    H_all = (student_full_logprobs.exp() * student_full_logprobs).sum(
+                        -1
+                    )
 
+        if self.zero_outside_topk:
+            assert student_topk_global_logprobs is not None
+            student_topk_logprobs = student_topk_global_logprobs
         else:
             # self.zero_outside_topk = False
             # 把 teacher 和 student 的分布都截断到 top-k，然后在这 k 个 token 上重新归一化，再计算 KL 散度
@@ -1479,6 +1488,8 @@ class DistillationLossFn(LossFunction):
         # Single point of next-token alignment after TP/CP processing
         teacher_topk_logprobs = teacher_topk_logprobs[:, :-1, :]
         student_topk_logprobs = student_topk_logprobs[:, :-1, :]
+        if student_topk_global_logprobs is not None:
+            student_topk_global_logprobs = student_topk_global_logprobs[:, :-1, :]
         if self.zero_outside_topk and self.kl_type != "forward":
             # Align H_all with next-token prediction
             H_all = H_all[:, :-1]
@@ -1537,13 +1548,13 @@ class DistillationLossFn(LossFunction):
                 student_content_logprobs - teacher_content_logprobs,
                 torch.zeros_like(student_content_logprobs),
             )
-            content_kl_component = (
-                student_content_probs * content_log_ratio
-            ).sum(dim=-1)
+            content_kl_component = (student_content_probs * content_log_ratio).sum(
+                dim=-1
+            )
 
             eps = self.stop_content_probability_eps
-            student_stop_probability = student_eos_logprobs[:, :-1, 0].exp().clamp(
-                min=eps, max=1.0 - eps
+            student_stop_probability = (
+                student_eos_logprobs[:, :-1, 0].exp().clamp(min=eps, max=1.0 - eps)
             )
             teacher_stop_logprob = (
                 data["teacher_eos_logits"].to(
@@ -1654,9 +1665,7 @@ class DistillationLossFn(LossFunction):
                 target_ids = ids[:, 1 : 1 + max_len].to(device=base_mask.device)
                 not_eos = torch.ones_like(base_mask)
                 for eos_id in self.mask_eos_positions:
-                    not_eos = not_eos * (target_ids != eos_id).to(
-                        dtype=base_mask.dtype
-                    )
+                    not_eos = not_eos * (target_ids != eos_id).to(dtype=base_mask.dtype)
                 base_mask = base_mask * not_eos
 
             mask = base_mask
@@ -1670,15 +1679,12 @@ class DistillationLossFn(LossFunction):
             selected_confident_disagreement_sum: Optional[torch.Tensor] = None
 
             if tvd_gate_active:
-                # Preconditions: gate needs true global student probs on
-                # top-k support (only zero_outside_topk=True path guarantees
-                # this) and exact teacher full-vocab logsumexp (Path B).
-                # __init__ fails fast if `zero_outside_topk=False`, so this
-                # is defense-in-depth for future direct callers.
-                if not self.zero_outside_topk:
-                    raise ValueError(
-                        "tvd_gate requires zero_outside_topk=True (needs true "
-                        "global student probabilities on the top-k support)."
+                # Gate scores use true global probabilities regardless of
+                # whether the KL uses a global or top-k conditional student
+                # distribution.
+                if student_topk_global_logprobs is None:
+                    raise RuntimeError(
+                        "tvd_gate requires global student top-k probabilities."
                     )
                 if "teacher_logsumexp" not in data:
                     raise KeyError(
@@ -1693,7 +1699,9 @@ class DistillationLossFn(LossFunction):
                     teacher_topk_logits.to(torch.float32) - teacher_lse.unsqueeze(-1)
                 )[:, :-1, :]  # [B, S-1, k]
                 teacher_p_topk_true = teacher_true_log_p_topk.exp()
-                student_p_topk_true = student_topk_logprobs.to(torch.float32).exp()
+                student_p_topk_true = student_topk_global_logprobs.to(
+                    torch.float32
+                ).exp()
                 acceptance_topk = torch.minimum(
                     student_p_topk_true, teacher_p_topk_true
                 ).sum(-1)  # [B, S-1]
@@ -1708,8 +1716,7 @@ class DistillationLossFn(LossFunction):
                         teacher_p_topk_true, k=2, dim=-1
                     ).values
                     teacher_margin = (
-                        top_two_teacher_probs[..., 0]
-                        - top_two_teacher_probs[..., 1]
+                        top_two_teacher_probs[..., 0] - top_two_teacher_probs[..., 1]
                     )
                     confident_disagreement = tvd_topk * teacher_margin
                     gate_w = _top_fraction_mask(
@@ -1808,9 +1815,7 @@ class DistillationLossFn(LossFunction):
             if teacher_margin_sum is not None:
                 assert confident_disagreement_sum is not None
                 assert selected_confident_disagreement_sum is not None
-                metrics["tvd_teacher_margin_sum"] = float(
-                    teacher_margin_sum.item()
-                )
+                metrics["tvd_teacher_margin_sum"] = float(teacher_margin_sum.item())
                 metrics["tvd_confident_disagreement_sum"] = float(
                     confident_disagreement_sum.item()
                 )
@@ -2010,9 +2015,7 @@ class OADLossFn(LossFunction):
             # Sums over valid tokens (the count is the same denominator for
             # every per-token metric below).
             acceptance_sum = (acceptance[:, :-1] * mask).sum()
-            teacher_topk_mass_sum = (
-                teacher_p_topk[:, :-1].sum(dim=-1) * mask
-            ).sum()
+            teacher_topk_mass_sum = (teacher_p_topk[:, :-1].sum(dim=-1) * mask).sum()
             student_mass_on_teacher_topk_sum = (
                 student_p_topk[:, :-1].sum(dim=-1) * mask
             ).sum()
