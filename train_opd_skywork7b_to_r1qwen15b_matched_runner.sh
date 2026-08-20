@@ -37,6 +37,7 @@ TEACHER_MODEL="${TEACHER_MODEL:-/dev/shm/llms/Skywork-OR1-Math-7B/}"
 POLICY_MODEL="${POLICY_MODEL:-/dev/shm/llms/DeepSeek-R1-Distill-Qwen-1.5B/}"
 OPD_CONFIG_PATH="${OPD_CONFIG_PATH:-examples/configs/distillation_math_tvd_matched_full.yaml}"
 OPD_RUN_TAG="${OPD_RUN_TAG:-matched-full-token}"
+OPD_ZERO_OUTSIDE_TOPK="${OPD_ZERO_OUTSIDE_TOPK:-true}"
 
 for model_dir in "$TEACHER_MODEL" "$POLICY_MODEL"; do
     if [[ ! -f "${model_dir}config.json" ]]; then
@@ -64,6 +65,7 @@ mkdir -p "${REPO_DIR}/logs"
 echo "Policy:  $POLICY_MODEL"
 echo "Teacher: $TEACHER_MODEL"
 echo "Config:  $OPD_CONFIG_PATH"
+echo "Zero outside top-k: $OPD_ZERO_OUTSIDE_TOPK"
 echo "Run:     $RUN_NAME"
 
 cd "$REPO_DIR"
@@ -91,6 +93,6 @@ python examples/run_distillation_math.py \
     checkpointing.save_consolidated=false \
     checkpointing.checkpoint_dir="checkpoints/distillation-${RUN_NAME}" \
     loss_fn.kl_type=reverse \
-    loss_fn.zero_outside_topk=true \
+    loss_fn.zero_outside_topk="$OPD_ZERO_OUTSIDE_TOPK" \
     logger.wandb_enabled=true \
     logger.wandb.name="$RUN_NAME"
