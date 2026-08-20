@@ -1005,12 +1005,12 @@ class TestTvdGateInitValidation:
         with pytest.raises(AssertionError, match="start_threshold"):
             DistillationLossFn(cfg)
 
-    def test_requires_zero_outside_topk(self):
+    def test_allows_conditional_topk_kl(self):
         cfg = self._kl_base()
         cfg["zero_outside_topk"] = False
         cfg["tvd_gate"] = {"mode": "fixed", "threshold": 0.3}
-        with pytest.raises(AssertionError, match="zero_outside_topk"):
-            DistillationLossFn(cfg)
+        loss = DistillationLossFn(cfg)
+        assert not loss.zero_outside_topk
 
     def test_unknown_mode_raises(self):
         cfg = self._kl_base()

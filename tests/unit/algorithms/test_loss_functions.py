@@ -63,17 +63,13 @@ def test_top_fraction_mask_ranks_each_sequence_and_ignores_padding():
     scores = torch.tensor(
         [[0.1, 0.9, 0.2, 0.8], [0.7, 0.1, 0.6, 100.0]], dtype=torch.float32
     )
-    valid_mask = torch.tensor(
-        [[1, 1, 1, 1], [1, 1, 1, 0]], dtype=torch.float32
-    )
+    valid_mask = torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0]], dtype=torch.float32)
 
     selected = _top_fraction_mask(scores, valid_mask, keep_fraction=0.5)
 
     torch.testing.assert_close(
         selected,
-        torch.tensor(
-            [[False, True, False, True], [True, False, True, False]]
-        ),
+        torch.tensor([[False, True, False, True], [True, False, True, False]]),
     )
 
 
@@ -82,13 +78,8 @@ def test_distillation_reduction_and_confident_gate_config_validation():
         {
             "kl_type": "reverse",
             "mixed_kl_weight": 0.5,
-            "zero_outside_topk": True,
+            "zero_outside_topk": False,
             "reduction": "sequence_mean",
-            "tvd_gate": {
-                "mode": "fixed",
-                "direction": "low",
-                "threshold": 1.0,
-            },
         }
     )
     assert not sequence_loss.normalize_by_kept_tokens
@@ -97,7 +88,7 @@ def test_distillation_reduction_and_confident_gate_config_validation():
         {
             "kl_type": "reverse",
             "mixed_kl_weight": 0.5,
-            "zero_outside_topk": True,
+            "zero_outside_topk": False,
             "tvd_gate": {
                 "mode": "top_fraction",
                 "score": "confident_disagreement",
@@ -1938,19 +1929,74 @@ def test_tvd_gated_distillation_defers_kept_token_normalization():
     torch.testing.assert_close(empty_loss, torch.zeros_like(empty_loss))
 
 
+def test_tvd_gate_does_not_change_conditional_topk_reverse_kl():
+    """Global gate scoring must not add the zero-outside tail correction."""
+    student_logits_base = torch.tensor(
+        [[[2.0, 1.0, 0.0, -1.0]] * 3], requires_grad=True
+    )
+    student_logits_gated = student_logits_base.detach().clone().requires_grad_(True)
+    teacher_full_logits = torch.tensor([[[1.5, -0.5, 0.5, -1.0]] * 3])
+    teacher_topk_indices = torch.tensor([[[0, 1]] * 3])
+    data = {
+        "input_ids": torch.tensor([[0, 1, 2]]),
+        "input_lengths": torch.tensor([3]),
+        "token_mask": torch.tensor([[0.0, 1.0, 1.0]]),
+        "sample_mask": torch.tensor([1.0]),
+        "teacher_topk_logits": teacher_full_logits.gather(-1, teacher_topk_indices),
+        "teacher_topk_indices": teacher_topk_indices,
+        "teacher_logsumexp": torch.logsumexp(teacher_full_logits, dim=-1),
+    }
+    global_valid_seqs = torch.tensor(1.0)
+    global_valid_toks = torch.tensor(2.0)
+    base_cfg = {
+        "kl_type": "reverse",
+        "mixed_kl_weight": 0.5,
+        "zero_outside_topk": False,
+    }
+
+    baseline_loss, _ = DistillationLossFn(base_cfg)(
+        student_logits_base,
+        data,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+    )
+    gated_loss_fn = DistillationLossFn(
+        {
+            **base_cfg,
+            "tvd_gate": {
+                "mode": "fixed",
+                "direction": "low",
+                "threshold": 1.0,
+            },
+        }
+    )
+    gated_loss_fn._tvd_gate_state = {"mode": "fixed", "tau": 1.0}
+    gated_numerator, metrics = gated_loss_fn(
+        student_logits_gated,
+        data,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+    )
+    gated_loss = gated_numerator / global_valid_toks
+
+    assert metrics["tvd_gate_kept_tokens_sum"] == pytest.approx(2.0)
+    torch.testing.assert_close(gated_loss, baseline_loss)
+    baseline_loss.backward()
+    gated_loss.backward()
+    torch.testing.assert_close(student_logits_gated.grad, student_logits_base.grad)
+
+
 def test_confident_disagreement_gate_keeps_fraction_per_sequence():
     torch.manual_seed(0)
     data, student_logits = setup_distillation_test_data(
         batch_size=2, seq_len=5, vocab_size=8, topk=8
     )
-    data["teacher_logsumexp"] = torch.logsumexp(
-        data["teacher_topk_logits"], dim=-1
-    )
+    data["teacher_logsumexp"] = torch.logsumexp(data["teacher_topk_logits"], dim=-1)
     loss_fn = DistillationLossFn(
         {
             "kl_type": "reverse",
             "mixed_kl_weight": 0.5,
-            "zero_outside_topk": True,
+            "zero_outside_topk": False,
             "tvd_gate": {
                 "mode": "top_fraction",
                 "score": "confident_disagreement",
@@ -1976,29 +2022,20 @@ def test_confident_disagreement_gate_keeps_fraction_per_sequence():
     assert torch.isfinite(loss)
 
 
-def test_sequence_mean_distillation_returns_normalized_loss_with_gate():
+def test_sequence_mean_distillation_returns_normalized_loss_without_gate():
     torch.manual_seed(0)
     data, student_logits = setup_distillation_test_data(
         batch_size=2, seq_len=5, vocab_size=8, topk=8
     )
     data["token_mask"][0, -2:] = 0
-    data["teacher_logsumexp"] = torch.logsumexp(
-        data["teacher_topk_logits"], dim=-1
-    )
     loss_fn = DistillationLossFn(
         {
             "kl_type": "reverse",
             "mixed_kl_weight": 0.5,
-            "zero_outside_topk": True,
+            "zero_outside_topk": False,
             "reduction": "sequence_mean",
-            "tvd_gate": {
-                "mode": "fixed",
-                "direction": "low",
-                "threshold": 1.0,
-            },
         }
     )
-    loss_fn._tvd_gate_state = {"mode": "fixed", "tau": 1.0}
 
     loss, _ = loss_fn(
         student_logits,
@@ -2165,9 +2202,7 @@ def test_stop_content_decouples_eos_outside_teacher_topk():
     student_logits = torch.tensor(
         [[[1.0, 0.0, -1.0, -2.0, -3.0]] * seq_len], requires_grad=True
     )
-    teacher_full_logits = torch.tensor(
-        [[[1.0, 0.0, -1.0, -2.0, 1.5]] * seq_len]
-    )
+    teacher_full_logits = torch.tensor([[[1.0, 0.0, -1.0, -2.0, 1.5]] * seq_len])
     teacher_topk_indices = torch.tensor([[[0, 1, 2, 3]] * seq_len])
     teacher_topk_logits = teacher_full_logits.gather(-1, teacher_topk_indices)
     data = {
