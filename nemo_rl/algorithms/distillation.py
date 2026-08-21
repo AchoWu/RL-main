@@ -601,7 +601,9 @@ def setup(
         weights_path=weights_path,
         optimizer_path=optimizer_path,
         init_optimizer=True,
-        init_reference_model=False,
+        init_reference_model=(
+            float(loss_config.get("reference_policy_kl_penalty", 0.0)) > 0.0
+        ),
     )
 
     if student_generation is not None:
@@ -983,6 +985,31 @@ def distillation_train(
                         flat_messages.get_multimodal_dict(as_tensors=False)
                     )
                     train_data.to("cpu")
+
+                reference_kl_enabled = (
+                    isinstance(loss_fn, DistillationLossFn)
+                    and loss_fn.reference_policy_kl_penalty > 0.0
+                )
+                if reference_kl_enabled:
+                    print(
+                        "▶ Preparing frozen initial-student reference inference...",
+                        flush=True,
+                    )
+                    with timer.time("reference_logprob_inference_prep"):
+                        student_policy.prepare_for_lp_inference()
+                    print("▶ Computing reference logprobs...", flush=True)
+                    try:
+                        with timer.time("reference_logprob_inference"):
+                            reference_output = (
+                                student_policy.get_reference_policy_logprobs(train_data)
+                            )
+                            train_data["reference_policy_logprobs"] = reference_output[
+                                "reference_logprobs"
+                            ]
+                    finally:
+                        # Teacher and student share the training cluster. Release
+                        # the student weights before loading the teacher.
+                        student_policy.offload_after_refit()
 
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):

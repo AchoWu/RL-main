@@ -1097,6 +1097,10 @@ class DistillationLossConfig(TypedDict):
     mixed_kl_weight: float
     zero_outside_topk: bool
     reduction: NotRequired[str]  # "token_mean" (default) | "sequence_mean"
+    reference_policy_kl_penalty: NotRequired[float]
+    reference_policy_kl_type: NotRequired[str]  # "k1" | "k2" | "k3"
+    reference_policy_kl_input_clamp: NotRequired[float | None]
+    reference_policy_kl_output_clamp: NotRequired[float | None]
     tvd_gate: NotRequired[TvdGateConfig]
     teacher_margin_weight: NotRequired[TeacherMarginWeightConfig]
     stop_content: NotRequired[StopContentConfig]
@@ -1118,6 +1122,10 @@ class DistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     teacher_topk_logits: torch.Tensor
     teacher_topk_indices: torch.Tensor
+    seq_index: NotRequired[torch.Tensor]
+    # Log-probability assigned to each input token by the frozen initial
+    # student. Position 0 follows the policy API convention and is always 0.
+    reference_policy_logprobs: NotRequired[torch.Tensor]
     # Optional: exact full-vocab logsumexp of the teacher, needed by the TVD
     # gate to convert teacher_topk_logits into true global probabilities.
     # Populated by the DTensor teacher worker (see Path B plumbing).
@@ -1135,6 +1143,16 @@ class DistillationLossFn(LossFunction):
         self.mixed_kl_weight = cfg["mixed_kl_weight"]
         self.zero_outside_topk = cfg["zero_outside_topk"]
         self.reduction = str(cfg.get("reduction", "token_mean"))
+        self.reference_policy_kl_penalty = float(
+            cfg.get("reference_policy_kl_penalty", 0.0)
+        )
+        self.reference_policy_kl_type = str(cfg.get("reference_policy_kl_type", "k3"))
+        self.reference_policy_kl_input_clamp = cfg.get(
+            "reference_policy_kl_input_clamp", 20.0
+        )
+        self.reference_policy_kl_output_clamp = cfg.get(
+            "reference_policy_kl_output_clamp", 10.0
+        )
         self.log_infinitesimal = -100
         self.loss_type = LossType.TOKEN_LEVEL
 
@@ -1146,6 +1164,14 @@ class DistillationLossFn(LossFunction):
             raise ValueError(
                 f"Unknown loss_fn.reduction={self.reduction!r}. "
                 "Expected one of: 'token_mean', 'sequence_mean'."
+            )
+        if self.reference_policy_kl_penalty < 0.0:
+            raise ValueError(
+                "loss_fn.reference_policy_kl_penalty must be non-negative."
+            )
+        if self.reference_policy_kl_type not in ("k1", "k2", "k3"):
+            raise ValueError(
+                "loss_fn.reference_policy_kl_type must be one of: 'k1', 'k2', 'k3'."
             )
 
         self.stop_content_cfg = cfg.get("stop_content")
@@ -1266,6 +1292,12 @@ class DistillationLossFn(LossFunction):
         self.normalize_by_kept_tokens = (
             gate_mode != "none" and self.reduction == "token_mean"
         )
+        if self.reference_policy_kl_penalty > 0.0 and gate_mode != "none":
+            raise ValueError(
+                "reference-policy KL is not yet compatible with tvd_gate: the "
+                "gate's delayed kept-token normalization would also rescale the "
+                "ungated reference penalty. Run it without a TVD gate."
+            )
         if gate_mode != "none":
             # Reject unknown modes up-front so users see the full valid list.
             if gate_mode not in ("fixed", "warmup", "top_fraction"):
@@ -1329,6 +1361,45 @@ class DistillationLossFn(LossFunction):
 
         # Ensure float32 for stability (match other losses)
         next_token_logits = next_token_logits.to(torch.float32)
+        current_token_logprobs: Optional[torch.Tensor] = None
+        if self.reference_policy_kl_penalty > 0.0:
+            if "reference_policy_logprobs" not in data:
+                raise KeyError(
+                    "reference_policy_kl_penalty > 0 requires "
+                    "`reference_policy_logprobs` in train_data."
+                )
+            if vocab_parallel_group is not None:
+                assert vocab_parallel_rank is not None
+                current_token_logprobs = from_parallel_logits_to_logprobs(
+                    next_token_logits,
+                    input_ids,
+                    vocab_start_index=(
+                        vocab_parallel_rank * next_token_logits.shape[-1]
+                    ),
+                    vocab_end_index=(
+                        (vocab_parallel_rank + 1) * next_token_logits.shape[-1]
+                    ),
+                    tp_group=vocab_parallel_group,
+                    inference_only=False,
+                    cp_group=context_parallel_group,
+                )
+                current_token_logprobs = current_token_logprobs[
+                    :, : input_ids.shape[1] - 1
+                ]
+            elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+                current_token_logprobs = get_logprobs_from_vocab_parallel_logits(
+                    next_token_logits,
+                    input_ids,
+                    seq_index=data.get("seq_index"),
+                )
+            else:
+                current_logits = next_token_logits[:, :-1]
+                next_tokens = input_ids[:, 1:].to(current_logits.device)
+                current_token_logprobs = (
+                    torch.nn.functional.log_softmax(current_logits, dim=-1)
+                    .gather(dim=-1, index=next_tokens.unsqueeze(-1))
+                    .squeeze(-1)
+                )
         per_token_kl = None
         # Preferred truncated-KL path: teacher provides top-k support per position
         teacher_topk_logits = data["teacher_topk_logits"]  # [B, S, k]
@@ -1689,6 +1760,8 @@ class DistillationLossFn(LossFunction):
         confidence_margin_sum: Optional[torch.Tensor] = None
         confidence_weight_sum: Optional[torch.Tensor] = None
         confidence_weight_sq_sum: Optional[torch.Tensor] = None
+        reference_policy_kl_loss: Optional[torch.Tensor] = None
+        distillation_kl_loss: Optional[torch.Tensor] = None
 
         if "token_mask" in data and "sample_mask" in data:
             token_mask = data["token_mask"][:, 1:]
@@ -1865,13 +1938,60 @@ class DistillationLossFn(LossFunction):
                     mask,
                     global_normalization_factor=global_valid_toks,
                 )
+            distillation_kl_loss = kl_loss
+
+            if self.reference_policy_kl_penalty > 0.0:
+                assert current_token_logprobs is not None
+                reference_logprobs = data["reference_policy_logprobs"].to(
+                    device=current_token_logprobs.device,
+                    dtype=current_token_logprobs.dtype,
+                )[:, 1:]
+                reference_max_len = min(
+                    current_token_logprobs.shape[1],
+                    reference_logprobs.shape[1],
+                    base_mask.shape[1],
+                )
+                reference_per_token_kl = calculate_kl(
+                    logprobs=current_token_logprobs[:, :reference_max_len],
+                    logprobs_reference=reference_logprobs[:, :reference_max_len],
+                    kl_type=self.reference_policy_kl_type,
+                    input_clamp_value=self.reference_policy_kl_input_clamp,
+                    output_clamp_value=self.reference_policy_kl_output_clamp,
+                )
+                reference_mask = base_mask[:, :reference_max_len]
+                if self.reduction == "sequence_mean":
+                    reference_policy_kl_loss = _sequence_balanced_mean(
+                        reference_per_token_kl,
+                        reference_mask,
+                        sample_mask,
+                        global_valid_seqs,
+                    )
+                else:
+                    reference_policy_kl_loss = masked_mean(
+                        reference_per_token_kl,
+                        reference_mask,
+                        global_normalization_factor=global_valid_toks,
+                    )
+                kl_loss = (
+                    kl_loss
+                    + self.reference_policy_kl_penalty * reference_policy_kl_loss
+                )
         else:
             kl_loss = per_token_kl.mean()
+            distillation_kl_loss = kl_loss
 
+        assert distillation_kl_loss is not None
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
+            "distillation_loss": float(distillation_kl_loss.detach().item()),
             "num_valid_samples": int(batch_size),
         }
+        if reference_policy_kl_loss is not None:
+            reference_kl_value = float(reference_policy_kl_loss.detach().item())
+            metrics["reference_policy_kl"] = reference_kl_value
+            metrics["reference_policy_kl_penalty"] = (
+                self.reference_policy_kl_penalty * reference_kl_value
+            )
 
         if self.stop_content_enabled and content_kl_component is not None:
             assert stop_kl_component is not None

@@ -2092,6 +2092,80 @@ def test_sequence_mean_distillation_returns_normalized_loss_without_gate():
     assert not loss_fn.normalize_by_kept_tokens
 
 
+@pytest.mark.parametrize("reduction", ["token_mean", "sequence_mean"])
+def test_distillation_reference_policy_kl_adds_nonnegative_penalty(reduction):
+    batch_size, seq_len, vocab_size = 2, 4, 5
+    input_ids = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]])
+    token_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0], [0.0, 1.0, 0.0, 0.0]])
+    sample_mask = torch.ones(batch_size)
+    support = torch.arange(vocab_size).view(1, 1, -1).expand(batch_size, seq_len, -1)
+    student_logits = torch.zeros(batch_size, seq_len, vocab_size, requires_grad=True)
+    data = {
+        "input_ids": input_ids,
+        "input_lengths": torch.full((batch_size,), seq_len),
+        "token_mask": token_mask,
+        "sample_mask": sample_mask,
+        "teacher_topk_logits": torch.zeros(batch_size, seq_len, vocab_size),
+        "teacher_topk_indices": support,
+        # The current uniform policy assigns log(1 / vocab_size) to each
+        # sampled token, while this synthetic reference assigns log(1) = 0.
+        "reference_policy_logprobs": torch.zeros(batch_size, seq_len),
+    }
+    beta = 0.1
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+            "reduction": reduction,
+            "reference_policy_kl_penalty": beta,
+            "reference_policy_kl_type": "k3",
+        }
+    )
+    global_valid_toks = torch.sum(sample_mask.unsqueeze(-1) * token_mask[:, 1:])
+
+    loss, metrics = loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=sample_mask.sum(),
+        global_valid_toks=global_valid_toks,
+    )
+    loss.backward()
+
+    assert metrics["distillation_loss"] == pytest.approx(0.0, abs=1.0e-6)
+    assert metrics["reference_policy_kl"] > 0.0
+    assert metrics["reference_policy_kl_penalty"] == pytest.approx(
+        beta * metrics["reference_policy_kl"]
+    )
+    assert loss.item() == pytest.approx(metrics["reference_policy_kl_penalty"])
+    assert student_logits.grad is not None
+    assert torch.isfinite(student_logits.grad).all()
+
+
+def test_distillation_reference_policy_kl_config_validation():
+    base = {
+        "kl_type": "reverse",
+        "mixed_kl_weight": 0.5,
+        "zero_outside_topk": False,
+    }
+    with pytest.raises(ValueError, match="must be non-negative"):
+        DistillationLossFn({**base, "reference_policy_kl_penalty": -0.1})
+    with pytest.raises(ValueError, match="must be one of"):
+        DistillationLossFn({**base, "reference_policy_kl_type": "exact"})
+    with pytest.raises(ValueError, match="not yet compatible with tvd_gate"):
+        DistillationLossFn(
+            {
+                **base,
+                "reference_policy_kl_penalty": 0.01,
+                "tvd_gate": {
+                    "mode": "fixed",
+                    "direction": "low",
+                    "threshold": 0.5,
+                },
+            }
+        )
+
+
 def test_teacher_margin_weighted_distillation_preserves_total_token_weight():
     torch.manual_seed(0)
     data, student_logits = setup_distillation_test_data(

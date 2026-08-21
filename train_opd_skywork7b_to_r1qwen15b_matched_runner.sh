@@ -38,6 +38,16 @@ POLICY_MODEL="${POLICY_MODEL:-/dev/shm/llms/DeepSeek-R1-Distill-Qwen-1.5B/}"
 OPD_CONFIG_PATH="${OPD_CONFIG_PATH:-examples/configs/distillation_math_tvd_matched_full.yaml}"
 OPD_RUN_TAG="${OPD_RUN_TAG:-matched-full-token}"
 OPD_ZERO_OUTSIDE_TOPK="${OPD_ZERO_OUTSIDE_TOPK:-true}"
+OPD_REFERENCE_KL_PENALTY="${OPD_REFERENCE_KL_PENALTY:-}"
+OPD_REFERENCE_KL_TYPE="${OPD_REFERENCE_KL_TYPE:-k3}"
+
+REFERENCE_KL_OVERRIDES=()
+if [[ -n "$OPD_REFERENCE_KL_PENALTY" ]]; then
+    REFERENCE_KL_OVERRIDES+=(
+        loss_fn.reference_policy_kl_penalty="$OPD_REFERENCE_KL_PENALTY"
+        loss_fn.reference_policy_kl_type="$OPD_REFERENCE_KL_TYPE"
+    )
+fi
 
 for model_dir in "$TEACHER_MODEL" "$POLICY_MODEL"; do
     if [[ ! -f "${model_dir}config.json" ]]; then
@@ -66,6 +76,9 @@ echo "Policy:  $POLICY_MODEL"
 echo "Teacher: $TEACHER_MODEL"
 echo "Config:  $OPD_CONFIG_PATH"
 echo "Zero outside top-k: $OPD_ZERO_OUTSIDE_TOPK"
+if [[ -n "$OPD_REFERENCE_KL_PENALTY" ]]; then
+    echo "Reference KL: beta=$OPD_REFERENCE_KL_PENALTY type=$OPD_REFERENCE_KL_TYPE"
+fi
 echo "Run:     $RUN_NAME"
 
 cd "$REPO_DIR"
@@ -94,5 +107,6 @@ python examples/run_distillation_math.py \
     checkpointing.checkpoint_dir="checkpoints/distillation-${RUN_NAME}" \
     loss_fn.kl_type=reverse \
     loss_fn.zero_outside_topk="$OPD_ZERO_OUTSIDE_TOPK" \
+    "${REFERENCE_KL_OVERRIDES[@]}" \
     logger.wandb_enabled=true \
     logger.wandb.name="$RUN_NAME"
