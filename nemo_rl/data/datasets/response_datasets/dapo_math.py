@@ -81,3 +81,131 @@ class DAPOMath17KDataset(RawDataset):
         self.formatted_ds = prepare_dapo_math_17k_dataset(
             seed=seed, task_name=self.task_name
         )
+
+
+def format_dapo_math_processed(
+    data: dict[str, Any],
+    task_name: str = "DAPOMath17KProcessed",
+) -> dict[str, list[Any] | str]:
+    """Format open-r1/DAPO-Math-17k-Processed, whose ``prompt`` is a plain string.
+
+    This differs from ``format_dapo_math_17k`` above: the BytedTsinghua-SIA
+    release stores ``prompt`` as a chat list, the open-r1 one as a bare string.
+    """
+    return {
+        "messages": [
+            {
+                "role": "user",
+                "content": data["prompt"],
+            },
+            {
+                "role": "assistant",
+                "content": data["reward_model"]["ground_truth"],
+            },
+        ],
+        "task_name": task_name,
+    }
+
+
+def prepare_dapo_math_processed_dataset(
+    seed: int = 42,
+    task_name: str = "DAPOMath17KProcessed",
+    config_name: str = "en",
+    validation_source: str = "train_holdout",
+    validation_num_samples: int = 500,
+    validation_seed: int = 42,
+) -> dict[str, Dataset | None]:
+    """Load open-r1/DAPO-Math-17k-Processed and build its validation set.
+
+    ``validation_source="train_holdout"`` carves a reproducible random
+    partition out of train using ``validation_seed``; those rows are removed
+    from train so the two splits stay strictly disjoint.
+    """
+    train_ds = load_dataset(
+        "open-r1/DAPO-Math-17k-Processed", config_name, split="train"
+    )
+
+    if validation_source == "aime_2024":
+        val_ds = load_dataset("HuggingFaceH4/aime_2024", split="train")
+        val_formatted = val_ds.map(
+            format_math_processed_aime,
+            remove_columns=val_ds.column_names,
+            fn_kwargs={"task_name": task_name},
+        )
+    elif validation_source == "train_holdout":
+        if not 0 < validation_num_samples < len(train_ds):
+            raise ValueError(
+                "validation_num_samples must be in [1, len(train_ds) - 1] when "
+                f"validation_source='train_holdout'; got {validation_num_samples} "
+                f"for {len(train_ds)} training samples"
+            )
+        partitioned_ds = train_ds.shuffle(seed=validation_seed)
+        val_ds = partitioned_ds.select(range(validation_num_samples))
+        train_ds = partitioned_ds.select(
+            range(validation_num_samples, len(partitioned_ds))
+        )
+        val_formatted = val_ds.map(
+            format_dapo_math_processed,
+            remove_columns=val_ds.column_names,
+            fn_kwargs={"task_name": task_name},
+        )
+    else:
+        raise ValueError(
+            "Unknown DAPOMath17KProcessed validation_source "
+            f"{validation_source!r}; expected 'aime_2024' or 'train_holdout'"
+        )
+
+    train_ds = train_ds.shuffle(seed=seed)
+    train_formatted = train_ds.map(
+        format_dapo_math_processed,
+        remove_columns=train_ds.column_names,
+        fn_kwargs={"task_name": task_name},
+    )
+
+    return {
+        "train": train_formatted,
+        "validation": val_formatted,
+    }
+
+
+def format_math_processed_aime(
+    data: dict[str, Any],
+    task_name: str = "DAPOMath17KProcessed",
+) -> dict[str, list[Any] | str]:
+    """Format HuggingFaceH4/aime_2024 rows to match the processed DAPO schema."""
+    return {
+        "messages": [
+            {"role": "user", "content": data["problem"]},
+            {"role": "assistant", "content": data["answer"]},
+        ],
+        "task_name": task_name,
+    }
+
+
+class DAPOMath17KProcessedDataset(RawDataset):
+    def __init__(
+        self,
+        seed: int = 42,
+        config_name: str = "en",
+        validation_source: str = "train_holdout",
+        validation_num_samples: int = 500,
+        validation_seed: int = 42,
+    ) -> None:
+        """Initialize open-r1/DAPO-Math-17k-Processed with a train/val split.
+
+        Args:
+            seed: Random seed for shuffling train
+            config_name: Dataset config: "all", "cn", or "en"
+            validation_source: "train_holdout" or "aime_2024"
+            validation_num_samples: Holdout size when using "train_holdout"
+            validation_seed: Random seed for the holdout partition
+        """
+        self.task_name = "DAPOMath17KProcessed"
+        self.formatted_ds = prepare_dapo_math_processed_dataset(
+            seed=seed,
+            task_name=self.task_name,
+            config_name=config_name,
+            validation_source=validation_source,
+            validation_num_samples=validation_num_samples,
+            validation_seed=validation_seed,
+        )

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# TVD-warmup KL 蒸馏（curriculum 变体）: Skywork-OR1-Math-7B → DeepSeek-R1-Distill-Qwen-1.5B
+# TVD-gated KL 蒸馏（fixed τ, 固定阈值 curriculum 切片）:
+#   Skywork-OR1-Math-7B → DeepSeek-R1-Distill-Qwen-1.5B
 #
-# 目标：把 TVD gate 反向 —— 一开始只学 TVD 小（师生已经差不多）的 token，
-# 随训练逐步放开 τ 直到接近 1（TVD < τ 覆盖几乎所有 token）。
-# 语义：direction="low" ⇒ keep iff TVD < τ；warmup 让 τ 从 start_threshold
-# 沿 cosine 曲线 anneal 到 end_threshold=1.0，warmup_until_frac 之后保持。
+# 语义：direction="low" ⇒ keep iff TVD_topk < τ；mode="fixed" ⇒ 全程恒定 τ=0.4，
+# 即整个训练只让"师生已经比较接近（TVD<0.4）"的 token 进入 KL 损失。
 #
-# 其他一切（模型/数据/超时/tokenizer 检查/EOS mask 关闭）对齐
-# train_opd_skywork7b_to_r1qwen15b_reverse.sh —— 便于对照。
+# 相比 warmup-low 版本，这里 τ 不再随步数变化，用来做单点消融/对照。
+# 其他一切（模型/数据/超时/tokenizer 检查/EOS mask 关闭）与
+# train_opd_skywork7b_to_r1qwen15b_tvdwarmup_low.sh 对齐。
 # set -euo pipefail
 
 # ====== conda 环境 ======
@@ -62,19 +62,14 @@ for d in "$TEACHER_MODEL" "$POLICY_MODEL"; do
 done
 echo "▶ Using policy=$POLICY_MODEL  teacher=$TEACHER_MODEL"
 
-# ====== TVD warmup（curriculum）实验参数 ======
-# DIRECTION=low: 保留 TVD < τ 的 token（从"师生一致的"开始学）
-# START=0.05:    step 0 时的 τ；只有近似完全一致的 token 参与 loss
-# END=0.7:       warmup 末端；TVD 上界就是 1，τ=1 时"TVD < τ"命中几乎全部 token
-# UNTIL=0.4:     用 50% 训练步数从 START anneal 到 END
-MODE="warmup"
+# ====== TVD gated（fixed τ）实验参数 ======
+# MODE=fixed:      τ 全程恒定，不随步数变化
+# DIRECTION=low:   keep iff TVD_topk < τ（"师生一致"的 token 才进入 loss）
+# THRESHOLD=0.4:   固定 τ = 0.4
+MODE="fixed"
 DIRECTION="low"
-START=0.05
-END=1.0
-UNTIL=1.0
-DATESTR=260817
-
-RUN_NAME="opd-skywork7b-to-r1qwen1.5b-reverse-tvdwarm-${DIRECTION}-s${START}-e${END}-u${UNTIL}-${DATESTR}"
+THRESHOLD=0.3
+RUN_NAME="opd-skywork7b-to-r1qwen1.5b-reverse-tvdfixed-${DIRECTION}-th${THRESHOLD}"
 mkdir -p /group/40092/howu/RL-main/logs
 
 # for wandb login
@@ -84,7 +79,7 @@ export WANDB_INIT_TIMEOUT=300
 
 cd /group/40092/howu/RL-main
 python examples/run_distillation_math.py \
-    --config examples/configs/distillation_math_tvd_warmup_low.yaml \
+    --config examples/configs/distillation_math_tvd_gated.yaml \
     policy.model_name="$POLICY_MODEL" \
     teacher.model_name="$TEACHER_MODEL" \
     cluster.gpus_per_node=8 \
@@ -105,11 +100,9 @@ python examples/run_distillation_math.py \
     checkpointing.checkpoint_dir="checkpoints/distillation-${RUN_NAME}" \
     loss_fn.kl_type=reverse \
     loss_fn.tvd_gate.mode="${MODE}" \
-    loss_fn.tvd_gate.direction="${DIRECTION}" \
-    loss_fn.tvd_gate.start_threshold="${START}" \
-    loss_fn.tvd_gate.end_threshold="${END}" \
-    loss_fn.tvd_gate.warmup_until_frac="${UNTIL}" \
+    +loss_fn.tvd_gate.direction="${DIRECTION}" \
+    loss_fn.tvd_gate.threshold="${THRESHOLD}" \
     logger.wandb_enabled=true \
     logger.wandb.name="${RUN_NAME}"
-
-python3 test_gpu.py 
+    
+python3 test_gpu.py

@@ -71,10 +71,10 @@ MODE="warmup"
 DIRECTION="low"
 START=0.05
 END=1.0
-UNTIL=1.0
-DATESTR=260817
+UNTIL=0.1
+DATESTR=260819
 
-RUN_NAME="opd-skywork7b-to-r1qwen1.5b-reverse-tvdwarm-${DIRECTION}-s${START}-e${END}-u${UNTIL}-${DATESTR}"
+RUN_NAME="opd-skywork7b-to-r1qwen1.5b-reverse-tvdwarm-${DIRECTION}-s${START}-e${END}-u${UNTIL}-step50-16k-${DATESTR}"
 mkdir -p /group/40092/howu/RL-main/logs
 
 # for wandb login
@@ -91,16 +91,19 @@ python examples/run_distillation_math.py \
     policy.train_micro_batch_size=1 \
     policy.train_global_batch_size=128 \
     policy.optimizer.kwargs.lr=1.0e-6 \
+    policy.max_total_sequence_length=16384 \
+    teacher.max_total_sequence_length=16384 \
     teacher.logprob_batch_size=1 \
     distillation.max_num_epochs=1 \
-    distillation.max_num_steps=100 \
-    distillation.val_period=10 \
+    distillation.max_num_steps=50 \
+    distillation.val_period=5 \
     distillation.val_at_start=true \
     distillation.max_val_samples=1000 \
     data.validation_source=train_holdout \
     data.validation_num_samples=1000 \
     data.validation_seed=42 \
-    checkpointing.save_period=25 \
+    checkpointing.save_period=5 \
+    checkpointing.keep_top_k=10 \
     checkpointing.save_consolidated=false \
     checkpointing.checkpoint_dir="checkpoints/distillation-${RUN_NAME}" \
     loss_fn.kl_type=reverse \

@@ -43,6 +43,14 @@ results/
 code_snapshots*/
 .cache/
 
+# Experiment artifacts: eval outputs, converted weights, downloaded datasets
+aime_eval_results/
+aime_eval_results_dapo32k/
+hf_ckpts/
+eval_datasets/
+aime_2024.jsonl
+.claude/
+
 # Runtime env
 *runtime_env.yaml
 !default_runtime_env.yaml

@@ -14,7 +14,10 @@
 from typing import Any
 
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
-from nemo_rl.data.datasets.response_datasets.dapo_math import DAPOMath17KDataset
+from nemo_rl.data.datasets.response_datasets.dapo_math import (
+    DAPOMath17KDataset,
+    DAPOMath17KProcessedDataset,
+)
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
@@ -87,6 +90,17 @@ def load_response_dataset(data_config, seed: int = 42):
             "Loading BytedTsinghua-SIA/DAPO-Math-17k for training and AIME 2024 for validation"
         )
         base_dataset: Any = DAPOMath17KDataset(seed=seed)
+    elif dataset_name == "DAPOMath17KProcessed":
+        print(
+            "Loading open-r1/DAPO-Math-17k-Processed for training and validation"
+        )
+        base_dataset: Any = DAPOMath17KProcessedDataset(
+            seed=seed,
+            config_name=data_config.get("config_name", "en"),
+            validation_source=data_config.get("validation_source", "train_holdout"),
+            validation_num_samples=data_config.get("validation_num_samples", 500),
+            validation_seed=data_config.get("validation_seed", 42),
+        )
     # for vlm rl training
     elif dataset_name == "clevr-cogent":
         base_dataset: Any = CLEVRCoGenTDataset(
@@ -157,6 +171,7 @@ __all__ = [
     "CLEVRCoGenTDataset",
     "DeepScalerDataset",
     "DAPOMath17KDataset",
+    "DAPOMath17KProcessedDataset",
     "Geometry3KDataset",
     "OpenAIFormatDataset",
     "OasstDataset",

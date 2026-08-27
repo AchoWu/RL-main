@@ -44,9 +44,11 @@ class DataConfig(TypedDict):
     # DeepScaler-only validation controls. By default DeepScaler keeps its
     # historical AIME 2024 validation behavior; individual recipes can opt in
     # to a reproducible subset sampled from the training distribution.
+    # DAPOMath17KProcessed reuses these and adds config_name ("all"/"cn"/"en").
     validation_source: NotRequired[str]
     validation_num_samples: NotRequired[int]
     validation_seed: NotRequired[int]
+    config_name: NotRequired[str]
 
 
 # ===============================================================================
