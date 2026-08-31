@@ -1,0 +1,20 @@
+# EMA-of-student anchor OPD. Main loss is reverse-KL to the teacher;
+# an auxiliary reverse-KL(p_S || p_EMA) pulls the student toward the EMA
+# of its own recent weights. Anchor is dynamic (unlike frozen reference-KL),
+# so it dampens step-to-step drift without capping progress. Mutually
+# exclusive with reference_policy_kl_penalty (shares the same weight buffer).
+defaults: distillation_math.yaml
+
+loss_fn:
+    kl_type: "reverse"
+    zero_outside_topk: false
+    reduction: "token_mean"
+    ema_anchor:
+        enabled: true
+        # mu ≈ 0.999 → EMA memory window ≈ 1000 steps ("trailing full-history
+        # average" for our 307-step run). Try 0.995 for a shorter, ~200-step
+        # memory if the anchor feels too sticky.
+        mu: 0.999
+        # lambda on KL(p_S || p_EMA). Target `ema_anchor_kl / distillation_loss`
+        # around 0.1-0.3; adjust if the ratio deviates.
+        kl_weight: 0.05

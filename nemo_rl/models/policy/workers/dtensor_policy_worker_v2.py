@@ -1857,6 +1857,41 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         return self.model.config
 
     @torch.no_grad()
+    def update_reference_ema(self, mu: float) -> None:
+        """EMA-update the cached reference_model_state_dict from live weights.
+
+        reference_ema <- mu * reference_ema + (1 - mu) * live_model. Reuses the
+        CPU-resident buffer allocated at init when init_reference_model=True.
+        Silently no-ops if the buffer is not allocated. Runs off-critical-path
+        (called after student.train has already stepped).
+        """
+        if not hasattr(self, "reference_model_state_dict"):
+            return
+        one_minus_mu = 1.0 - float(mu)
+        for k, v in self.model.state_dict().items():
+            src = to_local_if_dtensor(v).detach()
+            dst = self.reference_model_state_dict[k]
+            if dst.shape != src.shape:
+                # Scalar or shape-mismatch buffer: overwrite with a copy.
+                dst.copy_(src.to(dst.device, dtype=dst.dtype))
+                continue
+            # dst is on CPU (possibly pinned); do the mix on GPU then copy back
+            # to keep the arithmetic in a single kernel per parameter.
+            src_cpu = src.to(dst.device, dtype=dst.dtype)
+            dst.mul_(mu).add_(src_cpu, alpha=one_minus_mu)
+
+    @torch.no_grad()
+    def get_reference_topk_logits(
+        self,
+        data: BatchedDataDict[Any],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[Any]:
+        """Run get_topk_logits under the reference (EMA) weights."""
+        with self.use_reference_model():
+            return self.get_topk_logits(data=data, k=k, micro_batch_size=micro_batch_size)
+
+    @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}

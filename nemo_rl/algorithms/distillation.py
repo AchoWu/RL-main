@@ -593,6 +593,11 @@ def setup(
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
+    ema_anchor_cfg = loss_config.get("ema_anchor") or {}
+    ema_anchor_enabled = bool(ema_anchor_cfg.get("enabled", False))
+    ema_anchor_mu = float(ema_anchor_cfg.get("mu", 0.999))
+    ema_anchor_kl_weight = float(ema_anchor_cfg.get("kl_weight", 0.0))
+
     student_policy = Policy(
         name_prefix="student",
         cluster=train_cluster,
@@ -603,6 +608,7 @@ def setup(
         init_optimizer=True,
         init_reference_model=(
             float(loss_config.get("reference_policy_kl_penalty", 0.0)) > 0.0
+            or ema_anchor_enabled
         ),
     )
 
@@ -990,22 +996,37 @@ def distillation_train(
                     isinstance(loss_fn, DistillationLossFn)
                     and loss_fn.reference_policy_kl_penalty > 0.0
                 )
-                if reference_kl_enabled:
+                ema_anchor_enabled_run = (
+                    isinstance(loss_fn, DistillationLossFn)
+                    and getattr(loss_fn, "ema_anchor_enabled", False)
+                    and float(getattr(loss_fn, "ema_anchor_kl_weight", 0.0)) > 0.0
+                )
+                if reference_kl_enabled or ema_anchor_enabled_run:
                     print(
-                        "▶ Preparing frozen initial-student reference inference...",
+                        "▶ Preparing student for reference/EMA inference...",
                         flush=True,
                     )
                     with timer.time("reference_logprob_inference_prep"):
                         student_policy.prepare_for_lp_inference()
-                    print("▶ Computing reference logprobs...", flush=True)
                     try:
-                        with timer.time("reference_logprob_inference"):
-                            reference_output = (
-                                student_policy.get_reference_policy_logprobs(train_data)
-                            )
-                            train_data["reference_policy_logprobs"] = reference_output[
-                                "reference_logprobs"
-                            ]
+                        if reference_kl_enabled:
+                            print("▶ Computing reference logprobs...", flush=True)
+                            with timer.time("reference_logprob_inference"):
+                                reference_output = (
+                                    student_policy.get_reference_policy_logprobs(train_data)
+                                )
+                                train_data["reference_policy_logprobs"] = reference_output[
+                                    "reference_logprobs"
+                                ]
+                        if ema_anchor_enabled_run:
+                            print("▶ Computing EMA top-k logits...", flush=True)
+                            with timer.time("ema_anchor_topk_inference"):
+                                ema_topk = student_policy.get_reference_topk_logits(
+                                    train_data,
+                                    k=master_config["distillation"]["topk_logits_k"],
+                                )
+                                train_data["ema_topk_logits"] = ema_topk["topk_logits"]
+                                train_data["ema_topk_indices"] = ema_topk["topk_indices"]
                     finally:
                         # Teacher and student share the training cluster. Release
                         # the student weights before loading the teacher.
@@ -1075,6 +1096,15 @@ def distillation_train(
                             tvd_gate_threshold_current = tau
                     # nemo_rl/models/policy/workers/dtensor_policy_worker.py 506
                     train_results = student_policy.train(train_data, loss_fn)
+
+                # EMA-of-student: after the optimizer step, blend the just-updated
+                # weights into the reference (EMA) buffer. Cheap CPU-side mix; the
+                # buffer is used as the top-k source in the NEXT step's loss.
+                if ema_anchor_enabled_run:
+                    with timer.time("ema_anchor_update"):
+                        student_policy.update_reference_ema(
+                            mu=float(loss_fn.ema_anchor_mu)
+                        )
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
@@ -1203,6 +1233,13 @@ def distillation_train(
                         metrics["teacher_margin_weight_ess_frac"] = float("nan")
                 metrics.update(rollout_metrics)
                 metrics.update(teacher_prefix_metrics)
+                # EMA anchor constants: log outside the loss-fn metrics pipeline
+                # so they don't get sliced by num_global_batches.
+                if ema_anchor_enabled_run:
+                    metrics["ema_anchor_mu"] = float(loss_fn.ema_anchor_mu)
+                    metrics["ema_anchor_kl_weight"] = float(
+                        loss_fn.ema_anchor_kl_weight
+                    )
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing

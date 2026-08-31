@@ -1092,6 +1092,27 @@ class StopContentConfig(TypedDict):
     probability_eps: float
 
 
+class EmaAnchorConfig(TypedDict, total=False):
+    """Config for EMA-of-student anchor regularization.
+
+    Adds `kl_weight * KL(p_S || p_EMA)` on the EMA's top-k support, where
+    the EMA copy of the student weights is updated in-place each step as
+    `theta_ema <- mu * theta_ema + (1 - mu) * theta_student` (starting from
+    the initial student weights). Acts as a soft trust region "in time":
+    the student is only lightly penalized for deviating from its recent
+    trailing average, not from a frozen initial reference. Complementary to
+    the main teacher KL: teacher pulls toward a distant target, EMA anchor
+    dampens step-to-step drift.
+
+    Physically reuses the same `reference_model_state_dict` slot as
+    `reference_policy_kl_penalty` — the two features are mutually exclusive.
+    """
+
+    enabled: bool
+    mu: float  # EMA decay; typical 0.995-0.999
+    kl_weight: float  # lambda on KL(p_S || p_EMA)
+
+
 class DistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float
@@ -1104,6 +1125,7 @@ class DistillationLossConfig(TypedDict):
     tvd_gate: NotRequired[TvdGateConfig]
     teacher_margin_weight: NotRequired[TeacherMarginWeightConfig]
     stop_content: NotRequired[StopContentConfig]
+    ema_anchor: NotRequired[EmaAnchorConfig]
     # If set, drops these token ids from the loss mask at their *target*
     # positions (i.e. positions where the *next* token equals one of these
     # ids). Motivation: on-policy rollouts that stop early on wrong answers
@@ -1133,6 +1155,10 @@ class DistillationLossDataDict(TypedDict):
     # Exact teacher EOS logit at every position. Required by stop-content
     # factorization even when EOS is not among the teacher's top-k tokens.
     teacher_eos_logits: NotRequired[torch.Tensor]
+    # Top-k logits/indices of the student EMA copy, on the EMA's OWN top-k
+    # support. Populated by the student policy when ema_anchor is enabled.
+    ema_topk_logits: NotRequired[torch.Tensor]
+    ema_topk_indices: NotRequired[torch.Tensor]
 
 
 class DistillationLossFn(LossFunction):
@@ -1173,6 +1199,31 @@ class DistillationLossFn(LossFunction):
             raise ValueError(
                 "loss_fn.reference_policy_kl_type must be one of: 'k1', 'k2', 'k3'."
             )
+
+        # Optional EMA-of-student anchor. Adds KL(p_S || p_EMA) on the EMA's
+        # own top-k support. Physically shares the reference_model_state_dict
+        # slot with reference-policy KL, so the two are mutually exclusive.
+        ema_cfg = cfg.get("ema_anchor")
+        self.ema_anchor_enabled = bool(
+            ema_cfg is not None and ema_cfg.get("enabled", False)
+        )
+        self.ema_anchor_mu = 0.999
+        self.ema_anchor_kl_weight = 0.0
+        if self.ema_anchor_enabled:
+            assert ema_cfg is not None
+            self.ema_anchor_mu = float(ema_cfg.get("mu", 0.999))
+            self.ema_anchor_kl_weight = float(ema_cfg.get("kl_weight", 0.0))
+            if not (0.0 <= self.ema_anchor_mu < 1.0):
+                raise ValueError("loss_fn.ema_anchor.mu must be in [0, 1).")
+            if self.ema_anchor_kl_weight < 0.0:
+                raise ValueError(
+                    "loss_fn.ema_anchor.kl_weight must be non-negative."
+                )
+            if self.reference_policy_kl_penalty > 0.0:
+                raise ValueError(
+                    "ema_anchor and reference_policy_kl_penalty are mutually "
+                    "exclusive (both reuse the reference_model_state_dict slot)."
+                )
 
         self.stop_content_cfg = cfg.get("stop_content")
         self.stop_content_enabled = bool(
@@ -1762,6 +1813,7 @@ class DistillationLossFn(LossFunction):
         confidence_weight_sq_sum: Optional[torch.Tensor] = None
         reference_policy_kl_loss: Optional[torch.Tensor] = None
         distillation_kl_loss: Optional[torch.Tensor] = None
+        ema_kl_loss: Optional[torch.Tensor] = None
 
         if "token_mask" in data and "sample_mask" in data:
             token_mask = data["token_mask"][:, 1:]
@@ -1976,6 +2028,74 @@ class DistillationLossFn(LossFunction):
                     kl_loss
                     + self.reference_policy_kl_penalty * reference_policy_kl_loss
                 )
+
+            # EMA-of-student anchor: KL(p_S || p_EMA) on the EMA's own top-k
+            # support. Frame-of-reference matches the main reverse-KL loss —
+            # student is penalized for placing mass where the trailing EMA
+            # does not. Mask is the same base_mask; no gating.
+            if (
+                self.ema_anchor_enabled
+                and self.ema_anchor_kl_weight > 0.0
+                and "ema_topk_logits" in data
+                and "ema_topk_indices" in data
+            ):
+                ema_topk_logits_full = data["ema_topk_logits"].to(
+                    device=student_topk_logprobs.device, dtype=torch.float32
+                )
+                ema_topk_indices_full = data["ema_topk_indices"].to(
+                    device=student_topk_logprobs.device
+                )
+                if (parallel_group is not None) or (cp_size > 1):
+                    student_ema_topk_logits = gather_logits_at_global_indices(
+                        logits_tensor,
+                        ema_topk_indices_full,
+                        tp_group=parallel_group,
+                        cp_group=cp_group,
+                        vocab_start_index=(
+                            vocab_start_index if parallel_group is not None else 0
+                        ),
+                        vocab_end_index=(
+                            vocab_end_index
+                            if parallel_group is not None
+                            else int(logits_tensor.shape[-1])
+                        ),
+                    )
+                else:
+                    student_ema_topk_logits = logits_tensor.gather(
+                        dim=-1,
+                        index=ema_topk_indices_full.to(logits_tensor.device),
+                    )
+                student_ema_topk_logprobs = torch.nn.functional.log_softmax(
+                    student_ema_topk_logits, dim=-1
+                )[:, :-1, :]
+                ema_topk_logprobs = torch.nn.functional.log_softmax(
+                    ema_topk_logits_full, dim=-1
+                )[:, :-1, :]
+
+                # reverse-KL against EMA: q_S * (log q_S - log q_EMA)
+                student_probs_ema = student_ema_topk_logprobs.exp()
+                per_token_ema_kl = (
+                    student_probs_ema
+                    * (student_ema_topk_logprobs - ema_topk_logprobs)
+                ).sum(dim=-1)
+
+                ema_max_len = min(per_token_ema_kl.shape[1], base_mask.shape[1])
+                ema_mask = base_mask[:, :ema_max_len]
+                ema_per_token = per_token_ema_kl[:, :ema_max_len]
+                if self.reduction == "sequence_mean":
+                    ema_kl_loss = _sequence_balanced_mean(
+                        ema_per_token,
+                        ema_mask,
+                        sample_mask,
+                        global_valid_seqs,
+                    )
+                else:
+                    ema_kl_loss = masked_mean(
+                        ema_per_token,
+                        ema_mask,
+                        global_normalization_factor=global_valid_toks,
+                    )
+                kl_loss = kl_loss + self.ema_anchor_kl_weight * ema_kl_loss
         else:
             kl_loss = per_token_kl.mean()
             distillation_kl_loss = kl_loss
@@ -1991,6 +2111,12 @@ class DistillationLossFn(LossFunction):
             metrics["reference_policy_kl"] = reference_kl_value
             metrics["reference_policy_kl_penalty"] = (
                 self.reference_policy_kl_penalty * reference_kl_value
+            )
+        if self.ema_anchor_enabled and ema_kl_loss is not None:
+            ema_kl_value = float(ema_kl_loss.detach().item())
+            metrics["ema_anchor_kl"] = ema_kl_value
+            metrics["ema_anchor_kl_penalty"] = (
+                self.ema_anchor_kl_weight * ema_kl_value
             )
 
         if self.stop_content_enabled and content_kl_component is not None:
