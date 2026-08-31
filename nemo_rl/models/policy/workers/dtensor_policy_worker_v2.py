@@ -1866,7 +1866,16 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         (called after student.train has already stepped).
         """
         if not hasattr(self, "reference_model_state_dict"):
-            return
+            # If we get here, the setup-time check in distillation.py was
+            # bypassed. Fail loudly so the caller sees a clear error at the
+            # right site instead of a downstream AttributeError from
+            # get_reference_topk_logits.
+            raise RuntimeError(
+                "update_reference_ema called on a worker without "
+                "reference_model_state_dict. Enable init_reference_model "
+                "when constructing the student Policy (loss_fn.ema_anchor "
+                "requires this)."
+            )
         mu_f = float(mu)
         one_minus_mu = 1.0 - mu_f
         for k, v in self.model.state_dict().items():
@@ -1886,8 +1895,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             # Force the EMA blend through fp32. Doing `dst.mul_(0.999)` when
             # dst is bf16 quantizes mu to the nearest bf16 (~0.99609), which
             # shortens the effective EMA window by ~4x. Cast to fp32, mix,
-            # cast back — the CPU-side arithmetic cost is negligible vs the
-            # forward passes elsewhere.
+            # cast back. Arithmetic is CPU-side (dst is CPU-resident) — cost
+            # is negligible vs the teacher/student forward passes.
             src_f32 = src.to(dst.device, dtype=torch.float32)
             dst_f32 = dst.to(torch.float32)
             dst_f32.mul_(mu_f).add_(src_f32, alpha=one_minus_mu)
