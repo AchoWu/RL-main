@@ -1335,6 +1335,18 @@ class DistillationLossFn(LossFunction):
                 "teacher_margin_weight and tvd_gate cannot be enabled together. "
                 "Run confidence weighting as an isolated baseline ablation."
             )
+        if self.ema_anchor_enabled and gate_mode != "none":
+            # Gate-active main loss is an *unnormalized* token-loss sum
+            # (worker divides by kept-token count later). EMA-anchor's
+            # masked_mean is already normalized, so summing the two would
+            # rescale EMA-anchor's gradient by 1/kept_tokens. Refuse the
+            # combination until we route EMA through the same delayed
+            # normalization path.
+            raise ValueError(
+                "ema_anchor and tvd_gate cannot be enabled together: the "
+                "gate defers loss normalization to the worker, which would "
+                "double-normalize the EMA-anchor term. Disable one."
+            )
         # A TVD-gated loss is accumulated as an unnormalized token-loss sum.
         # The DTensor worker sees every microbatch and DP shard, so it can divide
         # the accumulated gradients by the exact global number of kept tokens

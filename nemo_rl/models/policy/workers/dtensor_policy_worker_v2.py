@@ -1867,18 +1867,31 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         """
         if not hasattr(self, "reference_model_state_dict"):
             return
-        one_minus_mu = 1.0 - float(mu)
+        mu_f = float(mu)
+        one_minus_mu = 1.0 - mu_f
         for k, v in self.model.state_dict().items():
             src = to_local_if_dtensor(v).detach()
             dst = self.reference_model_state_dict[k]
+            # Non-floating buffers (int64 counters, bool masks, RoPE integer
+            # indices, etc.) cannot be EMA-blended without a cast error from
+            # aten. Overwrite them with the current live value — semantically
+            # correct for these buffer kinds (they aren't learned parameters).
+            if not dst.is_floating_point() or not src.is_floating_point():
+                dst.copy_(src.to(dst.device, dtype=dst.dtype))
+                continue
             if dst.shape != src.shape:
                 # Scalar or shape-mismatch buffer: overwrite with a copy.
                 dst.copy_(src.to(dst.device, dtype=dst.dtype))
                 continue
-            # dst is on CPU (possibly pinned); do the mix on GPU then copy back
-            # to keep the arithmetic in a single kernel per parameter.
-            src_cpu = src.to(dst.device, dtype=dst.dtype)
-            dst.mul_(mu).add_(src_cpu, alpha=one_minus_mu)
+            # Force the EMA blend through fp32. Doing `dst.mul_(0.999)` when
+            # dst is bf16 quantizes mu to the nearest bf16 (~0.99609), which
+            # shortens the effective EMA window by ~4x. Cast to fp32, mix,
+            # cast back — the CPU-side arithmetic cost is negligible vs the
+            # forward passes elsewhere.
+            src_f32 = src.to(dst.device, dtype=torch.float32)
+            dst_f32 = dst.to(torch.float32)
+            dst_f32.mul_(mu_f).add_(src_f32, alpha=one_minus_mu)
+            dst.copy_(dst_f32.to(dst.dtype))
 
     @torch.no_grad()
     def get_reference_topk_logits(

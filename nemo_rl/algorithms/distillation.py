@@ -598,6 +598,27 @@ def setup(
     ema_anchor_mu = float(ema_anchor_cfg.get("mu", 0.999))
     ema_anchor_kl_weight = float(ema_anchor_cfg.get("kl_weight", 0.0))
 
+    if ema_anchor_enabled:
+        # EMA anchor plumbing (update_reference_ema / get_reference_topk_logits)
+        # is currently only implemented on DTensorPolicyWorkerV2. Fail fast
+        # here rather than 20+ minutes into training with a Ray AttributeError.
+        student_dtensor_cfg = policy_config.get("dtensor_cfg", {})
+        student_uses_v2 = bool(
+            student_dtensor_cfg.get("enabled", False)
+            and student_dtensor_cfg.get("_v2", False)
+        )
+        student_uses_megatron = bool(
+            policy_config.get("megatron_cfg", {}).get("enabled", False)
+        )
+        if student_uses_megatron or not student_uses_v2:
+            raise ValueError(
+                "loss_fn.ema_anchor.enabled=true requires the student policy "
+                "to run on DTensorPolicyWorkerV2 "
+                "(policy.dtensor_cfg.enabled=true and policy.dtensor_cfg._v2=true). "
+                "The EMA worker methods are not implemented on the v1 DTensor "
+                "worker or the Megatron worker."
+            )
+
     student_policy = Policy(
         name_prefix="student",
         cluster=train_cluster,
