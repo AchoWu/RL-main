@@ -2575,15 +2575,19 @@ class TopKAgreementPGLossFn(LossFunction):
 
         # ------------------------------------------------------------------
         # 1) Current-student logprob at the sampled token v_t = input_ids[t+1].
-        #    We reuse the existing TP+CP-aware kernel used by ClippedPGLossFn.
+        #    Dispatch must match DistillationLossFn (loss_functions.py:1434):
+        #    key off the ORIGINAL `vocab_parallel_group` / DTensor type, not
+        #    the resolved `parallel_group` we assigned above — otherwise the
+        #    DTensor path incorrectly routes into from_parallel_logits_to_logprobs,
+        #    whose `target.roll(...)` op has no DTensor sharding strategy.
         # ------------------------------------------------------------------
-        if parallel_group is not None:
+        if vocab_parallel_group is not None:
             current_logp = from_parallel_logits_to_logprobs(
                 next_token_logits,
                 input_ids,
                 vocab_start_index=vocab_start_index,
                 vocab_end_index=vocab_end_index,
-                tp_group=parallel_group,
+                tp_group=vocab_parallel_group,
                 inference_only=False,
                 cp_group=context_parallel_group,
             )  # [B, S-1]
