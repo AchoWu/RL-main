@@ -2656,9 +2656,23 @@ class TopKAgreementPGLossFn(LossFunction):
         # Teacher/Student top-k tensors are indexed by position t (context),
         # sampled token is input_ids[t+1]. So slice [:, :-1, :] and
         # input_ids[:, 1:].
+        #
+        # input_ids is a CP-sharded DTensor on the DTensorPolicyWorkerV2 path;
+        # student_topk_full / teacher_topk_indices are plain tensors of the
+        # canonical full-seq length. Mixing them in aten.eq is rejected by the
+        # DTensor dispatcher (see loss_functions.py:1856-1864 for the same
+        # pattern in DistillationLossFn's mask_eos_positions branch).
+        ids = input_ids
+        if isinstance(ids, torch.distributed.tensor.DTensor):
+            ids = ids.to_local()
+            if cp_size > 1:
+                ids = allgather_cp_sharded_tensor(ids, cp_group, seq_dim=1)
         student_topk_at_ctx = student_topk_full[:, :-1, :].to(current_logp.device)
         teacher_topk_at_ctx = teacher_topk_indices[:, :-1, :].to(current_logp.device)
-        v_next = input_ids[:, 1:].to(current_logp.device)  # [B, S-1]
+        # ids may be padded to a multiple of 2*cp; slice [:, 1:1+max_len]
+        # trims to the canonical target length that current_logp uses.
+        max_len_ids = student_topk_at_ctx.shape[1]
+        v_next = ids[:, 1 : 1 + max_len_ids].to(current_logp.device)  # [B, S-1]
 
         # ------------------------------------------------------------------
         # 3) Advantage classification A ∈ {+1, 0, −1}.
@@ -2675,6 +2689,16 @@ class TopKAgreementPGLossFn(LossFunction):
         pos_mask = in_student & in_teacher  # A = +1
         neg_mask = ~in_student  # A = -1
         # zero elsewhere (in_student & ~in_teacher)
+
+        # Align pos/neg masks to current_logp length. current_logp may be
+        # slightly longer than pos_mask under CP padding; take the common
+        # prefix so downstream broadcasts are safe.
+        common_len = min(current_logp.shape[1], pos_mask.shape[1])
+        current_logp = current_logp[:, :common_len]
+        pos_mask = pos_mask[:, :common_len]
+        neg_mask = neg_mask[:, :common_len]
+        in_student = in_student[:, :common_len]
+        in_teacher = in_teacher[:, :common_len]
 
         advantage = torch.zeros_like(current_logp)
         advantage = torch.where(
