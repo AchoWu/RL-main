@@ -31,6 +31,7 @@ from nemo_rl.algorithms.loss_functions import (
     DistillationLossDataDict,
     DistillationLossFn,
     OADLossFn,
+    TopKAgreementPGLossFn,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
@@ -249,7 +250,7 @@ def setup(
     Optional[GenerationInterface],  # teacher_generation
     StatefulDataLoader,
     Optional[StatefulDataLoader],
-    DistillationLossFn | OADLossFn,
+    DistillationLossFn | OADLossFn | TopKAgreementPGLossFn,
     Logger,
     CheckpointManager,
     DistillationSaveState,
@@ -598,6 +599,29 @@ def setup(
     ema_anchor_mu = float(ema_anchor_cfg.get("mu", 0.999))
     ema_anchor_kl_weight = float(ema_anchor_cfg.get("kl_weight", 0.0))
 
+    # topk_agreement_pg invariant lock: this loss defines π_ref as the FROZEN
+    # initial student checkpoint and computes IS ratios against it. Two paths
+    # would silently mutate π_ref if left enabled:
+    #   - EMA anchor (loss_fn.ema_anchor.enabled=true) shares the reference
+    #     model_state_dict slot and rewrites it with an EMA every step.
+    #   - reference_policy_kl_penalty>0 combined with any future "refresh ref"
+    #     hook would break the "frozen initial" semantics.
+    # Fail fast here so a misconfiguration doesn't quietly produce ratios
+    # against an EMA/rolling ref instead of the initial ckpt.
+    if loss_config.get("type") == "topk_agreement_pg":
+        if ema_anchor_enabled:
+            raise ValueError(
+                "loss_fn.type='topk_agreement_pg' requires loss_fn.ema_anchor.enabled=false. "
+                "π_ref must be the FROZEN initial student ckpt; EMA anchor mutates "
+                "the reference slot every step and would corrupt the IS ratio."
+            )
+        if float(loss_config.get("reference_policy_kl_penalty", 0.0)) > 0.0:
+            raise ValueError(
+                "loss_fn.type='topk_agreement_pg' requires reference_policy_kl_penalty=0. "
+                "The IS ratio already uses π_ref = frozen initial ckpt; adding a "
+                "reference-KL term double-uses this channel with conflicting semantics."
+            )
+
     if ema_anchor_enabled:
         # EMA anchor plumbing (update_reference_ema / get_reference_topk_logits)
         # is currently only implemented on DTensorPolicyWorkerV2. Fail fast
@@ -630,6 +654,9 @@ def setup(
         init_reference_model=(
             float(loss_config.get("reference_policy_kl_penalty", 0.0)) > 0.0
             or ema_anchor_enabled
+            # topk_agreement_pg uses π_ref = frozen initial student as the
+            # IS-ratio denominator and needs the reference model slot.
+            or loss_config.get("type") == "topk_agreement_pg"
         ),
     )
 
@@ -655,15 +682,19 @@ def setup(
         ray.get(futures_train + futures_inference)
 
     # Dispatch loss function: default "kl" (back-compat); "oad" enables
-    # Overlap-Aligned Distillation (see BASIC_OAD_PROPOSAL.md).
+    # Overlap-Aligned Distillation (see BASIC_OAD_PROPOSAL.md); "topk_agreement_pg"
+    # is the teacher-guided policy-gradient sharpening variant (see loss_functions.py).
     loss_type = loss_config.get("type", "kl")
     if loss_type == "kl":
         loss_fn = DistillationLossFn(loss_config)
     elif loss_type == "oad":
         loss_fn = OADLossFn(loss_config.get("oad", {}))
+    elif loss_type == "topk_agreement_pg":
+        loss_fn = TopKAgreementPGLossFn(loss_config["topk_agreement_pg"])
     else:
         raise ValueError(
-            f"Unknown loss_fn.type: {loss_type!r}. Expected one of: 'kl', 'oad'."
+            f"Unknown loss_fn.type: {loss_type!r}. "
+            "Expected one of: 'kl', 'oad', 'topk_agreement_pg'."
         )
 
     print("\n" + "=" * 60)
@@ -1017,12 +1048,16 @@ def distillation_train(
                     isinstance(loss_fn, DistillationLossFn)
                     and loss_fn.reference_policy_kl_penalty > 0.0
                 )
+                # topk_agreement_pg always needs π_ref (frozen initial student)
+                # logprobs for its IS ratio; reuse the same channel.
+                topk_agreement_pg_enabled = isinstance(loss_fn, TopKAgreementPGLossFn)
+                reference_logp_needed = reference_kl_enabled or topk_agreement_pg_enabled
                 ema_anchor_enabled_run = (
                     isinstance(loss_fn, DistillationLossFn)
                     and getattr(loss_fn, "ema_anchor_enabled", False)
                     and float(getattr(loss_fn, "ema_anchor_kl_weight", 0.0)) > 0.0
                 )
-                if reference_kl_enabled or ema_anchor_enabled_run:
+                if reference_logp_needed or ema_anchor_enabled_run:
                     print(
                         "▶ Preparing student for reference/EMA inference...",
                         flush=True,
@@ -1030,7 +1065,7 @@ def distillation_train(
                     with timer.time("reference_logprob_inference_prep"):
                         student_policy.prepare_for_lp_inference()
                     try:
-                        if reference_kl_enabled:
+                        if reference_logp_needed:
                             print("▶ Computing reference logprobs...", flush=True)
                             with timer.time("reference_logprob_inference"):
                                 reference_output = (

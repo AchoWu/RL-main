@@ -25,6 +25,7 @@ from nemo_rl.distributed.model_utils import (
     ChunkedDistributedGatherLogprob,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
+    distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     gather_logits_at_global_indices,
     get_logprobs_from_vocab_parallel_logits,
@@ -2420,6 +2421,364 @@ class OADLossFn(LossFunction):
             "oad_active_grad_token_sum": float(active_grad_token_sum.item()),
             "oad_token_count": float(n_valid_tensor.item()),
             "oad_min_accept_pathB": float(min_accept.item()),
+        }
+
+        return loss, metrics
+
+
+# ===============================================================================
+# Top-K Agreement Policy Gradient (teacher-guided sharpening)
+# ===============================================================================
+class TopKAgreementPGLossConfig(TypedDict):
+    """Configuration for the top-k agreement policy-gradient loss.
+
+    Loss per sampled token v_t:
+        A_t = +1 if v_t ∈ S_top ∩ T_top
+        A_t =  0 if v_t ∈ S_top \\ T_top
+        A_t = −1 if v_t ∉ S_top
+        w_t = π_θ(v_t) / π_ref(v_t)      # ref = frozen initial student ckpt
+        L_t = − min(w_t · A_t, clip(w_t, 1−ε_lo, 1+ε_hi) · A_t)
+    """
+
+    student_k: int
+    ratio_clip_min: float
+    ratio_clip_max: float
+    reduction: NotRequired[str]  # "token_mean" (default) | "sequence_mean"
+
+
+class TopKAgreementPGLossDataDict(TypedDict):
+    """Required keys for the top-k agreement PG loss."""
+
+    input_ids: torch.Tensor
+    token_mask: torch.Tensor
+    sample_mask: torch.Tensor
+    teacher_topk_indices: torch.Tensor  # [B, S, k_T]
+    # Per-position log π_ref(x_{t+1}). Position 0 follows the policy API
+    # convention and is always 0. Reference weights = frozen initial student.
+    reference_policy_logprobs: torch.Tensor  # [B, S]
+    seq_index: NotRequired[torch.Tensor]
+
+
+class TopKAgreementPGLossFn(LossFunction):
+    """Three-class advantage × PPO-clipped IS surrogate on student rollouts.
+
+    Semantics (OPD-style, single rollout per step):
+        - π_θ    = student being trained (this forward)
+        - π_ref  = frozen initial student ckpt (reference channel)
+        - π_T    = teacher (top-k indices supplied by teacher worker)
+
+    For each sampled token v_t = input_ids[t+1]:
+        S_top(x_<t) = top-k global vocabulary of π_θ at position t
+        T_top(x_<t) = teacher's top-k (already in teacher_topk_indices)
+
+        A_t = +1  if v_t ∈ S_top ∩ T_top
+        A_t =  0  if v_t ∈ S_top \\ T_top   (student thinks fine, teacher does not)
+        A_t = −1  if v_t ∉ S_top             (student didn't rank v_t highly at all)
+
+        w_t = exp(log π_θ(v_t) − log π_ref(v_t))
+        L_t = − min(w_t · A_t, clip(w_t, 1−ε_lo, 1+ε_hi) · A_t)
+
+    IS + clip role: bound single-step drift from the initial ckpt. Because
+    π_ref is frozen (not per-step), ratios drift away from 1 as training
+    proceeds; the diagnostic ``is_clipped_frac_*`` metrics make this visible.
+
+    Fraction of A=−1 tokens is expected to be small (v_t is drawn from π_θ_old
+    ≈ π_θ, and π_θ's own top-k covers most of its mass). This is a known
+    property of the formulation, not a bug — the sign of the update on the
+    rare −1 positions still points the student away from tokens it now
+    dislikes but nevertheless emitted during rollout.
+    """
+
+    def __init__(self, cfg: TopKAgreementPGLossConfig):
+        self.student_k = int(cfg["student_k"])
+        self.ratio_clip_min = float(cfg["ratio_clip_min"])
+        self.ratio_clip_max = float(cfg["ratio_clip_max"])
+        self.reduction = str(cfg.get("reduction", "token_mean"))
+        self.loss_type = LossType.TOKEN_LEVEL
+
+        if self.student_k <= 0:
+            raise ValueError(
+                f"loss_fn.topk_agreement_pg.student_k must be positive, got {self.student_k}."
+            )
+        if not (0.0 < self.ratio_clip_min < 1.0):
+            raise ValueError(
+                "loss_fn.topk_agreement_pg.ratio_clip_min must be in (0, 1)."
+            )
+        if not (self.ratio_clip_max > 1.0 and math.isfinite(self.ratio_clip_max)):
+            raise ValueError(
+                "loss_fn.topk_agreement_pg.ratio_clip_max must be a finite value > 1.0."
+            )
+        if self.reduction not in ("token_mean", "sequence_mean"):
+            raise ValueError(
+                f"Unknown loss_fn.reduction={self.reduction!r}. "
+                "Expected one of: 'token_mean', 'sequence_mean'."
+            )
+
+    def __call__(
+        self,
+        next_token_logits: torch.Tensor,
+        data: TopKAgreementPGLossDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        input_ids = data["input_ids"]
+        batch_size = input_ids.shape[0]
+        teacher_topk_indices = data["teacher_topk_indices"]  # [B, S, k_T]
+
+        if "reference_policy_logprobs" not in data:
+            raise KeyError(
+                "TopKAgreementPGLossFn requires `reference_policy_logprobs` "
+                "in train_data. Enable the reference logprob path in "
+                "distillation.py so π_ref = frozen initial student is snapshotted."
+            )
+
+        cp_group = context_parallel_group
+        cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+        next_token_logits = next_token_logits.to(torch.float32)
+
+        # Resolve TP / CP layout (mirrors OADLossFn:2280-2320).
+        if vocab_parallel_group is not None:
+            assert vocab_parallel_rank is not None
+            V_local = int(next_token_logits.shape[-1])
+            vocab_start_index = vocab_parallel_rank * V_local
+            vocab_end_index = (vocab_parallel_rank + 1) * V_local
+            parallel_group = vocab_parallel_group
+            logits_local = next_token_logits
+        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+            device_mesh = next_token_logits.device_mesh
+            tp_group = device_mesh.get_group("tp")
+            tp_rank = tp_group.rank()
+            local_logits = next_token_logits.to_local()
+            V_local = int(local_logits.shape[-1])
+            vocab_start_index = tp_rank * V_local
+            vocab_end_index = (tp_rank + 1) * V_local
+            parallel_group = tp_group
+            logits_local = local_logits
+            teacher_topk_indices = teacher_topk_indices.to(local_logits.device)
+            if (
+                device_mesh.mesh_dim_names is not None
+                and "cp" in device_mesh.mesh_dim_names
+            ):
+                cp_group = device_mesh.get_group("cp")
+                cp_size = cp_group.size()
+            else:
+                cp_group = None
+                cp_size = 1
+        else:
+            parallel_group = None
+            logits_local = next_token_logits
+            vocab_start_index = 0
+            vocab_end_index = int(logits_local.shape[-1])
+
+        # ------------------------------------------------------------------
+        # 1) Current-student logprob at the sampled token v_t = input_ids[t+1].
+        #    We reuse the existing TP+CP-aware kernel used by ClippedPGLossFn.
+        # ------------------------------------------------------------------
+        if parallel_group is not None:
+            current_logp = from_parallel_logits_to_logprobs(
+                next_token_logits,
+                input_ids,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_end_index,
+                tp_group=parallel_group,
+                inference_only=False,
+                cp_group=context_parallel_group,
+            )  # [B, S-1]
+            current_logp = current_logp[:, : input_ids.shape[1] - 1]
+        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+            current_logp = get_logprobs_from_vocab_parallel_logits(
+                next_token_logits,
+                input_ids,
+                seq_index=data.get("seq_index"),
+            )
+        else:
+            shifted_logits = logits_local[:, :-1]
+            next_ids = input_ids[:, 1:].to(shifted_logits.device)
+            current_logp = (
+                torch.nn.functional.log_softmax(shifted_logits, dim=-1)
+                .gather(dim=-1, index=next_ids.unsqueeze(-1))
+                .squeeze(-1)
+            )  # [B, S-1]
+
+        # ------------------------------------------------------------------
+        # 2) Student global top-k indices at every position (TP+CP aware).
+        #    We only need these indices for membership testing (advantage
+        #    classification). No gradient flows through this branch — the
+        #    advantage A ∈ {+1, 0, −1} is a piecewise-constant function of
+        #    the top-k membership set, hence its gradient is zero a.e.
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            if parallel_group is not None:
+                # distributed_vocab_topk operates on the CP-sharded logits directly
+                # and returns per-shard results with seq_len == logits_local.shape[1].
+                _, student_topk_idx_sharded = distributed_vocab_topk(
+                    logits_local,
+                    self.student_k,
+                    tp_group=parallel_group,
+                    vocab_start_index=vocab_start_index,
+                    vocab_end_index=vocab_end_index,
+                    chunk_size=max(1, min(int(logits_local.shape[1]), 1024)),
+                )  # [B, S_local, k_S], global vocab ids
+                if cp_size > 1:
+                    student_topk_full = allgather_cp_sharded_tensor(
+                        student_topk_idx_sharded, cp_group, seq_dim=1
+                    )
+                    # After CP allgather, sequence length is padded to
+                    # logits_local.shape[1] * cp_size; teacher_topk_indices
+                    # is the canonical (unpadded) length. The trim must be a
+                    # true prefix — if allgather emitted a shorter tensor for
+                    # any reason (mis-sharded input, unexpected CP layout),
+                    # a silent trim would produce misaligned membership tests.
+                    canonical_S = teacher_topk_indices.shape[1]
+                    assert student_topk_full.shape[1] >= canonical_S, (
+                        f"CP-gathered student top-k has seq_len "
+                        f"{student_topk_full.shape[1]} < canonical S "
+                        f"{canonical_S}; refusing to trim (would misalign "
+                        f"advantage vs targets)."
+                    )
+                    student_topk_full = student_topk_full[:, :canonical_S, :]
+                else:
+                    student_topk_full = student_topk_idx_sharded
+            else:
+                # Single-process fallback.
+                _, student_topk_full = torch.topk(
+                    logits_local, k=self.student_k, dim=-1
+                )  # [B, S, k_S], local indices == global indices in single-proc
+
+        # Align to next-token prediction: at position t we care about v_{t+1}.
+        # Teacher/Student top-k tensors are indexed by position t (context),
+        # sampled token is input_ids[t+1]. So slice [:, :-1, :] and
+        # input_ids[:, 1:].
+        student_topk_at_ctx = student_topk_full[:, :-1, :].to(current_logp.device)
+        teacher_topk_at_ctx = teacher_topk_indices[:, :-1, :].to(current_logp.device)
+        v_next = input_ids[:, 1:].to(current_logp.device)  # [B, S-1]
+
+        # ------------------------------------------------------------------
+        # 3) Advantage classification A ∈ {+1, 0, −1}.
+        # ------------------------------------------------------------------
+        # in_student[b, t] = True iff v_next[b, t] appears anywhere in the
+        # student's top-k at context position t.
+        in_student = (
+            student_topk_at_ctx == v_next.unsqueeze(-1)
+        ).any(dim=-1)  # [B, S-1] bool
+        in_teacher = (
+            teacher_topk_at_ctx == v_next.unsqueeze(-1)
+        ).any(dim=-1)  # [B, S-1] bool
+
+        pos_mask = in_student & in_teacher  # A = +1
+        neg_mask = ~in_student  # A = -1
+        # zero elsewhere (in_student & ~in_teacher)
+
+        advantage = torch.zeros_like(current_logp)
+        advantage = torch.where(
+            pos_mask,
+            torch.ones_like(advantage),
+            torch.where(neg_mask, -torch.ones_like(advantage), advantage),
+        )
+
+        # ------------------------------------------------------------------
+        # 4) IS ratio + PPO-style clip.
+        # ------------------------------------------------------------------
+        ref_logp = data["reference_policy_logprobs"].to(
+            device=current_logp.device, dtype=current_logp.dtype
+        )
+        # `reference_policy_logprobs` has shape [B, S]; position 0 is a
+        # convention-zero. Align to targets t+1 by slicing [:, 1:].
+        max_len = current_logp.shape[1]
+        ref_logp = ref_logp[:, 1 : 1 + max_len]
+
+        log_ratio = current_logp - ref_logp
+        ratio = log_ratio.exp()
+        ratio_clipped = ratio.clamp(self.ratio_clip_min, self.ratio_clip_max)
+
+        # PPO clipped surrogate: minimum over unclipped/clipped ratio times A.
+        surrogate_unclipped = ratio * advantage
+        surrogate_clipped = ratio_clipped * advantage
+        per_token_surrogate = torch.minimum(surrogate_unclipped, surrogate_clipped)
+        per_token_loss = -per_token_surrogate  # minimize -surrogate = maximize surrogate
+
+        # ------------------------------------------------------------------
+        # 5) Masking and reduction (matches DistillationLossFn conventions).
+        # ------------------------------------------------------------------
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        token_mask = token_mask[:, :max_len]
+        mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
+
+        if self.reduction == "sequence_mean":
+            loss = _sequence_balanced_mean(
+                per_token_loss,
+                mask,
+                sample_mask,
+                global_valid_seqs,
+            )
+        else:
+            loss = masked_mean(
+                per_token_loss,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
+
+        # ------------------------------------------------------------------
+        # 6) Diagnostics. Return raw sums + a token count so the outer
+        #    "pre-divide by num_global_batches → np.sum over microbatches"
+        #    pipeline reconstructs the correct ratios (mirrors OADLossFn).
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            valid = mask
+            n_valid = valid.sum().clamp_min(1.0)
+
+            pos_sum = (pos_mask.to(mask.dtype) * mask).sum()
+            zero_sum = (
+                (in_student & ~in_teacher).to(mask.dtype) * mask
+            ).sum()
+            neg_sum = (neg_mask.to(mask.dtype) * mask).sum()
+
+            # IS ratio statistics on valid tokens (unclipped).
+            ratio_valid = ratio * mask
+            ratio_sum = ratio_valid.sum()
+            ratio_sq_sum = (ratio * ratio * mask).sum()
+
+            clipped_hi = (ratio > self.ratio_clip_max).to(mask.dtype) * mask
+            clipped_lo = (ratio < self.ratio_clip_min).to(mask.dtype) * mask
+            clipped_hi_sum = clipped_hi.sum()
+            clipped_lo_sum = clipped_lo.sum()
+
+            # Per-class loss contributions.
+            loss_from_pos_sum = (per_token_loss * pos_mask.to(mask.dtype) * mask).sum()
+            loss_from_neg_sum = (per_token_loss * neg_mask.to(mask.dtype) * mask).sum()
+            # (A=0 contributes zero surrogate, so loss_from_zero_sum = 0.)
+
+            # Effective learning signal: PPO clipped surrogate zeros out gradient
+            # when the ratio saturates on the "wrong" side (see Schulman 2017 §6.1).
+            #   A = +1: gradient flows only when ratio ≤ clip_max
+            #           (above that, min() picks the constant clipped branch)
+            #   A = −1: gradient flows only when ratio ≥ clip_min
+            # As training proceeds and π_θ drifts from the frozen π_ref, these
+            # counts fall toward 0 → learning signal dies. Track them explicitly.
+            effective_pos = pos_mask & (ratio <= self.ratio_clip_max)
+            effective_neg = neg_mask & (ratio >= self.ratio_clip_min)
+            effective_pos_sum = (effective_pos.to(mask.dtype) * mask).sum()
+            effective_neg_sum = (effective_neg.to(mask.dtype) * mask).sum()
+
+        metrics = {
+            "loss": float(loss.item()) if loss.ndim == 0 else loss,
+            "num_valid_samples": int(batch_size),
+            "topk_pg_token_count": float(n_valid.item()),
+            "topk_pg_pos_sum": float(pos_sum.item()),
+            "topk_pg_zero_sum": float(zero_sum.item()),
+            "topk_pg_neg_sum": float(neg_sum.item()),
+            "topk_pg_is_ratio_sum": float(ratio_sum.item()),
+            "topk_pg_is_ratio_sq_sum": float(ratio_sq_sum.item()),
+            "topk_pg_is_clipped_hi_sum": float(clipped_hi_sum.item()),
+            "topk_pg_is_clipped_lo_sum": float(clipped_lo_sum.item()),
+            "topk_pg_effective_pos_sum": float(effective_pos_sum.item()),
+            "topk_pg_effective_neg_sum": float(effective_neg_sum.item()),
+            "topk_pg_loss_from_pos_sum": float(loss_from_pos_sum.item()),
+            "topk_pg_loss_from_neg_sum": float(loss_from_neg_sum.item()),
         }
 
         return loss, metrics

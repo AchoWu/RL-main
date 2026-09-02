@@ -23,6 +23,7 @@ distillation:
 
 loss_fn:
     type: "kl"  # "kl" (default) or "oad" (Overlap-Aligned Distillation, see BASIC_OAD_PROPOSAL.md)
+                # or "topk_agreement_pg" (teacher-guided PG sharpening, see below)
 
     # Fields used when type == "kl"
     kl_type: "mixed" # forward, reverse, mixed
@@ -32,6 +33,22 @@ loss_fn:
     # Fields used when type == "oad"
     oad:
         eps: 1.0e-8
+
+    # Fields used when type == "topk_agreement_pg"
+    # Per-token loss:
+    #   A_t = +1 if v_t ∈ S_top ∩ T_top   (student and teacher both rank it in top-k)
+    #   A_t =  0 if v_t ∈ S_top \ T_top   (student ranks it, teacher does not)
+    #   A_t = -1 if v_t ∉ S_top            (student does not rank it in its own top-k)
+    #   w_t = π_θ(v_t) / π_ref(v_t)        (π_ref = frozen initial student ckpt)
+    #   L_t = − min(w_t · A_t, clip(w_t, ratio_clip_min, ratio_clip_max) · A_t)
+    # NOTE: teacher_k reuses distillation.topk_logits_k. π_ref must stay frozen —
+    # loss_fn.ema_anchor.enabled and reference_policy_kl_penalty>0 are rejected
+    # at setup because they mutate the reference-model slot.
+    topk_agreement_pg:
+        student_k: 32
+        ratio_clip_min: 0.9
+        ratio_clip_max: 1.1
+        reduction: "token_mean"  # or "sequence_mean"
 
 checkpointing:
     enabled: true
