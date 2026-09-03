@@ -66,21 +66,6 @@ loss_fn:
         push_down_weight: 1.0
         reduction: "token_mean"  # or "sequence_mean"
 
-    # Fields used when type == "topk_agreement_ce"
-    # Vocabulary-level weighted CE — no sampling, no IS ratio, no PPO clip.
-    # Per context position t:
-    #   S_top = student top-k_S, T_top = teacher top-k_T
-    #   L_pos = − mean_{v ∈ S_top ∩ T_top} log π_θ(v | x_<t)          # push up
-    #   L_neg = + mean_{v ∈ S_top \ T_top} log π_θ(v | x_<t)          # push down
-    #   L_t   = L_pos + push_down_weight · L_neg
-    # NOTE: teacher_k reuses distillation.topk_logits_k. Compared to
-    # topk_agreement_pg, gradient signal is ~k_S× denser per position and
-    # there is no clip saturation. π_ref is NOT used here.
-    topk_agreement_ce:
-        student_k: 32
-        push_down_weight: 1.0
-        reduction: "token_mean"  # or "sequence_mean"
-
 checkpointing:
     enabled: true
     checkpoint_dir: "checkpoints/distillation-${policy.model_name}"
