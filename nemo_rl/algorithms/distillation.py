@@ -31,6 +31,7 @@ from nemo_rl.algorithms.loss_functions import (
     DistillationLossDataDict,
     DistillationLossFn,
     OADLossFn,
+    TopKAgreementCELossFn,
     TopKAgreementPGLossFn,
 )
 from nemo_rl.algorithms.utils import set_seed
@@ -250,7 +251,7 @@ def setup(
     Optional[GenerationInterface],  # teacher_generation
     StatefulDataLoader,
     Optional[StatefulDataLoader],
-    DistillationLossFn | OADLossFn | TopKAgreementPGLossFn,
+    DistillationLossFn | OADLossFn | TopKAgreementPGLossFn | TopKAgreementCELossFn,
     Logger,
     CheckpointManager,
     DistillationSaveState,
@@ -683,7 +684,8 @@ def setup(
 
     # Dispatch loss function: default "kl" (back-compat); "oad" enables
     # Overlap-Aligned Distillation (see BASIC_OAD_PROPOSAL.md); "topk_agreement_pg"
-    # is the teacher-guided policy-gradient sharpening variant (see loss_functions.py).
+    # is the teacher-guided policy-gradient sharpening variant (token-level, IS+clip);
+    # "topk_agreement_ce" is the vocabulary-level weighted-CE variant (no IS/clip).
     loss_type = loss_config.get("type", "kl")
     if loss_type == "kl":
         loss_fn = DistillationLossFn(loss_config)
@@ -691,10 +693,12 @@ def setup(
         loss_fn = OADLossFn(loss_config.get("oad", {}))
     elif loss_type == "topk_agreement_pg":
         loss_fn = TopKAgreementPGLossFn(loss_config["topk_agreement_pg"])
+    elif loss_type == "topk_agreement_ce":
+        loss_fn = TopKAgreementCELossFn(loss_config["topk_agreement_ce"])
     else:
         raise ValueError(
             f"Unknown loss_fn.type: {loss_type!r}. "
-            "Expected one of: 'kl', 'oad', 'topk_agreement_pg'."
+            "Expected one of: 'kl', 'oad', 'topk_agreement_pg', 'topk_agreement_ce'."
         )
 
     print("\n" + "=" * 60)

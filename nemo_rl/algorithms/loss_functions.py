@@ -2810,3 +2810,290 @@ class TopKAgreementPGLossFn(LossFunction):
         }
 
         return loss, metrics
+
+
+# ===============================================================================
+# Top-K Agreement Weighted-CE (vocabulary-level, no IS, no clip)
+# ===============================================================================
+class TopKAgreementCELossConfig(TypedDict):
+    """Configuration for the vocabulary-level top-k agreement CE loss.
+
+    Loss per context position t:
+        S_top = student top-k_S at t
+        T_top = teacher top-k_T at t (already provided by teacher worker)
+
+        L_pos_t = − mean_{v ∈ S_top ∩ T_top} log π_θ(v | x_<t)     # push up
+        L_neg_t = + mean_{v ∈ S_top \\ T_top} log π_θ(v | x_<t)     # push down
+        L_t     = L_pos_t + push_down_weight · L_neg_t
+
+    Both means are computed over the (possibly empty) subset of S_top;
+    empty subsets contribute zero. `log π_θ(v)` is the TRUE global log-prob
+    (student_logits[v] − student_full_logsumexp), NOT a top-k renormalization.
+
+    Unlike TopKAgreementPGLossFn, this loss sums over the top-k vocabulary at
+    every position — no per-position sampling → no IS ratio → no PPO clip.
+    """
+
+    student_k: int
+    push_down_weight: float
+    reduction: NotRequired[str]  # "token_mean" (default) | "sequence_mean"
+
+
+class TopKAgreementCELossDataDict(TypedDict):
+    """Required keys for the top-k agreement CE loss."""
+
+    input_ids: torch.Tensor
+    token_mask: torch.Tensor
+    sample_mask: torch.Tensor
+    teacher_topk_indices: torch.Tensor  # [B, S, k_T]
+    seq_index: NotRequired[torch.Tensor]
+
+
+class TopKAgreementCELossFn(LossFunction):
+    """Vocabulary-level weighted CE on the student's own top-k support.
+
+    Gradient flows through the logits at every v ∈ S_top(x_<t) — that is,
+    k_S positions per context — via `gather_logits_at_global_indices`.
+    Positions inside S ∩ T get pushed up (larger log_p); positions inside
+    S \\ T get pushed down (smaller log_p). Tokens outside S_top receive no
+    direct gradient (their logits still shift because of softmax normalization
+    via the global logsumexp path).
+
+    Semantics vs TopKAgreementPGLossFn:
+        - PG version: v_t drawn from π_θ_old; A(v_t) ∈ {+1, 0, −1};
+          single-token per-position gradient; needs IS ratio + PPO clip.
+        - CE version (this): closed-form sum over S_top at every position;
+          k_S-token per-position gradient; no sampling, no IS, no clip.
+
+    Both share the "teacher-guided sharpening" intuition (align student to
+    teacher's top ranks), but the CE version has ~k_S× denser gradient
+    signal per position and is not subject to clip-saturation.
+    """
+
+    def __init__(self, cfg: TopKAgreementCELossConfig):
+        self.student_k = int(cfg["student_k"])
+        self.push_down_weight = float(cfg["push_down_weight"])
+        self.reduction = str(cfg.get("reduction", "token_mean"))
+        self.loss_type = LossType.TOKEN_LEVEL
+
+        if self.student_k <= 0:
+            raise ValueError(
+                f"loss_fn.topk_agreement_ce.student_k must be positive, got {self.student_k}."
+            )
+        if self.push_down_weight < 0.0:
+            raise ValueError(
+                "loss_fn.topk_agreement_ce.push_down_weight must be non-negative."
+            )
+        if self.reduction not in ("token_mean", "sequence_mean"):
+            raise ValueError(
+                f"Unknown loss_fn.reduction={self.reduction!r}. "
+                "Expected one of: 'token_mean', 'sequence_mean'."
+            )
+
+    def __call__(
+        self,
+        next_token_logits: torch.Tensor,
+        data: TopKAgreementCELossDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        input_ids = data["input_ids"]
+        batch_size = input_ids.shape[0]
+        teacher_topk_indices = data["teacher_topk_indices"]  # [B, S, k_T]
+
+        cp_group = context_parallel_group
+        cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+        next_token_logits = next_token_logits.to(torch.float32)
+
+        # ------------------------------------------------------------------
+        # Resolve TP / CP layout (mirrors OADLossFn:2280-2320).
+        # ------------------------------------------------------------------
+        if vocab_parallel_group is not None:
+            assert vocab_parallel_rank is not None
+            V_local = int(next_token_logits.shape[-1])
+            vocab_start_index = vocab_parallel_rank * V_local
+            vocab_end_index = (vocab_parallel_rank + 1) * V_local
+            parallel_group = vocab_parallel_group
+            logits_local = next_token_logits
+            full_seq_len = teacher_topk_indices.shape[1]
+        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+            device_mesh = next_token_logits.device_mesh
+            tp_group = device_mesh.get_group("tp")
+            tp_rank = tp_group.rank()
+            local_logits = next_token_logits.to_local()
+            V_local = int(local_logits.shape[-1])
+            vocab_start_index = tp_rank * V_local
+            vocab_end_index = (tp_rank + 1) * V_local
+            parallel_group = tp_group
+            logits_local = local_logits
+            teacher_topk_indices = teacher_topk_indices.to(local_logits.device)
+            if (
+                device_mesh.mesh_dim_names is not None
+                and "cp" in device_mesh.mesh_dim_names
+            ):
+                cp_group = device_mesh.get_group("cp")
+                cp_size = cp_group.size()
+            else:
+                cp_group = None
+                cp_size = 1
+            full_seq_len = teacher_topk_indices.shape[1]
+        else:
+            parallel_group = None
+            logits_local = next_token_logits
+            vocab_start_index = 0
+            vocab_end_index = int(logits_local.shape[-1])
+            full_seq_len = teacher_topk_indices.shape[1]
+
+        # ------------------------------------------------------------------
+        # 1) Student global top-k indices (no_grad — indices are discrete).
+        #    student_topk_indices: [B, S_full, k_S] with S_full canonical.
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            if parallel_group is not None:
+                _, student_topk_idx_sharded = distributed_vocab_topk(
+                    logits_local,
+                    self.student_k,
+                    tp_group=parallel_group,
+                    vocab_start_index=vocab_start_index,
+                    vocab_end_index=vocab_end_index,
+                    chunk_size=max(1, min(int(logits_local.shape[1]), 1024)),
+                )  # [B, S_local, k_S]
+                if cp_size > 1:
+                    student_topk_indices = allgather_cp_sharded_tensor(
+                        student_topk_idx_sharded, cp_group, seq_dim=1
+                    )
+                    canonical_S = teacher_topk_indices.shape[1]
+                    assert student_topk_indices.shape[1] >= canonical_S, (
+                        f"CP-gathered student top-k has seq_len "
+                        f"{student_topk_indices.shape[1]} < canonical S "
+                        f"{canonical_S}; refusing to trim."
+                    )
+                    student_topk_indices = student_topk_indices[:, :canonical_S, :]
+                else:
+                    student_topk_indices = student_topk_idx_sharded
+            else:
+                _, student_topk_indices = torch.topk(
+                    logits_local, k=self.student_k, dim=-1
+                )
+
+        # ------------------------------------------------------------------
+        # 2) Gather student logits at S_top indices (WITH gradient) and
+        #    compute exact full-vocab logsumexp → true log-probabilities.
+        # ------------------------------------------------------------------
+        student_topk_logits = gather_logits_at_global_indices(
+            logits_local,
+            student_topk_indices,
+            tp_group=parallel_group,
+            cp_group=cp_group,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+        )  # [B, S, k_S]
+
+        student_lse = vocab_cp_logsumexp(
+            logits_local,
+            tp_group=parallel_group,
+            cp_group=cp_group,
+            full_seq_len=full_seq_len,
+        )  # [B, S]
+
+        student_topk_log_p = student_topk_logits - student_lse.unsqueeze(-1)  # [B, S, k_S]
+
+        # ------------------------------------------------------------------
+        # 3) Membership: for each v in student_topk, is it also in teacher_topk?
+        #    Broadcast [B, S, k_S, 1] == [B, S, 1, k_T] → [B, S, k_S, k_T]
+        # ------------------------------------------------------------------
+        in_intersection = (
+            student_topk_indices.unsqueeze(-1) == teacher_topk_indices.unsqueeze(-2)
+        ).any(dim=-1)  # [B, S, k_S] bool
+        in_student_only = ~in_intersection
+
+        # ------------------------------------------------------------------
+        # 4) Align to next-token prediction: position t predicts target t+1.
+        #    student_topk_log_p is context-indexed; slice [:, :-1] to drop the
+        #    final position that has no target.
+        # ------------------------------------------------------------------
+        student_topk_log_p = student_topk_log_p[:, :-1, :]           # [B, S-1, k_S]
+        in_intersection = in_intersection[:, :-1, :]                 # [B, S-1, k_S]
+        in_student_only = in_student_only[:, :-1, :]                 # [B, S-1, k_S]
+
+        # ------------------------------------------------------------------
+        # 5) Per-position push-up / push-down means over the two subsets.
+        # ------------------------------------------------------------------
+        pos_count = in_intersection.sum(dim=-1).to(student_topk_log_p.dtype)  # [B, S-1]
+        neg_count = in_student_only.sum(dim=-1).to(student_topk_log_p.dtype)  # [B, S-1]
+        pos_denom = pos_count.clamp_min(1.0)
+        neg_denom = neg_count.clamp_min(1.0)
+
+        pos_sum_log_p = (student_topk_log_p * in_intersection).sum(dim=-1)  # [B, S-1]
+        neg_sum_log_p = (student_topk_log_p * in_student_only).sum(dim=-1)  # [B, S-1]
+
+        # Guard: positions with empty subsets contribute exactly zero (avoid
+        # dividing zero-numerator by 1 to give 0 — but also make sure the
+        # ratio does not backprop through a fake denominator).
+        pos_has = (pos_count > 0).to(student_topk_log_p.dtype)
+        neg_has = (neg_count > 0).to(student_topk_log_p.dtype)
+
+        L_pos = -(pos_sum_log_p / pos_denom) * pos_has  # [B, S-1]
+        L_neg = +(neg_sum_log_p / neg_denom) * neg_has  # [B, S-1]
+
+        per_token_loss = L_pos + self.push_down_weight * L_neg  # [B, S-1]
+
+        # ------------------------------------------------------------------
+        # 6) Masking and reduction (matches DistillationLossFn conventions).
+        # ------------------------------------------------------------------
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        max_len = per_token_loss.shape[1]
+        token_mask = token_mask[:, :max_len].to(per_token_loss.device)
+        mask = token_mask * sample_mask.unsqueeze(-1).to(per_token_loss.device)  # [B, S-1]
+
+        if self.reduction == "sequence_mean":
+            loss = _sequence_balanced_mean(
+                per_token_loss,
+                mask,
+                sample_mask,
+                global_valid_seqs,
+            )
+        else:
+            loss = masked_mean(
+                per_token_loss,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
+
+        # ------------------------------------------------------------------
+        # 7) Diagnostics (raw sums + token count; downstream pre-divide +
+        #    np.sum recovers correct ratios — same convention as OADLossFn).
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            n_valid = mask.sum().clamp_min(1.0)
+
+            # Subset sizes (per-position averages recoverable via
+            # size_sum / token_count).
+            pos_size_sum = (pos_count * mask).sum()
+            neg_size_sum = (neg_count * mask).sum()
+
+            # Fraction of positions where each subset is non-empty.
+            pos_active_sum = (pos_has * mask).sum()
+            neg_active_sum = (neg_has * mask).sum()
+
+            # Per-class loss contributions (already carrying the sign).
+            loss_pos_sum = (L_pos * mask).sum()
+            loss_neg_sum = (L_neg * mask).sum()
+
+        metrics = {
+            "loss": float(loss.item()) if loss.ndim == 0 else loss,
+            "num_valid_samples": int(batch_size),
+            "topk_ce_token_count": float(n_valid.item()),
+            "topk_ce_pos_size_sum": float(pos_size_sum.item()),
+            "topk_ce_neg_size_sum": float(neg_size_sum.item()),
+            "topk_ce_pos_active_sum": float(pos_active_sum.item()),
+            "topk_ce_neg_active_sum": float(neg_active_sum.item()),
+            "topk_ce_loss_pos_sum": float(loss_pos_sum.item()),
+            "topk_ce_loss_neg_sum": float(loss_neg_sum.item()),
+        }
+
+        return loss, metrics
