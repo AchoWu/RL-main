@@ -83,6 +83,26 @@ for f in "$TRAIN_JSONL" "$VAL_JSONL"; do
 done
 echo "▶ Using train=$TRAIN_JSONL  val=$VAL_JSONL"
 
+# ====== 生成终止符修正 ======
+# 这组模型的 tokenizer_config.json 把 eos 声明成 '</s>'(id=1)，但 chat template
+# 的 assistant turn 实际以 '<|im_end|>'(id=130073) 结束 —— 模型永远不会吐 id=1。
+# configure_generation_config 会默认 stop_token_ids=[eos_token_id]，于是 vLLM
+# 在等一个不会出现的 token，每条 rollout 都跑满 max_new_tokens。显式覆盖。
+# 用 tools/check_chat_template.py 可以复查这个 id。
+IM_END_ID=130073
+python - "$POLICY_MODEL" "$IM_END_ID" <<'PY' || exit 1
+import sys
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained(sys.argv[1], trust_remote_code=True)
+expected = int(sys.argv[2])
+actual = tok.convert_tokens_to_ids("<|im_end|>")
+if actual != expected:
+    print(f"X IM_END_ID={expected} 与 tokenizer 实际的 <|im_end|>={actual} 不符，"
+          f"请更新脚本里的 IM_END_ID（换模型后需要重新确认）")
+    sys.exit(1)
+print(f"> stop token verified: <|im_end|>={actual} (declared eos={tok.eos_token_id})")
+PY
+
 # 实验名
 RUN_NAME="opd-justrl2step100-to-justrl2base-ultradata-261009"
 
@@ -110,6 +130,7 @@ python examples/run_distillation_math.py \
       +data.input_key=prompt \
       +data.output_key=ground_truth \
       data.prompt_file=null \
+      policy.generation.stop_token_ids="[$IM_END_ID]" \
       distillation.num_generations_per_prompt=1 \
       distillation.max_num_epochs=1 \
       distillation.max_num_steps=100 \
