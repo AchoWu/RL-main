@@ -54,3 +54,9 @@ aime_2024.jsonl
 # Runtime env
 *runtime_env.yaml
 !default_runtime_env.yaml
+
+# UltraData math corpus + its generated train/val split (~26MB, regenerate
+# with tools/split_ultradata_math.py)
+UltraData-RL-Math-2609.jsonl
+ultradata_math_train.jsonl
+ultradata_math_val.jsonl
