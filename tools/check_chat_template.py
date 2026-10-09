@@ -233,12 +233,42 @@ def main() -> int:
         if tok.eos_token and tok.eos_token in turn_end:
             print("[ok] template's assistant turn ends in EOS -> rollouts can stop")
         else:
-            print(
-                "[WARN] EOS does not appear at the end of the assistant turn. "
-                "Confirm the model emits a stop token, or rollouts will run to "
-                "max_new_tokens."
+            # The template's turn terminator is what the model actually emits;
+            # tokenizer.eos_token is only what the config happens to declare.
+            # When they disagree, stop_token_ids is wired to the wrong token and
+            # nothing stops a rollout. Resolve the real terminator so the fix is
+            # a concrete id rather than an exercise for the reader.
+            turn_end_ids = tok(turn_end, add_special_tokens=False)["input_ids"]
+            special = tok.all_special_tokens
+            terminator = next(
+                (
+                    t
+                    for t in tok.convert_ids_to_tokens(turn_end_ids)
+                    if t in special or t.startswith("<|")
+                ),
+                None,
             )
-            problems.append("eos not in assistant turn end")
+            print(
+                "[FAIL] EOS does not terminate the assistant turn: "
+                f"eos is {tok.eos_token!r} (id={tok.eos_token_id}) but the turn "
+                f"ends with {turn_end!r}."
+            )
+            print(
+                "       configure_generation_config sets "
+                "stop_token_ids=[eos_token_id], so vLLM would wait for a token "
+                "the model never emits: every rollout runs to max_new_tokens "
+                "(truncated, and slow), and eos_termination_rate logs ~0."
+            )
+            if terminator is not None:
+                term_id = tok.convert_tokens_to_ids(terminator)
+                print(
+                    f"       Real terminator is {terminator!r} (id={term_id}). Fix with:\n"
+                    f"         policy.generation.stop_token_ids=[{term_id}]\n"
+                    f"       (stop_token_ids already exists in the yaml as null, so\n"
+                    f"       no '+' prefix; add teacher.generation too if it generates.)"
+                )
+            problems.append("eos does not terminate the assistant turn")
+            hard_fail = True
 
     # --- 5. double BOS -------------------------------------------------------
     section("5. Double BOS (asserted at runtime)")
