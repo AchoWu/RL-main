@@ -91,6 +91,14 @@ def setup_data(
         defaultdict(lambda: (math_task_spec, math_hf_data_processor))
     )
     task_data_processors[task_name] = (math_task_spec, math_hf_data_processor)
+    # Validation sets may carry their own task names (JustRL2Math tags each AIME year), and
+    # both AllTaskProcessedDataset and calculate_rewards check membership with `in`, which a
+    # defaultdict does not satisfy -- register every name explicitly.
+    val_task_names: set[str] = set()
+    if data.formatted_ds["validation"]:
+        val_task_names = set(data.formatted_ds["validation"]["task_name"])
+    for name in val_task_names:
+        task_data_processors[name] = (math_task_spec, math_hf_data_processor)
 
     # setup math environment
     math_env = MathEnvironment.options(  # type: ignore # it's wrapped with ray.remote
@@ -124,6 +132,8 @@ def setup_data(
 
     task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: math_env)
     task_to_env[task_name] = math_env
+    for name in val_task_names:
+        task_to_env[name] = math_env
     return dataset, val_dataset, task_to_env, task_to_env
 
 
