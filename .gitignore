@@ -46,3 +46,12 @@ code_snapshots*/
 # Runtime env
 *runtime_env.yaml
 !default_runtime_env.yaml
+
+# Local training data: downloaded or regenerated, never versioned.
+# oad_v1/ is excepted because its fixtures are tracked on purpose.
+*.jsonl
+!oad_v1/*.jsonl
+
+# Scratch dumps from one-off generation/eval runs
+_g.txt
+_t.txt
