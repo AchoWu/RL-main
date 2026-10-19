@@ -36,6 +36,8 @@ class DataConfig(TypedDict):
     download_dir: NotRequired[str]
     train_data_path: NotRequired[str]
     val_data_paths: NotRequired[dict[str, str]]
+    # Copies of each validation problem (JustRL2Math; verl's val_kwargs.n).
+    val_repeat: NotRequired[int]
     # Number of data loader workers.
     # Set to 8 or 10 for large batches to improve loading speed.
     # This saturates CPU threads without consuming too much memory

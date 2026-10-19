@@ -1117,6 +1117,7 @@ def validate(
 
         total_rewards = []  # Can be any metric. Setted to 'accuracy' by default.
         total_lengths = []
+        rewards_by_task: dict[str, list[float]] = {}
         all_message_logs = []  # Collect all message logs
 
         max_batches = (
@@ -1157,6 +1158,8 @@ def validate(
 
             total_rewards.extend(rewards.tolist())
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+            for task_name, reward in zip(val_batch["task_name"], rewards.tolist()):
+                rewards_by_task.setdefault(task_name, []).append(reward)
 
             # Collect message logs for later display
             to_env = [
@@ -1180,6 +1183,12 @@ def validate(
             "accuracy": accuracy,
             "avg_length": avg_length,
         }
+        # One accuracy per validation set, e.g. JustRL-II's three AIME years.
+        if len(rewards_by_task) > 1:
+            for task_name, task_rewards in rewards_by_task.items():
+                val_metrics[f"accuracy/{task_name}"] = sum(task_rewards) / len(
+                    task_rewards
+                )
 
         # Print sample conversations only once at the end of validation
         try:
@@ -1203,6 +1212,12 @@ def validate(
     # Print summary of validation results
     print("\n📊 Validation Results:")
     print(f"    • Accuracy: {accuracy:.4f}")
+    if len(rewards_by_task) > 1:
+        for task_name, task_rewards in rewards_by_task.items():
+            print(
+                f"      - {task_name}: {sum(task_rewards) / len(task_rewards):.4f}"
+                f" ({len(task_rewards)} samples)"
+            )
     print(f"    • Average response length: {avg_length:.1f} tokens")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
 

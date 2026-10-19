@@ -18,6 +18,7 @@ from nemo_rl.data.datasets.response_datasets.dapo_math import DAPOMath17KDataset
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
+from nemo_rl.data.datasets.response_datasets.justrl2_math import JustRL2MathDataset
 from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
     OpenAIFormatDataset,
 )
@@ -82,6 +83,16 @@ def load_response_dataset(data_config, seed: int = 42):
             "Loading BytedTsinghua-SIA/DAPO-Math-17k for training and AIME 2024 for validation"
         )
         base_dataset: Any = DAPOMath17KDataset(seed=seed)
+    elif dataset_name == "JustRL2Math":
+        print(
+            "Loading JustRL-II's UltraData-RL-Math for training and its AIME sets for validation"
+        )
+        base_dataset: Any = JustRL2MathDataset(
+            train_data_path=data_config["train_data_path"],
+            val_data_paths=data_config["val_data_paths"],
+            val_repeat=data_config["val_repeat"],
+            seed=seed,
+        )
     # for vlm rl training
     elif dataset_name == "clevr-cogent":
         base_dataset: Any = CLEVRCoGenTDataset(
@@ -161,4 +172,5 @@ __all__ = [
     "SquadDataset",
     "Tulu3SftMixtureDataset",
     "HelpSteer3Dataset",
+    "JustRL2MathDataset",
 ]

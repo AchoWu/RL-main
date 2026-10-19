@@ -1,0 +1,31 @@
+# OPD on JustRL-II's data: UltraData-RL-2609 (Math) for training, AIME 2024/25/26 for validation,
+# read from the verl parquets that verl06/recipe/justrl2/prepare_data.sh writes and
+# run_justrl2_16k.sh trains on. Prompt and grader match that run as well:
+#
+#   - prompt: the parquet's user turn as-is (it already ends with "Please reason step by step,
+#     and put your final answer within \boxed{}."), no prompt template, no system prompt.
+#   - grader: JustRL-II's --rm-type math (last \boxed{}, mathd + sympy, math-verify fallback).
+#   - validation: every AIME problem 8 times (verl's val_kwargs.n=8), accuracy per year.
+defaults: distillation_math.yaml
+
+distillation:
+    # 3 years x 30 problems x 8 copies = 720; max_val_samples // val_batch_size batches are run,
+    # so keep the two dividing evenly or the tail of aime-2026 is dropped.
+    val_batch_size: 240
+    max_val_samples: 720
+
+data:
+    dataset_name: "JustRL2Math"
+    prompt_file: null
+    system_prompt_file: null
+    train_data_path: "/group/40143/howu/verl/data/ultradata-rl-math.parquet"
+    val_data_paths:
+        aime-2024: "/group/40143/howu/verl/data/aime-2024.parquet"
+        aime-2025: "/group/40143/howu/verl/data/aime-2025.parquet"
+        aime-2026: "/group/40143/howu/verl/data/aime-2026.parquet"
+    val_repeat: 8
+
+env:
+    math:
+        num_workers: 8
+        math_verify_impl: "justrl2_math"

@@ -32,6 +32,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
+from nemo_rl.environments.justrl2_math import extract_answer, grade_answer_union
 from nemo_rl.environments.metrics import (
     calculate_pass_rate_per_prompt,
 )
@@ -102,6 +103,13 @@ class HFVerifyWorker:
                         reward_dict = dapo_math_verify(response, ground_truth)
                         ret_score = reward_dict["score"]
                         extracted_answer = reward_dict["pred"]
+                    elif math_verify_impl == "justrl2_math":
+                        # JustRL-II's --rm-type math: last \boxed{} only, 0/1.
+                        ret_score = float(grade_answer_union(response, ground_truth))
+                        results.append(ret_score)
+                        if return_extracted_answer:
+                            extracted_answers.append(extract_answer(response))
+                        continue
                     elif kwargs.get("math_verify_impl") == "hf_math_verify":
                         ground_truth_parsable = "\\boxed{" + ground_truth + "}"
                         ret_score, extracted_answer = self.verify_func(
@@ -109,7 +117,7 @@ class HFVerifyWorker:
                         )
                     else:
                         raise ValueError(
-                            f"Unknown math_verify_impl: {math_verify_impl}. Expected 'hf_math_verify' or 'dapo_math_verify'."
+                            f"Unknown math_verify_impl: {math_verify_impl}. Expected 'hf_math_verify', 'dapo_math_verify' or 'justrl2_math'."
                         )
 
                 results.append(float(ret_score))
