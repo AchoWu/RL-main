@@ -363,6 +363,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         # ------------------------------------------------
         # Build device mesh and parallelize
         # ------------------------------------------------
+        # torch==2.8's DeviceMesh calls set_device(LOCAL_RANK), but each Ray actor sees only
+        # its own GPU, so any LOCAL_RANK > 0 is an invalid ordinal. Same workaround as
+        # DTensorPolicyWorker: build the mesh with LOCAL_RANK=0, then restore it.
+        prev_local_rank = os.environ["LOCAL_RANK"]
+        os.environ["LOCAL_RANK"] = "0"
         manager = FSDP2Manager(
             dp_size=dp_size,
             dp_replicate_size=1,
@@ -391,6 +396,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         # Force setup distributed for world size 1 as FSDP2Manager skips it.
         if world_size == 1:
             manager._setup_distributed()
+        os.environ["LOCAL_RANK"] = prev_local_rank
 
         # Store mesh references for downstream usage
         self.device_mesh = manager.device_mesh

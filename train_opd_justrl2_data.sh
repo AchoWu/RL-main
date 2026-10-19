@@ -110,7 +110,7 @@ python examples/run_distillation_math.py \
     teacher.dtensor_cfg.tensor_parallel_size=2 \
     teacher.dtensor_cfg.context_parallel_size=2 \
     distillation.max_num_epochs=1 \
-    distillation.max_num_steps=50 \
+    distillation.max_num_steps=100 \
     distillation.val_period=5 \
     distillation.val_at_start=true \
     checkpointing.save_period=5 \
