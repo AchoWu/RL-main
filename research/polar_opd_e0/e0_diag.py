@@ -263,6 +263,7 @@ def cmd_score(args):
 
     torch.backends.cuda.matmul.allow_tf32 = False
     dev = torch.device(args.device)
+    os.makedirs(args.out_dir, exist_ok=True)
     gen_dir = args.gen_dir or args.out_dir
     meta_path = os.path.join(gen_dir, "gen_meta.json")
     if os.path.exists(meta_path):
@@ -283,7 +284,6 @@ def cmd_score(args):
     recs = [r for r in recs if len(r["response_ids"]) > 0][
         args.shard :: args.num_shards
     ]
-    print(f"[score shard {args.shard}] {len(recs)} responses", flush=True)
 
     tok = AutoTokenizer.from_pretrained(args.student)
     tok_t = AutoTokenizer.from_pretrained(args.teacher)
@@ -292,6 +292,16 @@ def cmd_score(args):
             "student and teacher tokenizers differ; E0 needs a shared vocab"
         )
     V = len(tok)
+    # vLLM samples over all embedding rows, including the padding rows past len(tok); a response
+    # that hit one has no defined teacher token there, so it is left out (and counted).
+    n_all = len(recs)
+    recs = [r for r in recs if max(r["response_ids"]) < V]
+    n_oov = n_all - len(recs)
+    print(
+        f"[score shard {args.shard}] {len(recs)} responses "
+        f"({n_oov} dropped: sampled an id >= len(tokenizer)={V})",
+        flush=True,
+    )
 
     def load(path):
         for attn in ("flash_attention_2", "sdpa"):
@@ -386,6 +396,7 @@ def cmd_score(args):
         seq_klTk=np.stack(seq_klTk),
         temps=TEMPS,
         topk=args.topk,
+        n_dropped_oov=n_oov,
     )
 
 
@@ -572,7 +583,11 @@ def cmd_report(args):
             "old score shards: no per-response temperature sums, reporting 'all' only"
         )
     seq_id = np.repeat(np.arange(len(trunc)), S["n"])
-    R = {}
+    R = {
+        "n_dropped_oov": int(
+            sum(int(z["n_dropped_oov"]) for z in zs if "n_dropped_oov" in z.files)
+        )
+    }
     for name, ms in subsets.items():
         if not ms.any():
             R[name] = None
