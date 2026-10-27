@@ -1949,3 +1949,153 @@ def test_distillation_loss_fn_call():
     expected_fields = ["loss"]
     for field in expected_fields:
         assert field in metrics
+
+
+def _cpu_distillation_data(batch_size=2, seq_len=5, vocab_size=16, topk=8, seed=0):
+    """CPU data whose teacher top-k is sorted with distinct indices, as torch.topk returns."""
+    g = torch.Generator().manual_seed(seed)
+    teacher_topk_logits = (
+        torch.randn((batch_size, seq_len, topk), generator=g)
+        .sort(dim=-1, descending=True)
+        .values
+    )
+    teacher_topk_indices = torch.stack(
+        [
+            torch.stack(
+                [torch.randperm(vocab_size, generator=g)[:topk] for _ in range(seq_len)]
+            )
+            for _ in range(batch_size)
+        ]
+    )
+    data = {
+        "input_ids": torch.randint(0, vocab_size, (batch_size, seq_len), generator=g),
+        "input_lengths": torch.tensor([seq_len] * batch_size),
+        "token_mask": torch.ones((batch_size, seq_len)),
+        "sample_mask": torch.ones(batch_size),
+        "teacher_topk_logits": teacher_topk_logits,
+        "teacher_topk_indices": teacher_topk_indices,
+    }
+    student_logits = torch.randn((batch_size, seq_len, vocab_size), generator=g)
+    return data, student_logits
+
+
+def _run_distillation(cfg, data, student_logits):
+    return DistillationLossFn(cfg)(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+
+_BASE_DISTILL_CFG = {
+    "kl_type": "reverse",
+    "mixed_kl_weight": 0.5,
+    "zero_outside_topk": False,
+}
+
+
+def test_distillation_polar_lambda_one_matches_reverse():
+    data, student_logits = _cpu_distillation_data()
+    reverse, _ = _run_distillation(_BASE_DISTILL_CFG, data, student_logits)
+    polar, _ = _run_distillation(
+        {**_BASE_DISTILL_CFG, "kl_type": "polar", "polar_lambda": 1.0},
+        data,
+        student_logits,
+    )
+    torch.testing.assert_close(polar, reverse)
+
+
+def test_distillation_polar_lambda_zero_vanishes_when_order_agrees():
+    """lambda=0 only matches order: a student that ranks the window like the teacher has zero loss."""
+    data, student_logits = _cpu_distillation_data()
+    idx = data["teacher_topk_indices"]
+    # Give the student strictly decreasing logits along the teacher's ranking, with a
+    # spectrum unrelated to the teacher's.
+    ordered = torch.linspace(3.0, -3.0, idx.shape[-1]) ** 3 / 9
+    student_logits = student_logits.scatter(-1, idx, ordered.expand_as(idx).clone())
+    loss, _ = _run_distillation(
+        {**_BASE_DISTILL_CFG, "kl_type": "polar", "polar_lambda": 0.0},
+        data,
+        student_logits,
+    )
+    assert abs(loss.item()) < 1e-5
+    reverse, _ = _run_distillation(_BASE_DISTILL_CFG, data, student_logits)
+    assert reverse.item() > 1e-2
+
+
+def test_distillation_polar_gradient_and_order_penalty():
+    data, student_logits = _cpu_distillation_data()
+    student_logits = student_logits.requires_grad_(True)
+    loss, _ = _run_distillation(
+        {**_BASE_DISTILL_CFG, "kl_type": "polar", "polar_lambda": 0.0},
+        data,
+        student_logits,
+    )
+    # Random student logits disagree with the teacher's ranking, so lambda=0 is still penalized.
+    assert loss.item() > 1e-3
+    loss.backward()
+    assert student_logits.grad is not None
+    assert torch.isfinite(student_logits.grad).all()
+    assert student_logits.grad.abs().sum() > 0
+
+
+def test_distillation_polar_invariant_to_teacher_slot_order():
+    data, student_logits = _cpu_distillation_data()
+    cfg = {**_BASE_DISTILL_CFG, "kl_type": "polar", "polar_lambda": 0.25}
+    sorted_loss, _ = _run_distillation(cfg, data, student_logits)
+    perm = torch.randperm(data["teacher_topk_logits"].shape[-1])
+    shuffled = {
+        **data,
+        "teacher_topk_logits": data["teacher_topk_logits"][..., perm],
+        "teacher_topk_indices": data["teacher_topk_indices"][..., perm],
+    }
+    shuffled_loss, _ = _run_distillation(cfg, shuffled, student_logits)
+    torch.testing.assert_close(shuffled_loss, sorted_loss)
+
+
+def test_distillation_teacher_temperature():
+    data, student_logits = _cpu_distillation_data()
+    base, _ = _run_distillation(_BASE_DISTILL_CFG, data, student_logits)
+    t_one, _ = _run_distillation(
+        {**_BASE_DISTILL_CFG, "teacher_temperature": 1.0}, data, student_logits
+    )
+    torch.testing.assert_close(t_one, base)
+
+    t_two, metrics = _run_distillation(
+        {**_BASE_DISTILL_CFG, "teacher_temperature": 2.0}, data, student_logits
+    )
+    scaled = {**data, "teacher_topk_logits": data["teacher_topk_logits"] / 2.0}
+    expected, _ = _run_distillation(_BASE_DISTILL_CFG, scaled, student_logits)
+    torch.testing.assert_close(t_two, expected)
+    # The logged comparison metric always refers to the raw (T=1) teacher.
+    assert metrics["teacher_reverse_kl"] == pytest.approx(base.item(), rel=1e-5)
+
+
+def test_distillation_teacher_reverse_kl_metric_matches_reverse_loss():
+    data, student_logits = _cpu_distillation_data()
+    data["token_mask"][0, 3:] = 0
+    loss, metrics = _run_distillation(_BASE_DISTILL_CFG, data, student_logits)
+    assert metrics["teacher_reverse_kl"] == pytest.approx(loss.item(), rel=1e-5)
+
+
+def test_distillation_polar_config_validation():
+    with pytest.raises(AssertionError):
+        DistillationLossFn({**_BASE_DISTILL_CFG, "kl_type": "polar"})
+    with pytest.raises(AssertionError):
+        DistillationLossFn(
+            {**_BASE_DISTILL_CFG, "kl_type": "polar", "polar_lambda": 1.5}
+        )
+    with pytest.raises(AssertionError):
+        DistillationLossFn(
+            {
+                **_BASE_DISTILL_CFG,
+                "kl_type": "polar",
+                "polar_lambda": 0.25,
+                "zero_outside_topk": True,
+            }
+        )
+    with pytest.raises(AssertionError):
+        DistillationLossFn({**_BASE_DISTILL_CFG, "teacher_temperature": 0.0})

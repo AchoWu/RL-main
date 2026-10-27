@@ -964,9 +964,17 @@ class SequencePackingLossWrapper:
 
 
 class DistillationLossConfig(TypedDict):
-    kl_type: str
+    kl_type: str  # forward, reverse, mixed, polar
     mixed_kl_weight: float
     zero_outside_topk: bool
+    # Divide the teacher top-k logits by this before normalizing (>1 softens the
+    # teacher). Absent = 1.0, i.e. the raw teacher.
+    teacher_temperature: NotRequired[float]
+    # Required when kl_type == "polar". PolarOPD: reverse KL to a target that keeps
+    # the teacher's ranking over the top-k window but takes its spectrum (the sorted
+    # probabilities) as the geometric mix sigma_student^(1-lambda) * sigma_teacher^lambda.
+    # lambda=1 is plain reverse KL; lambda=0 matches the teacher's order only.
+    polar_lambda: NotRequired[float]
 
 
 class DistillationLossDataDict(TypedDict):
@@ -991,13 +999,29 @@ class DistillationLossFn(LossFunction):
         self.kl_type = cfg["kl_type"]
         self.mixed_kl_weight = cfg["mixed_kl_weight"]
         self.zero_outside_topk = cfg["zero_outside_topk"]
+        self.teacher_temperature = (
+            cfg["teacher_temperature"] if "teacher_temperature" in cfg else 1.0
+        )
+        self.polar_lambda = None
         self.log_infinitesimal = -100
         self.loss_type = LossType.TOKEN_LEVEL
 
-        assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
+        assert self.kl_type in ["forward", "reverse", "mixed", "polar"], (
+            "Invalid KL type"
+        )
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
+        assert self.teacher_temperature > 0, "teacher_temperature must be positive"
+        if self.kl_type == "polar":
+            assert "polar_lambda" in cfg, 'kl_type "polar" requires polar_lambda'
+            self.polar_lambda = cfg["polar_lambda"]
+            assert 0 <= self.polar_lambda <= 1, "polar_lambda must be in [0, 1]"
+            # The polar target is defined on the renormalized top-k window, which
+            # carries no student mass outside the window to place in teacher order.
+            assert not self.zero_outside_topk, (
+                'kl_type "polar" requires zero_outside_topk=false'
+            )
 
     def __call__(
         self,
@@ -1155,6 +1179,15 @@ class DistillationLossFn(LossFunction):
         teacher_topk_logits = teacher_topk_logits.to(
             student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
         )
+        # Reverse KL to the raw (T=1) teacher over the window, logged so runs with a
+        # different kl_type / teacher_temperature can be compared on one quantity.
+        raw_teacher_topk_logprobs = None
+        if not self.zero_outside_topk:
+            raw_teacher_topk_logprobs = torch.nn.functional.log_softmax(
+                teacher_topk_logits.detach(), dim=-1
+            )[:, :-1, :]
+        if self.teacher_temperature != 1.0:
+            teacher_topk_logits = teacher_topk_logits / self.teacher_temperature
         # 在 k 维度上做 log_softmax [B, S, k]
         teacher_topk_logprobs = torch.nn.functional.log_softmax(
             teacher_topk_logits, dim=-1
@@ -1194,6 +1227,25 @@ class DistillationLossFn(LossFunction):
             per_token_kl = student_probs * (
                 student_topk_logprobs - teacher_topk_logprobs
             )
+        elif self.kl_type == "polar":
+            # Sorting the student's window logprobs gives its spectrum; the target puts
+            # the student's j-th largest logprob on the teacher's rank-j token, then
+            # mixes in the teacher's own logprob. The target is a fixed label (no
+            # gradient). Ranks are computed here rather than relying on the teacher
+            # top-k arriving sorted.
+            student_spectrum = (
+                student_topk_logprobs.detach().sort(dim=-1, descending=True).values
+            )
+            teacher_order = teacher_topk_logprobs.argsort(dim=-1, descending=True)
+            student_spectrum = torch.empty_like(student_spectrum).scatter_(
+                -1, teacher_order, student_spectrum
+            )
+            polar_target = torch.nn.functional.log_softmax(
+                (1.0 - self.polar_lambda) * student_spectrum
+                + self.polar_lambda * teacher_topk_logprobs,
+                dim=-1,
+            )
+            per_token_kl = student_probs * (student_topk_logprobs - polar_target)
         else:
             #  examples/configs/distillation_math.yaml mixed KL
             # [B, S-1, k] = [B, S-1, k] * [B, S-1, k]
@@ -1223,11 +1275,25 @@ class DistillationLossFn(LossFunction):
             )
         else:
             kl_loss = per_token_kl.mean()
+            mask = None
 
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
             "num_valid_samples": int(batch_size),
         }
+        if raw_teacher_topk_logprobs is not None:
+            with torch.no_grad():
+                raw_kl = (
+                    student_probs * (student_topk_logprobs - raw_teacher_topk_logprobs)
+                ).sum(-1)
+                raw_kl = (
+                    masked_mean(
+                        raw_kl, mask, global_normalization_factor=global_valid_toks
+                    )
+                    if mask is not None
+                    else raw_kl.mean()
+                )
+            metrics["teacher_reverse_kl"] = float(raw_kl.item())
 
         # Idea 3 diagnostic: compare KL on the kept prefix vs the dropped tail.
         # Emitted only when a pre-warmup mask was threaded through and it
@@ -1245,7 +1311,9 @@ class DistillationLossFn(LossFunction):
             pre_mask = pre_mask_full[:, :max_len].to(mask.dtype)
             sample_mask_b = sample_mask.unsqueeze(-1)
             # Tail = tokens that were valid before warmup but got zeroed by it.
-            tail_mask = (pre_mask * (1.0 - token_mask.to(pre_mask.dtype))) * sample_mask_b
+            tail_mask = (
+                pre_mask * (1.0 - token_mask.to(pre_mask.dtype))
+            ) * sample_mask_b
             per_token_kl_d = per_token_kl.detach()
             metrics["prefix_kl_sum"] = float((per_token_kl_d * mask).sum().item())
             metrics["prefix_valid_tokens"] = int(mask.sum().item())

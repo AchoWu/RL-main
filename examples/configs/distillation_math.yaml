@@ -16,6 +16,9 @@ loss_fn:
     kl_type: "mixed" # forward, reverse, mixed
     mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
     zero_outside_topk: false # zero out the teacher logits outside the top k when calculate forward KL loss
+    # Optional (add with `+loss_fn.<key>=...`):
+    # teacher_temperature: 1.0 # divide teacher top-k logits by T before normalizing; absent = 1.0
+    # polar_lambda: 0.25 # required when kl_type is "polar"; 1.0 = reverse KL, 0.0 = teacher order only
 
 checkpointing:
     enabled: true
