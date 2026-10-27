@@ -184,6 +184,31 @@ def _resolve_prefix_ratio(
     raise ValueError(f"Unknown prefix_length_warmup mode: {mode!r}")
 
 
+def _remap_teacher_topk_outside_student_vocab_(
+    train_data: BatchedDataDict, student_vocab_size: int
+) -> int:
+    """Point teacher top-k slots the student's logits lack at a student padding row.
+
+    Only padding ids can fall outside the student vocab (see check_vocab_equality).
+    Such slots get index student_vocab_size - 1 (also padding) and a teacher logit
+    20 below the row minimum, so they carry ~zero teacher mass and rank last.
+
+    Returns:
+        Number of remapped slots.
+    """
+    idx = train_data["teacher_topk_indices"]
+    oob = idx >= student_vocab_size
+    n = int(oob.sum())
+    if n:
+        logits = train_data["teacher_topk_logits"]
+        floor = logits.amin(dim=-1, keepdim=True) - 20.0
+        train_data["teacher_topk_logits"] = torch.where(oob, floor, logits)
+        train_data["teacher_topk_indices"] = idx.masked_fill(
+            oob, student_vocab_size - 1
+        )
+    return n
+
+
 def _apply_prefix_length_warmup_(
     token_mask: torch.Tensor,
     prefix_ratio: float,
@@ -260,9 +285,19 @@ def check_vocab_equality(
     # 3) Chech model.config.vocab_size to guarantee the last dimension of the logits is the same
     student_config = AutoConfig.from_pretrained(student_model_name)
     teacher_config = AutoConfig.from_pretrained(teacher_model_name)
-    assert student_config.vocab_size == teacher_config.vocab_size, (
-        f"Model config vocab sizes differ between student and teacher. {skip_hint}"
-    )
+    if student_config.vocab_size != teacher_config.vocab_size:
+        # Same tokenizer, different embedding padding (e.g. Qwen2.5 1.5B 151936
+        # vs 7B 152064). Rows >= len(tokenizer) are padding in both models;
+        # _remap_teacher_topk_outside_student_vocab_ keeps the teacher top-k
+        # inside the student's logits.
+        assert min(student_config.vocab_size, teacher_config.vocab_size) >= len(
+            tokenizer
+        ), f"Model config vocab size is smaller than the tokenizer. {skip_hint}"
+        warnings.warn(
+            f"Model config vocab sizes differ (student {student_config.vocab_size}, "
+            f"teacher {teacher_config.vocab_size}) but tokenizers match; only "
+            "padding rows differ."
+        )
 
 
 def setup(
@@ -659,6 +694,9 @@ def distillation_train(
     max_steps = master_config["distillation"][
         "max_num_steps"
     ]  # max number of steps to train for
+    student_vocab_size = AutoConfig.from_pretrained(
+        master_config["policy"]["model_name"]
+    ).vocab_size
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
@@ -842,6 +880,16 @@ def distillation_train(
                     )
                     train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                     train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                    n_oob = _remap_teacher_topk_outside_student_vocab_(
+                        train_data, student_vocab_size
+                    )
+                    if n_oob:
+                        print(
+                            f"  ⚠️ {n_oob} teacher top-k slots outside the student "
+                            "vocab, remapped",
+                            flush=True,
+                        )
+                prefix_warmup_metrics["teacher_topk_oob_slots"] = n_oob
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
