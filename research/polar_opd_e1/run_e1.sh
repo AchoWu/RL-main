@@ -31,10 +31,14 @@ conda activate opd
 echo "▶ Python: $(python -c 'import sys; print(sys.executable, sys.version.split()[0])')"
 
 # ====== 代理 / 缓存 ======
-: "${ENV_VENUS_PROXY:=http://star-proxy.oa.com:3128}"
 export NO_PROXY=localhost,127.0.0.1,.woa.com,.oa.com,.tencent.com,tencentcos.cn,myqcloud.com
-export HTTP_PROXY=$ENV_VENUS_PROXY HTTPS_PROXY=$ENV_VENUS_PROXY
-export no_proxy=$NO_PROXY http_proxy=$ENV_VENUS_PROXY https_proxy=$ENV_VENUS_PROXY
+export HTTP_PROXY=http://star-proxy.oa.com:3128
+export HTTPS_PROXY=http://star-proxy.oa.com:3128
+export http_proxy="$HTTP_PROXY"
+export https_proxy="$HTTPS_PROXY"
+echo "HTTPS_PROXY=$HTTPS_PROXY"
+echo "HTTP_PROXY=$HTTP_PROXY"
+
 export HF_HOME=/root/.cache/huggingface
 export HF_DATASETS_CACHE=/root/.cache/huggingface/datasets
 
