@@ -22,6 +22,7 @@ import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
     _apply_prefix_length_warmup_,
     _default_distillation_save_state,
+    _remap_teacher_topk_outside_student_vocab_,
     _resolve_prefix_ratio,
     check_vocab_equality,
     distillation_train,
@@ -33,7 +34,14 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 @pytest.fixture
-def mock_components():
+def mock_components(monkeypatch):
+    # distillation_train reads the student vocab size from the HF config.
+    monkeypatch.setattr(
+        distil_mod.AutoConfig,
+        "from_pretrained",
+        lambda name: MagicMock(vocab_size=8),
+    )
+
     # Create mock components
     student_policy = MagicMock()
     student_policy.train.return_value = {
@@ -138,6 +146,7 @@ def mock_components():
             "seed": 42,
         },
         "policy": {
+            "model_name": "test-policy",
             "train_global_batch_size": 1,
             "make_sequence_length_divisible_by": 8,
             "max_total_sequence_length": 2048,
@@ -381,7 +390,7 @@ def test_check_vocab_equality_length_mismatch_raises(monkeypatch):
         check_vocab_equality(student_tokenizer, "student-model", "teacher-model")
 
 
-def test_check_vocab_equality_config_vocab_size_mismatch_raises(monkeypatch):
+def _patch_vocab_check(monkeypatch, student_vocab_size, teacher_vocab_size):
     vocab = {"a": 0, "b": 1}
     student_tokenizer = MagicMock()
     student_tokenizer.get_vocab.return_value = vocab
@@ -392,9 +401,9 @@ def test_check_vocab_equality_config_vocab_size_mismatch_raises(monkeypatch):
     teacher_tokenizer.__len__.return_value = 2
 
     student_config = MagicMock()
-    student_config.vocab_size = 2
+    student_config.vocab_size = student_vocab_size
     teacher_config = MagicMock()
-    teacher_config.vocab_size = 3
+    teacher_config.vocab_size = teacher_vocab_size
 
     monkeypatch.setattr(
         distil_mod.AutoTokenizer,
@@ -406,9 +415,35 @@ def test_check_vocab_equality_config_vocab_size_mismatch_raises(monkeypatch):
         "from_pretrained",
         lambda name: student_config if name == "student-model" else teacher_config,
     )
+    return student_tokenizer
 
+
+def test_check_vocab_equality_config_vocab_size_padding_mismatch_warns(monkeypatch):
+    # Same tokenizer, embeddings padded to different sizes (Qwen2.5 1.5B vs 7B).
+    student_tokenizer = _patch_vocab_check(monkeypatch, 3, 4)
+    with pytest.warns(UserWarning, match="only padding rows differ"):
+        check_vocab_equality(student_tokenizer, "student-model", "teacher-model")
+
+
+def test_check_vocab_equality_config_vocab_size_below_tokenizer_raises(monkeypatch):
+    student_tokenizer = _patch_vocab_check(monkeypatch, 1, 3)
     with pytest.raises(AssertionError):
         check_vocab_equality(student_tokenizer, "student-model", "teacher-model")
+
+
+def test_remap_teacher_topk_outside_student_vocab():
+    data = BatchedDataDict(
+        {
+            "teacher_topk_indices": torch.tensor([[[5, 9, 1], [2, 3, 4]]]),
+            "teacher_topk_logits": torch.tensor([[[3.0, 2.0, 1.0], [3.0, 2.0, 1.0]]]),
+        }
+    )
+    n = _remap_teacher_topk_outside_student_vocab_(data, student_vocab_size=8)
+    assert n == 1
+    assert data["teacher_topk_indices"].tolist() == [[[5, 7, 1], [2, 3, 4]]]
+    assert data["teacher_topk_logits"][0, 0].tolist() == [3.0, -19.0, 1.0]
+    assert data["teacher_topk_logits"][0, 1].tolist() == [3.0, 2.0, 1.0]
+    assert _remap_teacher_topk_outside_student_vocab_(data, 8) == 0
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
