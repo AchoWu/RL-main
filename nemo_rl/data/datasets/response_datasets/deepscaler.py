@@ -50,6 +50,7 @@ def prepare_deepscaler_dataset(
     seed: int = 42,
     task_name: str = "DeepScaler",
     val_aime_years: list[int] | None = None,
+    val_repeat: int = 16,
 ) -> dict[str, Dataset | None]:
     """Load and split the DeepScaler dataset into train and test sets.
 
@@ -59,6 +60,7 @@ def prepare_deepscaler_dataset(
         val_aime_years: AIME years to validate on, each tagged with its own task
             name ``aime<year>`` so validation reports one accuracy per year. None
             keeps the original single AIME 2024 set under ``task_name``.
+        val_repeat: Samples per validation problem (16 = the DeepScaleR setting).
     """
     # Load the original dataset for training
     train_ds = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train")
@@ -94,9 +96,9 @@ def prepare_deepscaler_dataset(
         )
     val_formatted = concatenate_datasets(val_parts)
 
-    # Compute accuracy 16 times per sample (matching the DeepScaleR evaluation setting)
+    # Compute accuracy val_repeat times per sample (16 matches the DeepScaleR evaluation setting)
     val_repeated = []
-    for _ in range(16):
+    for _ in range(val_repeat):
         val_repeated.extend(val_formatted)
     val_formatted = val_formatted.from_list(val_repeated)
 
@@ -107,14 +109,23 @@ def prepare_deepscaler_dataset(
 
 
 class DeepScalerDataset(RawDataset):
-    def __init__(self, seed: int = 42, val_aime_years: list[int] | None = None) -> None:
+    def __init__(
+        self,
+        seed: int = 42,
+        val_aime_years: list[int] | None = None,
+        val_repeat: int = 16,
+    ) -> None:
         """Initialize the DeepScaler dataset with train/test split.
 
         Args:
             seed: Random seed for reproducible splitting
             val_aime_years: AIME years to validate on; None = AIME 2024 only.
+            val_repeat: Samples per validation problem.
         """
         self.task_name = "DeepScaler"
         self.formatted_ds = prepare_deepscaler_dataset(
-            seed=seed, task_name=self.task_name, val_aime_years=val_aime_years
+            seed=seed,
+            task_name=self.task_name,
+            val_aime_years=val_aime_years,
+            val_repeat=val_repeat,
         )

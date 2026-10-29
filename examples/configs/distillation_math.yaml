@@ -214,8 +214,9 @@ data:
     dataset_name: "DeepScaler"
     # Optional, DeepScaler only (add with `+data.val_aime_years=[2024,2025,2026]`): AIME years to
     # validate on, each reported as validation/accuracy/aime<year>. Absent = AIME 2024 only.
-    # Each year is 30 problems x 16 samples; raise distillation.max_val_samples to cover them.
+    # Each year is 30 problems x val_repeat samples; raise distillation.max_val_samples to cover them.
     # val_aime_years: [2024, 2025, 2026]
+    # val_repeat: 16 # optional, DeepScaler only: samples per validation problem; absent = 16
     shuffle: true
 
 env:
