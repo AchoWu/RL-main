@@ -7,8 +7,10 @@
 #   opdT     reverse KL + teacher 温度 TEACHER_T（E0 的 best_global_T，top-64）
 #   polar25  PolarOPD λ=0.25
 #   polar50  PolarOPD λ=0.5（剂量对照）
+#   polar0   PolarOPD λ=0（只学 teacher 的序；默认不跑，ARMS="polar0" 单独跑）
 # 跨组可比的量：
-#   validation/accuracy          主指标
+#   validation/accuracy          主指标（VAL_YEARS 各年合并）
+#   validation/accuracy/aime<年> 分年准确率（VAL_YEARS 多于一年时才有）
 #   train/teacher_reverse_kl     对原始（T=1）teacher 的 reverse KL；各组 train/loss 的含义不同，不可直接比
 #
 # 用法：
@@ -67,7 +69,11 @@ STUDENT="${STUDENT:-/dev/shm/llms/DeepSeek-R1-Distill-Qwen-1.5B/}"
 ARMS="${ARMS:-opd opdT polar25 polar50}"
 TEACHER_T="${TEACHER_T:-1.41}"
 MAX_STEPS="${MAX_STEPS:-200}"
-VAL_PERIOD="${VAL_PERIOD:-5}"
+VAL_PERIOD="${VAL_PERIOD:-10}"  # 三年 AIME 一次测评约是只测 AIME24 的 3 倍时间
+VAL_YEARS="${VAL_YEARS:-2024,2025,2026}"
+# 每年 30 题 × 16 次采样；需覆盖到最后一个（可能不满的）val batch，val_batch_size=64
+N_YEARS=$(( $(tr -cd ',' <<< "$VAL_YEARS" | wc -c) + 1 ))
+VAL_SAMPLES="${VAL_SAMPLES:-$(( (N_YEARS * 480 + 63) / 64 * 64 ))}"
 SEQ_LEN="${SEQ_LEN:-16384}"
 SEED="${SEED:-42}"
 PREFIX="${PREFIX:-e1-skywork7b-to-r1qwen15b}"
@@ -82,6 +88,7 @@ arm_overrides() {
     opdT)    echo "loss_fn.kl_type=reverse +loss_fn.teacher_temperature=${TEACHER_T}" ;;
     polar25) echo "loss_fn.kl_type=polar +loss_fn.polar_lambda=0.25" ;;
     polar50) echo "loss_fn.kl_type=polar +loss_fn.polar_lambda=0.5" ;;
+    polar0)  echo "loss_fn.kl_type=polar +loss_fn.polar_lambda=0.0" ;;
     *) echo "❌ 未知组别: $1" >&2; return 1 ;;
   esac
 }
@@ -115,7 +122,8 @@ for arm in $ARMS; do
       distillation.max_num_steps="$MAX_STEPS" \
       distillation.val_period="$VAL_PERIOD" \
       distillation.val_at_start=true \
-      distillation.max_val_samples=1000 \
+      distillation.max_val_samples="$VAL_SAMPLES" \
+      +data.val_aime_years="[$VAL_YEARS]" \
       checkpointing.save_period="$VAL_PERIOD" \
       checkpointing.keep_top_k=3 \
       checkpointing.save_consolidated=false \
