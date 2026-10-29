@@ -83,6 +83,11 @@ def load_response_dataset(data_config, seed: int = 42):
                 if "val_aime_years" in data_config
                 else None
             ),
+            **(
+                {"val_repeat": data_config["val_repeat"]}
+                if "val_repeat" in data_config
+                else {}
+            ),
         )
     elif dataset_name == "DAPOMath17K":
         print(

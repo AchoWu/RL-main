@@ -39,6 +39,8 @@ class DataConfig(TypedDict):
     # DeepScaler only: AIME years to validate on, reported per year as
     # validation/accuracy/aime<year>. Absent = AIME 2024 only.
     val_aime_years: NotRequired[list[int]]
+    # DeepScaler only: samples per validation problem. Absent = 16 (DeepScaleR setting).
+    val_repeat: NotRequired[int]
     # Number of data loader workers.
     # Set to 8 or 10 for large batches to improve loading speed.
     # This saturates CPU threads without consuming too much memory
