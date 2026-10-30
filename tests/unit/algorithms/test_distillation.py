@@ -224,6 +224,71 @@ def test_distillation_train_max_steps(mock_components):
     assert mock_components["student_policy"].train.call_count == 5
 
 
+def test_distillation_train_transplant_queries_reference_at_teacher_topk(
+    mock_components,
+):
+    """kl_type "transplant" adds the reference logits at the teacher top-k to the train data."""
+    mock_components["master_config"]["distillation"]["max_num_steps"] = 2
+    loss_cfg = {
+        "kl_type": "transplant",
+        "mixed_kl_weight": 0.5,
+        "zero_outside_topk": False,
+        "transplant_beta": 1.0,
+    }
+    mock_components["master_config"]["loss_fn"] = loss_cfg
+    reference_logits = torch.randn(2, 10, 64)
+    student_policy = mock_components["student_policy"]
+    student_policy.get_reference_logits_at_indices.return_value = {
+        "topk_logits": reference_logits
+    }
+
+    distillation_train(
+        student_policy,
+        mock_components["teacher_policy"],
+        mock_components["student_generation"],
+        mock_components["train_dataloader"],
+        mock_components["val_dataloader"],
+        mock_components["tokenizer"],
+        DistillationLossFn(loss_cfg),
+        mock_components["task_to_env"],
+        mock_components["val_task_to_env"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        _default_distillation_save_state(),
+        mock_components["master_config"],
+    )
+
+    assert student_policy.get_reference_logits_at_indices.call_count == 2
+    _, indices = student_policy.get_reference_logits_at_indices.call_args.args
+    teacher_indices = mock_components["teacher_policy"].get_topk_logits.return_value[
+        "topk_indices"
+    ]
+    assert torch.equal(indices, teacher_indices)
+    train_data = student_policy.train.call_args.args[0]
+    assert train_data["reference_topk_logits"] is reference_logits
+
+
+def test_distillation_train_reverse_skips_reference(mock_components):
+    mock_components["master_config"]["distillation"]["max_num_steps"] = 1
+    student_policy = mock_components["student_policy"]
+    distillation_train(
+        student_policy,
+        mock_components["teacher_policy"],
+        mock_components["student_generation"],
+        mock_components["train_dataloader"],
+        mock_components["val_dataloader"],
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["task_to_env"],
+        mock_components["val_task_to_env"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        _default_distillation_save_state(),
+        mock_components["master_config"],
+    )
+    student_policy.get_reference_logits_at_indices.assert_not_called()
+
+
 def test_exit_on_timeout(mock_components, capsys):
     """Test that training loop exits when timeout is reached"""
     # Set max steps to large number

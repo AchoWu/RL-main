@@ -595,7 +595,10 @@ def setup(
         weights_path=weights_path,
         optimizer_path=optimizer_path,
         init_optimizer=True,
-        init_reference_model=False,
+        # kl_type "transplant" takes its target spectrum from the initial student.
+        # The worker snapshots the reference before loading weights_path, so it
+        # stays the initial model when resuming from a checkpoint.
+        init_reference_model=loss_config["kl_type"] == "transplant",
     )
 
     if student_generation is not None:
@@ -891,6 +894,20 @@ def distillation_train(
                         )
                 prefix_warmup_metrics["teacher_topk_oob_slots"] = n_oob
 
+                if loss_fn.kl_type == "transplant":
+                    print(
+                        "▶ Computing reference logits at the teacher top-k...",
+                        flush=True,
+                    )
+                    with timer.time("reference_logits_inference"):
+                        teacher_policy.offload_after_refit()
+                        student_policy.prepare_for_lp_inference()
+                        train_data["reference_topk_logits"] = (
+                            student_policy.get_reference_logits_at_indices(
+                                train_data, train_data["teacher_topk_indices"]
+                            )["topk_logits"]
+                        )
+
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
                     teacher_policy.offload_after_refit()
@@ -1067,6 +1084,15 @@ def distillation_train(
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
+            # Window diagnostics from DistillationLossFn, comparable across kl_types.
+            for key, label in (
+                ("teacher_reverse_kl", "Reverse KL to raw teacher"),
+                ("window_entropy", "Student window entropy"),
+                ("argmax_agree", "Argmax agreement with teacher"),
+                ("barrier_frac", "Barrier positions (s(argmax t) < e^-5)"),
+            ):
+                if key in metrics:
+                    print(f"  • {label}: {metrics[key]:.4f}")
             print(
                 f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}"
             )
@@ -1166,6 +1192,7 @@ def validate(
         total_rewards = []  # Can be any metric. Setted to 'accuracy' by default.
         total_lengths = []
         rewards_by_task: dict[str, list[float]] = {}
+        total_truncated: list[bool] = []
         all_message_logs = []  # Collect all message logs
 
         max_batches = (
@@ -1208,6 +1235,8 @@ def validate(
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
             for task_name, reward in zip(val_batch["task_name"], rewards.tolist()):
                 rewards_by_task.setdefault(task_name, []).append(reward)
+            if "truncated" in val_batch:
+                total_truncated.extend(val_batch["truncated"].tolist())
 
             # Collect message logs for later display
             to_env = [
@@ -1231,6 +1260,9 @@ def validate(
             "accuracy": accuracy,
             "avg_length": avg_length,
         }
+        if total_truncated:
+            # Responses cut at max_total_sequence_length; they always score 0.
+            val_metrics["truncation_rate"] = sum(total_truncated) / len(total_truncated)
         # One accuracy per validation set, e.g. one per AIME year.
         if len(rewards_by_task) > 1:
             for task_name, task_rewards in rewards_by_task.items():
@@ -1267,6 +1299,8 @@ def validate(
                 f" ({len(task_rewards)} samples)"
             )
     print(f"    • Average response length: {avg_length:.1f} tokens")
+    if total_truncated:
+        print(f"    • Truncation rate: {val_metrics['truncation_rate']:.4f}")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
 
     # Print timing information

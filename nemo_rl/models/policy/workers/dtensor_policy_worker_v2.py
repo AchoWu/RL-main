@@ -68,6 +68,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
+    gather_logits_at_global_indices,
     get_logprobs_from_vocab_parallel_logits,
 )
 from nemo_rl.models.huggingface.common import (
@@ -1387,8 +1388,12 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         data: BatchedDataDict[Any],
         k: int,
         micro_batch_size: Optional[int] = None,
+        at_indices: bool = False,
     ) -> BatchedDataDict[Any]:
         """Return per-position top-k logits and corresponding global indices.
+
+        With at_indices=True, return the logits at data["gather_indices"] ([B, S, k])
+        instead of the model's own top-k; "topk_indices" is then those indices.
 
         Notes:
         - Return shapes are [B, S, k].
@@ -1403,6 +1408,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             if micro_batch_size is not None
             else self.cfg["logprob_batch_size"]
         )
+        if at_indices and self.enable_seq_packing:
+            raise NotImplementedError(
+                "get_topk_logits(at_indices=True) does not support sequence packing"
+            )
 
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
@@ -1444,6 +1453,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             ):
                 input_ids = lp_batch.get("input_ids").cuda()
                 input_lengths = lp_batch.get("input_lengths")
+                gather_indices = (
+                    lp_batch.get("gather_indices").cuda() if at_indices else None
+                )
 
                 batch_size, seq_len = input_ids.shape
                 # Store original shapes for unpacking later
@@ -1548,23 +1560,35 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         vocab_start_index = tp_rank * V_local
                         vocab_end_index = (tp_rank + 1) * V_local
 
-                        vals, idx = distributed_vocab_topk(
-                            local_logits,
-                            k=k,
-                            tp_group=tp_group,
-                            vocab_start_index=vocab_start_index,
-                            vocab_end_index=vocab_end_index,
-                        )
-                        # [B, S_cp, k]
-
                         cp_group = self.cp_mesh.get_group()
+                        if at_indices:
+                            # Indices are replicated across CP ranks; the helper
+                            # shards them like the logits and all-gathers the result.
+                            vals = gather_logits_at_global_indices(
+                                local_logits,
+                                gather_indices,
+                                tp_group=tp_group,
+                                cp_group=cp_group,
+                                vocab_start_index=vocab_start_index,
+                                vocab_end_index=vocab_end_index,
+                            )
+                            idx = gather_indices
+                        else:
+                            vals, idx = distributed_vocab_topk(
+                                local_logits,
+                                k=k,
+                                tp_group=tp_group,
+                                vocab_start_index=vocab_start_index,
+                                vocab_end_index=vocab_end_index,
+                            )
+                            # [B, S_cp, k]
 
-                        vals = allgather_cp_sharded_tensor(
-                            vals, cp_group, seq_dim=sequence_dim
-                        )
-                        idx = allgather_cp_sharded_tensor(
-                            idx, cp_group, seq_dim=sequence_dim
-                        )
+                            vals = allgather_cp_sharded_tensor(
+                                vals, cp_group, seq_dim=sequence_dim
+                            )
+                            idx = allgather_cp_sharded_tensor(
+                                idx, cp_group, seq_dim=sequence_dim
+                            )
                         # [B, S, k]
                     else:
                         # Compute top-k over full sequence length (do not drop last position)
@@ -1576,16 +1600,30 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                             vocab_start_index = tp_rank * V_local
                             vocab_end_index = (tp_rank + 1) * V_local
 
-                            vals, idx = distributed_vocab_topk(
-                                local_logits,
-                                k=k,
-                                tp_group=tp_group,
-                                vocab_start_index=vocab_start_index,
-                                vocab_end_index=vocab_end_index,
-                            )
+                            if at_indices:
+                                vals = gather_logits_at_global_indices(
+                                    local_logits,
+                                    gather_indices,
+                                    tp_group=tp_group,
+                                    vocab_start_index=vocab_start_index,
+                                    vocab_end_index=vocab_end_index,
+                                )
+                                idx = gather_indices
+                            else:
+                                vals, idx = distributed_vocab_topk(
+                                    local_logits,
+                                    k=k,
+                                    tp_group=tp_group,
+                                    vocab_start_index=vocab_start_index,
+                                    vocab_end_index=vocab_end_index,
+                                )
                         else:
                             full_logits = logits.to(torch.float32)
-                            vals, idx = torch.topk(full_logits, k=k, dim=-1)
+                            if at_indices:
+                                vals = full_logits.gather(-1, gather_indices)
+                                idx = gather_indices
+                            else:
+                                vals, idx = torch.topk(full_logits, k=k, dim=-1)
 
                 # Handle sequence packing unpacking
                 if self.enable_seq_packing:
@@ -1660,6 +1698,21 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             else all_topk_idx_padded[0]
         ).cpu()
         return ret
+
+    def get_reference_logits_at_indices(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[Any]:
+        """Reference-model logits at data["gather_indices"]; see get_topk_logits(at_indices=True)."""
+        with self.use_reference_model():
+            return self.get_topk_logits(
+                data,
+                k=data["gather_indices"].shape[-1],
+                micro_batch_size=micro_batch_size,
+                at_indices=True,
+            )
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:

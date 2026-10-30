@@ -964,7 +964,7 @@ class SequencePackingLossWrapper:
 
 
 class DistillationLossConfig(TypedDict):
-    kl_type: str  # forward, reverse, mixed, polar
+    kl_type: str  # forward, reverse, mixed, polar, transplant
     mixed_kl_weight: float
     zero_outside_topk: bool
     # Divide the teacher top-k logits by this before normalizing (>1 softens the
@@ -975,6 +975,16 @@ class DistillationLossConfig(TypedDict):
     # probabilities) as the geometric mix sigma_student^(1-lambda) * sigma_teacher^lambda.
     # lambda=1 is plain reverse KL; lambda=0 matches the teacher's order only.
     polar_lambda: NotRequired[float]
+    # Required when kl_type == "transplant". Order-transplant forward KL: the target
+    # puts the frozen reference student's j-th largest window probability (raised to
+    # beta and renormalized) on the teacher's rank-j token, i.e. the teacher's order
+    # with the reference's spectrum. beta=1 keeps the reference entropy, beta>1 sharpens.
+    # Needs data["reference_topk_logits"] (reference logits at the teacher top-k ids).
+    transplant_beta: NotRequired[float]
+    # Optional, kl_type == "transplant": whose order the target uses. "teacher" (the
+    # method, used when absent) or "reference" (no-teacher control: forward KL to the
+    # sharpened reference itself over the teacher's window).
+    transplant_order: NotRequired[str]
 
 
 class DistillationLossDataDict(TypedDict):
@@ -984,6 +994,8 @@ class DistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     teacher_topk_logits: torch.Tensor
     teacher_topk_indices: torch.Tensor
+    # kl_type == "transplant": reference-model logits at teacher_topk_indices.
+    reference_topk_logits: NotRequired[torch.Tensor]
     # Idea 3 diagnostic: if the prefix-length warmup zeroed some response
     # tokens, this holds the pre-warmup mask so the loss can report
     # prefix_kl_mean vs tail_kl_mean (whether the tail signal is actually
@@ -1003,12 +1015,18 @@ class DistillationLossFn(LossFunction):
             cfg["teacher_temperature"] if "teacher_temperature" in cfg else 1.0
         )
         self.polar_lambda = None
+        self.transplant_beta = None
+        self.transplant_order = None
         self.log_infinitesimal = -100
         self.loss_type = LossType.TOKEN_LEVEL
 
-        assert self.kl_type in ["forward", "reverse", "mixed", "polar"], (
-            "Invalid KL type"
-        )
+        assert self.kl_type in [
+            "forward",
+            "reverse",
+            "mixed",
+            "polar",
+            "transplant",
+        ], "Invalid KL type"
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
@@ -1021,6 +1039,22 @@ class DistillationLossFn(LossFunction):
             # carries no student mass outside the window to place in teacher order.
             assert not self.zero_outside_topk, (
                 'kl_type "polar" requires zero_outside_topk=false'
+            )
+        if self.kl_type == "transplant":
+            assert "transplant_beta" in cfg, (
+                'kl_type "transplant" requires transplant_beta'
+            )
+            self.transplant_beta = cfg["transplant_beta"]
+            assert self.transplant_beta > 0, "transplant_beta must be positive"
+            self.transplant_order = (
+                cfg["transplant_order"] if "transplant_order" in cfg else "teacher"
+            )
+            assert self.transplant_order in ["teacher", "reference"], (
+                'transplant_order must be "teacher" or "reference"'
+            )
+            # Like polar, the target lives on the renormalized teacher top-k window.
+            assert not self.zero_outside_topk, (
+                'kl_type "transplant" requires zero_outside_topk=false'
             )
 
     def __call__(
@@ -1246,6 +1280,31 @@ class DistillationLossFn(LossFunction):
                 dim=-1,
             )
             per_token_kl = student_probs * (student_topk_logprobs - polar_target)
+        elif self.kl_type == "transplant":
+            # log softmax(beta * logits) over the window == log of the renormalized
+            # sigma_ref^beta, so beta can be applied to the raw reference logits.
+            reference_logprobs = torch.nn.functional.log_softmax(
+                self.transplant_beta
+                * data["reference_topk_logits"].to(
+                    student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
+                )[:, :-1, :],
+                dim=-1,
+            )
+            if self.transplant_order == "teacher":
+                # The reference's j-th largest logprob goes on the teacher's rank-j token.
+                reference_spectrum = reference_logprobs.sort(
+                    dim=-1, descending=True
+                ).values
+                teacher_order = teacher_topk_logprobs.argsort(dim=-1, descending=True)
+                transplant_target = torch.empty_like(reference_spectrum).scatter_(
+                    -1, teacher_order, reference_spectrum
+                )
+            else:
+                transplant_target = reference_logprobs
+            # Forward KL(target || student); the target carries no gradient.
+            per_token_kl = transplant_target.exp() * (
+                transplant_target - student_topk_logprobs
+            )
         else:
             #  examples/configs/distillation_math.yaml mixed KL
             # [B, S-1, k] = [B, S-1, k] * [B, S-1, k]
@@ -1294,6 +1353,33 @@ class DistillationLossFn(LossFunction):
                     else raw_kl.mean()
                 )
             metrics["teacher_reverse_kl"] = float(raw_kl.item())
+
+            # Window diagnostics, comparable across kl_types. All are restricted to
+            # the renormalized teacher top-k window, not the full vocab.
+            with torch.no_grad():
+                teacher_argmax = raw_teacher_topk_logprobs.argmax(dim=-1, keepdim=True)
+                diagnostics = {
+                    # Student entropy over the window.
+                    "window_entropy": -(student_probs * student_topk_logprobs).sum(-1),
+                    # Student and teacher agree on the window's top token.
+                    "argmax_agree": (
+                        student_topk_logprobs.argmax(dim=-1, keepdim=True)
+                        == teacher_argmax
+                    )[..., 0].float(),
+                    # Support barrier: the student gives the teacher's top token < e^-5.
+                    "barrier_frac": (
+                        student_topk_logprobs.gather(-1, teacher_argmax)[..., 0] < -5.0
+                    ).float(),
+                }
+                for name, value in diagnostics.items():
+                    value = (
+                        masked_mean(
+                            value, mask, global_normalization_factor=global_valid_toks
+                        )
+                        if mask is not None
+                        else value.mean()
+                    )
+                    metrics[name] = float(value.item())
 
         # Idea 3 diagnostic: compare KL on the kept prefix vs the dropped tail.
         # Emitted only when a pre-warmup mask was threaded through and it

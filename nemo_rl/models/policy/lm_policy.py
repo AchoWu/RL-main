@@ -405,6 +405,45 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
+        return self._dispatch_topk_logits(
+            "get_topk_logits",
+            data,
+            common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+        )
+
+    def get_reference_logits_at_indices(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        indices: torch.Tensor,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Reference-model logits at the given token indices.
+
+        Requires init_reference_model=True. indices is [B, S, k] (e.g. a teacher's
+        top-k ids); the result has the get_topk_logits layout, with "topk_logits"
+        the reference logits at those ids and "topk_indices" the ids themselves.
+        """
+        # Only what the worker and the batching need; the caller's dict may carry
+        # large [B, S, k] tensors that would otherwise be shipped to every worker.
+        query: BatchedDataDict[Any] = BatchedDataDict(
+            {
+                "input_ids": data["input_ids"],
+                "input_lengths": data["input_lengths"],
+                "gather_indices": indices,
+            }
+        )
+        return self._dispatch_topk_logits(
+            "get_reference_logits_at_indices",
+            query,
+            common_kwargs={"micro_batch_size": micro_batch_size},
+        )
+
+    def _dispatch_topk_logits(
+        self,
+        worker_method: str,
+        data: BatchedDataDict[Any],
+        common_kwargs: dict[str, Any],
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
@@ -434,7 +473,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
 
         futures = self.worker_group.run_all_workers_sharded_data(
-            "get_topk_logits",
+            worker_method,
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=[
@@ -447,7 +486,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
-            common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+            common_kwargs=common_kwargs,
         )
 
         # Avoid BatchedDataDict.from_batches here because it flattens rows for tensors with ndim>2 ([B,S,k] -> [B,S*k]).

@@ -1980,12 +1980,13 @@ def _cpu_distillation_data(batch_size=2, seq_len=5, vocab_size=16, topk=8, seed=
 
 
 def _run_distillation(cfg, data, student_logits):
+    # Normalize like the policy worker: over the next-token positions, token_mask[:, 1:].
     return DistillationLossFn(cfg)(
         student_logits,
         data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
         global_valid_toks=torch.sum(
-            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"][:, 1:]
         ),
     )
 
@@ -2099,3 +2100,135 @@ def test_distillation_polar_config_validation():
         )
     with pytest.raises(AssertionError):
         DistillationLossFn({**_BASE_DISTILL_CFG, "teacher_temperature": 0.0})
+
+
+_TRANSPLANT_CFG = {**_BASE_DISTILL_CFG, "kl_type": "transplant", "transplant_beta": 1.0}
+
+
+def _with_reference(data, reference_logits_full):
+    """Add reference logits at the teacher top-k ids, as distillation_train does."""
+    return {
+        **data,
+        "reference_topk_logits": reference_logits_full.gather(
+            -1, data["teacher_topk_indices"]
+        ),
+    }
+
+
+def test_distillation_transplant_zero_when_student_is_reordered_reference():
+    """The target is the reference spectrum in teacher order; a student equal to it has zero loss."""
+    data, student_logits = _cpu_distillation_data()
+    idx = data["teacher_topk_indices"]
+    # Student window logits strictly decreasing along the teacher ranking (slot order
+    # is the teacher order here), and the reference is the student itself.
+    ordered = torch.linspace(3.0, -3.0, idx.shape[-1]) ** 3 / 9
+    student_logits = student_logits.scatter(-1, idx, ordered.expand_as(idx).clone())
+    data = _with_reference(data, student_logits)
+    loss, _ = _run_distillation(_TRANSPLANT_CFG, data, student_logits)
+    assert abs(loss.item()) < 1e-6
+    # The same student is far from the teacher's own spectrum under plain forward KL.
+    forward, _ = _run_distillation(
+        {**_BASE_DISTILL_CFG, "kl_type": "forward"}, data, student_logits
+    )
+    assert forward.item() > 1e-2
+
+
+def test_distillation_transplant_invariant_to_teacher_spectrum():
+    """Only the teacher's ranking enters the target: any monotone teacher transform is a no-op."""
+    data, student_logits = _cpu_distillation_data()
+    reference_logits = torch.randn_like(student_logits)
+    data = _with_reference(data, reference_logits)
+    loss, _ = _run_distillation(_TRANSPLANT_CFG, data, student_logits)
+    warped = {
+        **data,
+        "teacher_topk_logits": torch.sinh(3 * data["teacher_topk_logits"]),
+    }
+    warped_loss, _ = _run_distillation(_TRANSPLANT_CFG, warped, student_logits)
+    torch.testing.assert_close(warped_loss, loss)
+    tempered, _ = _run_distillation(
+        {**_TRANSPLANT_CFG, "teacher_temperature": 2.0}, data, student_logits
+    )
+    torch.testing.assert_close(tempered, loss)
+
+
+def test_distillation_transplant_beta_scales_reference_logits():
+    data, student_logits = _cpu_distillation_data()
+    reference_logits = torch.randn_like(student_logits)
+    sharp, _ = _run_distillation(
+        {**_TRANSPLANT_CFG, "transplant_beta": 1.5},
+        _with_reference(data, reference_logits),
+        student_logits,
+    )
+    expected, _ = _run_distillation(
+        _TRANSPLANT_CFG, _with_reference(data, 1.5 * reference_logits), student_logits
+    )
+    torch.testing.assert_close(sharp, expected)
+
+
+def test_distillation_transplant_gradient_pushes_teacher_top_token():
+    """Forward-KL gradient on the window logits is s - p*: the teacher's top token is pulled up."""
+    data, student_logits = _cpu_distillation_data(batch_size=1, seq_len=2)
+    idx = data["teacher_topk_indices"]
+    # Student ranks the window in exactly the reverse of the teacher's order.
+    reversed_order = torch.linspace(-3.0, 3.0, idx.shape[-1])
+    student_logits = student_logits.scatter(
+        -1, idx, reversed_order.expand_as(idx).clone()
+    )
+    data = _with_reference(data, student_logits.clone())
+    student_logits = student_logits.requires_grad_(True)
+    loss, _ = _run_distillation(_TRANSPLANT_CFG, data, student_logits)
+    assert loss.item() > 1e-2
+    loss.backward()
+    top = idx[0, 0, 0]  # teacher's rank-0 token at the first (trained) position
+    assert student_logits.grad[0, 0, top] < 0
+    assert torch.isfinite(student_logits.grad).all()
+
+
+def test_distillation_transplant_reference_order_ignores_teacher():
+    data, student_logits = _cpu_distillation_data()
+    reference_logits = torch.randn_like(student_logits)
+    cfg = {**_TRANSPLANT_CFG, "transplant_order": "reference", "transplant_beta": 1.2}
+    data = _with_reference(data, reference_logits)
+    loss, _ = _run_distillation(cfg, data, student_logits)
+    perm = torch.randperm(data["teacher_topk_logits"].shape[-1])
+    reordered_teacher = {
+        **data,
+        "teacher_topk_logits": data["teacher_topk_logits"][..., perm],
+    }
+    other, _ = _run_distillation(cfg, reordered_teacher, student_logits)
+    torch.testing.assert_close(other, loss)
+    # It is plain forward KL to the sharpened reference over the window.
+    as_teacher = {**data, "teacher_topk_logits": 1.2 * data["reference_topk_logits"]}
+    forward, _ = _run_distillation(
+        {**_BASE_DISTILL_CFG, "kl_type": "forward"}, as_teacher, student_logits
+    )
+    torch.testing.assert_close(loss, forward)
+
+
+def test_distillation_window_diagnostics():
+    data, student_logits = _cpu_distillation_data()
+    idx = data["teacher_topk_indices"]
+    # Student agrees with the teacher's top token everywhere, so agreement is 1 and
+    # there is no barrier position.
+    ordered = torch.linspace(3.0, -3.0, idx.shape[-1])
+    student_logits = student_logits.scatter(-1, idx, ordered.expand_as(idx).clone())
+    _, metrics = _run_distillation(_BASE_DISTILL_CFG, data, student_logits)
+    assert metrics["argmax_agree"] == pytest.approx(1.0)
+    assert metrics["barrier_frac"] == pytest.approx(0.0)
+    assert 0 < metrics["window_entropy"] < torch.log(torch.tensor(8.0)).item()
+    # Reversed: the teacher's top token gets ~e^-6 window mass, a barrier everywhere.
+    student_logits = student_logits.scatter(-1, idx, (-ordered).expand_as(idx).clone())
+    _, metrics = _run_distillation(_BASE_DISTILL_CFG, data, student_logits)
+    assert metrics["argmax_agree"] == pytest.approx(0.0)
+    assert metrics["barrier_frac"] == pytest.approx(1.0)
+
+
+def test_distillation_transplant_config_validation():
+    with pytest.raises(AssertionError):
+        DistillationLossFn({**_BASE_DISTILL_CFG, "kl_type": "transplant"})
+    with pytest.raises(AssertionError):
+        DistillationLossFn({**_TRANSPLANT_CFG, "transplant_beta": 0.0})
+    with pytest.raises(AssertionError):
+        DistillationLossFn({**_TRANSPLANT_CFG, "transplant_order": "student"})
+    with pytest.raises(AssertionError):
+        DistillationLossFn({**_TRANSPLANT_CFG, "zero_outside_topk": True})

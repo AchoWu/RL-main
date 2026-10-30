@@ -13,12 +13,14 @@ distillation:
     seed: 42
 
 loss_fn:
-    kl_type: "mixed" # forward, reverse, mixed
+    kl_type: "mixed" # forward, reverse, mixed, polar, transplant
     mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
     zero_outside_topk: false # zero out the teacher logits outside the top k when calculate forward KL loss
     # Optional (add with `+loss_fn.<key>=...`):
     # teacher_temperature: 1.0 # divide teacher top-k logits by T before normalizing; absent = 1.0
     # polar_lambda: 0.25 # required when kl_type is "polar"; 1.0 = reverse KL, 0.0 = teacher order only
+    # transplant_beta: 1.0 # required when kl_type is "transplant": forward KL to the initial student's spectrum^beta in teacher order
+    # transplant_order: "teacher" # kl_type "transplant" only; "reference" = no-teacher control (initial student^beta itself); absent = "teacher"
 
 checkpointing:
     enabled: true

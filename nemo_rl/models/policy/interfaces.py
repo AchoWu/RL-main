@@ -96,6 +96,20 @@ class PolicyInterface(ABC):
         """
         pass
 
+    def get_reference_logits_at_indices(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        indices: torch.Tensor,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Get the reference model's logits at given token indices ([B, S, k]).
+
+        Same layout as get_topk_logits. Only implemented by the DTensor v2 backend.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support get_reference_logits_at_indices"
+        )
+
     @abstractmethod
     def train(
         self,
