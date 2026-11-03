@@ -5,6 +5,8 @@
 # 损失为平方全变差距离 STVD（loss_fn.kl_type=stvd），其余设置与 train_opd.sh 一致，
 # 用于和 train_opd.sh 的 reverse KL 基线对比。配置见 examples/configs/distillation_stvd.yaml。
 #   - 16k 序列长度、STVD = (0.5 * sum_i |p_S - p_T|)^2，每位置有界在 [0, 1]
+#   - 本脚本串行跑两组对照：loss_fn.zero_outside_topk = false 和 true，
+#     run/checkpoint/日志分别带 -ztkfalse / -ztktrue 后缀，其余超参与随机种子完全一致
 #   - 训练 distillation.max_num_steps 步；训练前及每 distillation.val_period 步测评、每 checkpointing.save_period 步保存权重
 #   - 验证集 AIME 2024/2025/2026，每题采样 8 次（3 × 30 × 8 = 720 条），分年份报 validation/accuracy/aime<年>
 #   - checkpoint 保存超时放宽到 30 分钟
@@ -83,8 +85,16 @@ for d in "$TEACHER_MODEL" "$POLICY_MODEL"; do
 done
 echo "▶ Using policy=$POLICY_MODEL  teacher=$TEACHER_MODEL"
 
-# 实验名
-RUN_NAME="opd-justrl2step900-to-r1qwen15b-stvd-16k-step50"
+# 实验名前缀（每组再追加 -ztk<false|true>）
+RUN_PREFIX="opd-justrl2step900-to-r1qwen15b-stvd-16k-step50"
+
+# ====== 两组对照实验：loss_fn.zero_outside_topk = false / true ======
+# 唯一变量是学生落在 teacher top-k 之外的概率质量是否计入 STVD：
+#   false（基线）：teacher/student 都截断到 top-k 并重新归一化，只在窗口内算距离
+#   true          ：student 用全词表 log_softmax（不重归一化），窗口外的质量通过
+#                   (1 - sum_i q_i) 计入，等于对"top-k 外为 0 的 teacher"算精确 TVD
+# 两组共用 distillation.seed=42，其余超参完全一致。8 卡独占，只能串行跑。
+ZTK_VARIANTS=(false true)
 
 mkdir -p /group/40092/howu/RL-main/logs
 
@@ -93,27 +103,68 @@ export HTTPS_PROXY=http://star-proxy.oa.com:3128
 export WANDB_INIT_TIMEOUT=300
 
 cd /group/40092/howu/RL-main
-python examples/run_distillation_math.py \
-    --config examples/configs/distillation_stvd.yaml \
-    policy.model_name="$POLICY_MODEL" \
-    teacher.model_name="$TEACHER_MODEL" \
-    cluster.gpus_per_node=8 \
-    policy.train_micro_batch_size=1 \
-    policy.train_global_batch_size=128 \
-    policy.optimizer.kwargs.lr=1.0e-6 \
-    policy.max_total_sequence_length=16384 \
-    teacher.max_total_sequence_length=16384 \
-    teacher.logprob_batch_size=1 \
-    teacher.dtensor_cfg.tensor_parallel_size=2 \
-    teacher.dtensor_cfg.context_parallel_size=2 \
-    distillation.max_num_epochs=1 \
-    distillation.max_num_steps=50 \
-    distillation.val_period=5 \
-    distillation.val_at_start=true \
-    checkpointing.save_period=5 \
-    checkpointing.keep_top_k=10 \
-    checkpointing.save_consolidated=false \
-    checkpointing.checkpoint_dir="checkpoints/distillation-${RUN_NAME}" \
-    logger.wandb_enabled=true \
-    logger.wandb.name="${RUN_NAME}" || true
+
+SUMMARY=()
+for ZTK in "${ZTK_VARIANTS[@]}"; do
+    RUN_NAME="${RUN_PREFIX}-ztk${ZTK}"
+    LOG_FILE="logs/${RUN_NAME}.log"
+
+    echo ""
+    echo "============================================================"
+    echo "[$(date '+%F %T')] START  zero_outside_topk=${ZTK}"
+    echo "  run      : ${RUN_NAME}"
+    echo "  log      : ${LOG_FILE}"
+    echo "  ckpt     : checkpoints/distillation-${RUN_NAME}"
+    echo "============================================================"
+
+    # 上一组可能留下残余 Ray 集群，先清掉再起新的
+    ray stop --force 2>/dev/null || true
+
+    # 不用 `|| true`：那样会把退出码洗成 0，崩溃和跑完 50 步看起来一模一样。
+    # 这里显式收集退出码，既保证前一组失败时后一组照常继续，又能在末尾看清结果。
+    set +e
+    python examples/run_distillation_math.py \
+        --config examples/configs/distillation_stvd.yaml \
+        policy.model_name="$POLICY_MODEL" \
+        teacher.model_name="$TEACHER_MODEL" \
+        cluster.gpus_per_node=8 \
+        policy.train_micro_batch_size=1 \
+        policy.train_global_batch_size=128 \
+        policy.optimizer.kwargs.lr=1.0e-6 \
+        policy.max_total_sequence_length=16384 \
+        teacher.max_total_sequence_length=16384 \
+        teacher.logprob_batch_size=1 \
+        teacher.dtensor_cfg.tensor_parallel_size=2 \
+        teacher.dtensor_cfg.context_parallel_size=2 \
+        distillation.max_num_epochs=1 \
+        distillation.max_num_steps=50 \
+        distillation.val_period=5 \
+        distillation.val_at_start=true \
+        distillation.max_val_samples=768 \
+        data.val_aime_years="[2024,2025,2026]" \
+        data.val_repeat=8 \
+        checkpointing.save_period=5 \
+        checkpointing.keep_top_k=10 \
+        checkpointing.save_consolidated=false \
+        checkpointing.checkpoint_dir="checkpoints/distillation-${RUN_NAME}" \
+        logger.wandb_enabled=true \
+        loss_fn.kl_type=stvd \
+        loss_fn.zero_outside_topk="${ZTK}" \
+        logger.wandb.name="${RUN_NAME}" 2>&1 | tee "${LOG_FILE}"
+    RC=${PIPESTATUS[0]}
+    set -e
+
+    if [[ $RC -eq 0 ]]; then
+        echo "[$(date '+%F %T')] DONE   zero_outside_topk=${ZTK} (exit 0)"
+    else
+        echo "[$(date '+%F %T')] FAILED zero_outside_topk=${ZTK} (exit ${RC}) — 详见 ${LOG_FILE}"
+    fi
+    SUMMARY+=("zero_outside_topk=${ZTK}  exit=${RC}  run=${RUN_NAME}")
+done
+
+echo ""
+echo "============================================================"
+echo "两组实验汇总"
+echo "============================================================"
+printf '  %s\n' "${SUMMARY[@]}"
 
