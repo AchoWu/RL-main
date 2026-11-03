@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# OPD 蒸馏：JustRL2 step-900 (teacher) → DeepSeek-R1-Distill-Qwen-1.5B (student)
-# 教师是 verl06/recipe/justrl2/run_justrl2_16k.sh 训练 DeepSeek-R1-Distill-Qwen-1.5B
-# RL 模型（global_step_900，已转 HF 格式到 /dev/shm/llms/justrl2_step_900/）。
+# OPD 蒸馏：Skywork-OR1-Math-7B (teacher) → DeepSeek-R1-Distill-Qwen-1.5B (student)
+# 教师 /dev/shm/llms/Skywork-OR1-Math-7B/（Qwen2.5-7B 系，与 E1/E2 同一个 teacher）。
+# 师生 tokenizer 相同但 config vocab_size 不同（152064 vs 151936），差异只在 padding 行，
+# 由 check_vocab_equality + _remap_teacher_topk_outside_student_vocab_ 处理。
 # 损失为平方全变差距离 STVD（loss_fn.kl_type=stvd），其余设置与 train_opd.sh 一致，
 # 用于和 train_opd.sh 的 reverse KL 基线对比。配置见 examples/configs/distillation_stvd.yaml。
 #   - 16k 序列长度、STVD = (0.5 * sum_i |p_S - p_T|)^2，每位置有界在 [0, 1]
@@ -76,7 +77,7 @@ sed -i 's/PY_EXECUTABLES.AUTOMODEL/PY_EXECUTABLES.SYSTEM/; s/PY_EXECUTABLES.FSDP
 export PYTHONPATH=/group/40092/howu/RL-main:${PYTHONPATH:-}
 
 # ====== 模型路径（内存盘） ======
-TEACHER_MODEL="/dev/shm/llms/justrl2_step_900/"
+TEACHER_MODEL="/dev/shm/llms/Skywork-OR1-Math-7B/"
 POLICY_MODEL="/dev/shm/llms/DeepSeek-R1-Distill-Qwen-1.5B/"
 for d in "$TEACHER_MODEL" "$POLICY_MODEL"; do
   if [[ ! -f "${d}config.json" ]]; then
@@ -86,7 +87,7 @@ done
 echo "▶ Using policy=$POLICY_MODEL  teacher=$TEACHER_MODEL"
 
 # 实验名前缀（每组再追加 -ztk<false|true>）
-RUN_PREFIX="opd-justrl2step900-to-r1qwen15b-stvd-16k-step50"
+RUN_PREFIX="opd-skywork7b-to-r1qwen15b-stvd-16k-step50"
 
 # ====== 两组对照实验：loss_fn.zero_outside_topk = false / true ======
 # 唯一变量是学生落在 teacher top-k 之外的概率质量是否计入 STVD：

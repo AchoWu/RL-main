@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# OPD 蒸馏：JustRL2 step-900 (teacher) → DeepSeek-R1-Distill-Qwen-1.5B (student)
-# 教师是 verl06/recipe/justrl2/run_justrl2_16k.sh 训练 DeepSeek-R1-Distill-Qwen-1.5B
-# RL 模型（global_step_900，已转 HF 格式到 /dev/shm/llms/justrl2_step_900/）。
+# OPD 蒸馏：Skywork-OR1-Math-7B (teacher) → DeepSeek-R1-Distill-Qwen-1.5B (student)
+# 教师 /dev/shm/llms/Skywork-OR1-Math-7B/（Qwen2.5-7B 系，与 E1/E2 同一个 teacher）。
+# 师生 tokenizer 相同但 config vocab_size 不同（152064 vs 151936），差异只在 padding 行，
+# 由 check_vocab_equality + _remap_teacher_topk_outside_student_vocab_ 处理。
 # 基于 main 的原始 OPD，无任何实验性改动：
 #   - 16k 序列长度、reverse KL
 #   - 训练 distillation.max_num_steps 步；训练前及每 distillation.val_period 步测评、每 checkpointing.save_period 步保存权重
@@ -73,7 +74,7 @@ sed -i 's/PY_EXECUTABLES.AUTOMODEL/PY_EXECUTABLES.SYSTEM/; s/PY_EXECUTABLES.FSDP
 export PYTHONPATH=/group/40092/howu/RL-main:${PYTHONPATH:-}
 
 # ====== 模型路径（内存盘） ======
-TEACHER_MODEL="/dev/shm/llms/justrl2_step_900/"
+TEACHER_MODEL="/dev/shm/llms/Skywork-OR1-Math-7B/"
 POLICY_MODEL="/dev/shm/llms/DeepSeek-R1-Distill-Qwen-1.5B/"
 for d in "$TEACHER_MODEL" "$POLICY_MODEL"; do
   if [[ ! -f "${d}config.json" ]]; then
@@ -83,7 +84,7 @@ done
 echo "▶ Using policy=$POLICY_MODEL  teacher=$TEACHER_MODEL"
 
 # 实验名
-RUN_NAME="opd-justrl2step900-to-r1qwen15b-reverse-16k-step50"
+RUN_NAME="opd-skywork7b-to-r1qwen15b-reverse-16k-step50"
 
 mkdir -p /group/40092/howu/RL-main/logs
 
