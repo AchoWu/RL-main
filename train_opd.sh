@@ -5,6 +5,7 @@
 # 基于 main 的原始 OPD，无任何实验性改动：
 #   - 16k 序列长度、reverse KL
 #   - 训练 distillation.max_num_steps 步；训练前及每 distillation.val_period 步测评、每 checkpointing.save_period 步保存权重
+#   - 验证集 AIME 2024/2025/2026，每题采样 8 次（3 × 30 × 8 = 720 条），分年份报 validation/accuracy/aime<年>
 #   - checkpoint 保存超时放宽到 30 分钟
 #   - save_consolidated=false（nemo_automodel consolidate 的 all_gather_object 会误算尺寸 OOM），
 #     训练结束后手工转 HF：
@@ -108,7 +109,9 @@ python examples/run_distillation_math.py \
     distillation.max_num_steps=50 \
     distillation.val_period=5 \
     distillation.val_at_start=true \
-    distillation.max_val_samples=1000 \
+    distillation.max_val_samples=768 \
+    +data.val_aime_years="[2024,2025,2026]" \
+    +data.val_repeat=8 \
     checkpointing.save_period=5 \
     checkpointing.keep_top_k=10 \
     checkpointing.save_consolidated=false \
