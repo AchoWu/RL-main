@@ -74,13 +74,18 @@ for batch in dataloader:
 
 ### 3.1 KL 蒸馏 (`type: "kl"`)
 
-`DistillationLossFn` (`loss_functions.py:982`) —— 三种 KL 模式：
+`DistillationLossFn` (`loss_functions.py:982`) —— 四种散度模式：
 
 - `kl_type: "forward"` — `KL(p_T || p_S)` = `p_T * log(p_T / p_S)`；教师驱动，覆盖
   教师概率高的位置。
 - `kl_type: "reverse"` — `KL(p_S || p_T)` = `p_S * log(p_S / p_T)`；学生驱动，
   mode-seeking。
 - `kl_type: "mixed"` — `w * forward + (1-w) * reverse`；`mixed_kl_weight` 控制权重。
+- `kl_type: "stvd"` — 平方全变差距离 `(TV(p_S, p_T))^2`，其中
+  `TV = 0.5 * sum_i |p_S(i) - p_T(i)|`。与 KL 不同，它有界（每个位置落在 `[0, 1]`），
+  对 `p_T(i) ≈ 0` 而 `p_S(i) > 0` 的位置不会给出无穷大的惩罚，因此对支撑不匹配更
+  稳健；代价是教师概率极小的位置梯度信号较弱。`zero_outside_topk: true` 时，top-k
+  以外教师概率为 0，学生在该区域的全部概率质量按 `1 - sum_topk p_S` 计入距离。
 
 **两种 top-k 处理策略：**
 
@@ -155,7 +160,7 @@ distillation:
 
 loss_fn:
     type: "kl"                           # 或 "oad"
-    kl_type: "mixed"                     # forward / reverse / mixed
+    kl_type: "mixed"                     # forward / reverse / mixed / stvd
     mixed_kl_weight: 0.5
     zero_outside_topk: false
     oad:

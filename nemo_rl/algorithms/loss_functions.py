@@ -964,6 +964,8 @@ class SequencePackingLossWrapper:
 
 
 class DistillationLossConfig(TypedDict):
+    # forward, reverse, mixed, or stvd (squared total variation distance,
+    # (0.5 * sum_i |q_i - p_i|)^2 per position)
     kl_type: str
     mixed_kl_weight: float
     zero_outside_topk: bool
@@ -994,7 +996,9 @@ class DistillationLossFn(LossFunction):
         self.log_infinitesimal = -100
         self.loss_type = LossType.TOKEN_LEVEL
 
-        assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
+        assert self.kl_type in ["forward", "reverse", "mixed", "stvd"], (
+            "Invalid KL type"
+        )
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
@@ -1021,6 +1025,9 @@ class DistillationLossFn(LossFunction):
         # Ensure float32 for stability (match other losses)
         next_token_logits = next_token_logits.to(torch.float32)
         per_token_kl = None
+        # Only the reverse-KL terms need the student's full-vocab entropy when
+        # zero_outside_topk is set (for the mass outside the teacher top-k).
+        needs_entropy = self.kl_type in ["reverse", "mixed"]
         # Preferred truncated-KL path: teacher provides top-k support per position
         teacher_topk_logits = data["teacher_topk_logits"]  # [B, S, k]
         teacher_topk_indices = data["teacher_topk_indices"]  # [B, S, k]
@@ -1094,7 +1101,7 @@ class DistillationLossFn(LossFunction):
                 False,
             )
 
-            if self.kl_type != "forward":
+            if needs_entropy:
                 H_all = ChunkedDistributedEntropy.apply(  # type: ignore
                     logits_tensor,
                     chunk_size,
@@ -1106,11 +1113,11 @@ class DistillationLossFn(LossFunction):
                 student_topk_logprobs = allgather_cp_sharded_tensor(
                     student_topk_logprobs, cp_group, seq_dim=1
                 )
-                if self.kl_type != "forward":
+                if needs_entropy:
                     H_all = allgather_cp_sharded_tensor(H_all, cp_group, seq_dim=1)
                 if pad_len > 0:
                     student_topk_logprobs = student_topk_logprobs[:, :-pad_len, :]
-                    if self.kl_type != "forward":
+                    if needs_entropy:
                         H_all = H_all[:, :-pad_len]
         elif self.zero_outside_topk:
             # Non-distributed processing
@@ -1118,7 +1125,7 @@ class DistillationLossFn(LossFunction):
             student_topk_logprobs = student_logprobs.gather(
                 dim=-1, index=teacher_topk_indices.to(student_logprobs.device)
             )
-            if self.kl_type != "forward":
+            if needs_entropy:
                 H_all = (student_logprobs.exp() * student_logprobs).sum(-1)
 
         else:
@@ -1163,7 +1170,7 @@ class DistillationLossFn(LossFunction):
         # Single point of next-token alignment after TP/CP processing
         teacher_topk_logprobs = teacher_topk_logprobs[:, :-1, :]
         student_topk_logprobs = student_topk_logprobs[:, :-1, :]
-        if self.zero_outside_topk and self.kl_type != "forward":
+        if self.zero_outside_topk and needs_entropy:
             # Align H_all with next-token prediction
             H_all = H_all[:, :-1]
 
@@ -1172,7 +1179,7 @@ class DistillationLossFn(LossFunction):
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
         loss_correction_term = torch.zeros_like(student_probs[..., 0])  # [B, S-1]
-        if self.zero_outside_topk and self.kl_type != "forward":
+        if self.zero_outside_topk and needs_entropy:
             H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
             P_rest = 1 - (student_probs.sum(-1))
             # The entropy and prob of the rest of the tokens [B, S-1]
@@ -1194,6 +1201,16 @@ class DistillationLossFn(LossFunction):
             per_token_kl = student_probs * (
                 student_topk_logprobs - teacher_topk_logprobs
             )
+        elif self.kl_type == "stvd":
+            # Squared TVD, (0.5 * sum_i |q_i - p_i|)^2, per position. It is a
+            # square of a sum over i, so reduce here and keep a trailing size-1
+            # dim for the shared sum below.
+            abs_diff = (student_probs - teacher_probs).abs().sum(-1)  # [B, S-1]
+            if self.zero_outside_topk:
+                # The renormalized teacher is 0 outside its top-k, so the student
+                # mass there counts in full toward the distance.
+                abs_diff = abs_diff + (1.0 - student_probs.sum(-1)).clamp_min(0.0)
+            per_token_kl = (0.5 * abs_diff).square().unsqueeze(-1)  # [B, S-1, 1]
         else:
             #  examples/configs/distillation_math.yaml mixed KL
             # [B, S-1, k] = [B, S-1, k] * [B, S-1, k]
@@ -1245,7 +1262,9 @@ class DistillationLossFn(LossFunction):
             pre_mask = pre_mask_full[:, :max_len].to(mask.dtype)
             sample_mask_b = sample_mask.unsqueeze(-1)
             # Tail = tokens that were valid before warmup but got zeroed by it.
-            tail_mask = (pre_mask * (1.0 - token_mask.to(pre_mask.dtype))) * sample_mask_b
+            tail_mask = (
+                pre_mask * (1.0 - token_mask.to(pre_mask.dtype))
+            ) * sample_mask_b
             per_token_kl_d = per_token_kl.detach()
             metrics["prefix_kl_sum"] = float((per_token_kl_d * mask).sum().item())
             metrics["prefix_valid_tokens"] = int(mask.sum().item())

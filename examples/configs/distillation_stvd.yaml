@@ -1,0 +1,18 @@
+# OPD 蒸馏，损失用平方全变差距离 STVD 替代 reverse KL。
+# 只覆盖与 distillation_math.yaml 不同的键，其余全部继承，便于与 reverse KL 基线对比。
+#
+# STVD = (0.5 * sum_i |p_S(i) - p_T(i)|)^2，在 teacher top-k 窗口上重新归一化后逐位置计算。
+# 与 KL 不同，它每个位置有界在 [0, 1]，teacher 概率 ~0 而学生概率 > 0 的位置不会被罚到无穷大。
+defaults: distillation_math.yaml
+
+loss_fn:
+    kl_type: "stvd"
+
+data:
+    # AIME 2024/2025/2026，每题采样 8 次，分年份报 validation/accuracy/aime<年>。
+    # 3 年 × 30 题 × 8 次 = 720 条，max_val_samples 需覆盖最后一个不满的 val batch。
+    val_aime_years: [2024, 2025, 2026]
+    val_repeat: 8
+
+distillation:
+    max_val_samples: 768

@@ -1892,6 +1892,130 @@ def test_distillation_loss_edge_cases():
     assert not torch.isinf(loss)
 
 
+def test_distillation_loss_stvd():
+    """Test squared total variation distance loss calculation."""
+    data, student_logits = setup_distillation_test_data()
+
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "stvd",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        }
+    )
+
+    loss, metrics = loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    assert loss.dim() == 0
+    assert not torch.isnan(loss)
+    assert not torch.isinf(loss)
+    # Squared TVD is in [0, 1] per position, so any masked mean of it is too.
+    assert 0.0 <= loss.item() <= 1.0
+    assert isinstance(metrics, dict)
+    assert "loss" in metrics
+
+
+def test_distillation_loss_stvd_matches_manual():
+    """stvd reproduces (0.5 * L1)^2 computed by hand on the renormalized top-k."""
+    data, student_logits = setup_distillation_test_data()
+
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "stvd",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        }
+    )
+    loss, _ = loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    # Reference: renormalize both distributions over the teacher top-k window,
+    # then take the squared TVD per position and average over valid tokens.
+    idx = data["teacher_topk_indices"]
+    student_p = torch.nn.functional.softmax(
+        student_logits.to(torch.float32).gather(-1, idx), dim=-1
+    )[:, :-1, :]
+    teacher_p = torch.nn.functional.softmax(
+        data["teacher_topk_logits"].to(torch.float32), dim=-1
+    )[:, :-1, :]
+    expected_per_token = (0.5 * (student_p - teacher_p).abs().sum(-1)).square()
+    mask = data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+    # masked_mean normalizes by the global_valid_toks passed in, not by mask.sum().
+    global_valid_toks = torch.sum(
+        data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+    )
+    expected = (expected_per_token * mask).sum() / (global_valid_toks + 1e-8)
+
+    torch.testing.assert_close(loss, expected, atol=1e-5, rtol=1e-4)
+
+
+def test_distillation_loss_stvd_zero_when_identical():
+    """stvd is exactly 0 when the student matches the teacher on the top-k window."""
+    data, _ = setup_distillation_test_data(vocab_size=8, topk=8)
+    # Make the window cover distinct ids so student logits can be set per slot.
+    idx = torch.arange(8, device="cuda").view(1, 1, 8).expand(2, 4, 8).contiguous()
+    data["teacher_topk_indices"] = idx
+    # Student logits equal to the teacher's on the window => identical softmax.
+    student_logits = data["teacher_topk_logits"].clone()
+
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "stvd",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        }
+    )
+    loss, _ = loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+    torch.testing.assert_close(loss, torch.zeros_like(loss), atol=1e-6, rtol=0)
+
+
+def test_distillation_loss_stvd_gradient_flow():
+    """stvd produces finite gradients on the student logits."""
+    data, student_logits = setup_distillation_test_data()
+    student_logits = student_logits.clone().requires_grad_(True)
+
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "stvd",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        }
+    )
+    loss, _ = loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+    loss.backward()
+
+    assert student_logits.grad is not None
+    assert not torch.isnan(student_logits.grad).any()
+    assert not torch.isinf(student_logits.grad).any()
+
+
 def test_distillation_loss_fn_initialization():
     """Test DistillationLossFn initialization."""
     # Test with default values
