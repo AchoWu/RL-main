@@ -87,7 +87,7 @@ done
 echo "▶ Using policy=$POLICY_MODEL  teacher=$TEACHER_MODEL"
 
 # 实验名前缀（每组再追加 -ztk<false|true>）
-RUN_PREFIX="opd-skywork7b-to-r1qwen15b-stvd-16k-step50"
+RUN_PREFIX="opd-skywork7b-to-r1qwen15b-stvd-16k-step100"
 
 # ====== 两组对照实验：loss_fn.zero_outside_topk = false / true ======
 # 唯一变量是学生落在 teacher top-k 之外的概率质量是否计入 STVD：
@@ -138,7 +138,7 @@ for ZTK in "${ZTK_VARIANTS[@]}"; do
         teacher.dtensor_cfg.tensor_parallel_size=2 \
         teacher.dtensor_cfg.context_parallel_size=2 \
         distillation.max_num_epochs=1 \
-        distillation.max_num_steps=50 \
+        distillation.max_num_steps=100 \
         distillation.val_period=5 \
         distillation.val_at_start=true \
         distillation.max_val_samples=768 \
@@ -148,7 +148,7 @@ for ZTK in "${ZTK_VARIANTS[@]}"; do
         checkpointing.keep_top_k=10 \
         checkpointing.save_consolidated=false \
         checkpointing.checkpoint_dir="checkpoints/distillation-${RUN_NAME}" \
-        logger.wandb_enabled=true \
+        logger.wandb_enabled=false \
         loss_fn.kl_type=stvd \
         loss_fn.zero_outside_topk="${ZTK}" \
         logger.wandb.name="${RUN_NAME}" 2>&1 | tee "${LOG_FILE}"
