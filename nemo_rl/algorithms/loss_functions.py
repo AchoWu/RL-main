@@ -33,6 +33,47 @@ from nemo_rl.distributed.model_utils import (
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 
+def _get_next_token_logprobs(
+    next_token_logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    seq_index: Optional[torch.Tensor],
+    vocab_parallel_rank: Optional[int],
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup],
+    context_parallel_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Full-vocab log-probs of the actual next tokens, [B, S-1].
+
+    Handles Megatron vocab-parallel logits, DTensor (TP/CP) logits and plain logits.
+    """
+    if vocab_parallel_group is not None:
+        assert vocab_parallel_rank is not None, (
+            "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+        )
+        logprobs = from_parallel_logits_to_logprobs(
+            next_token_logits,
+            input_ids,
+            vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
+            vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
+            tp_group=vocab_parallel_group,
+            inference_only=False,
+            cp_group=context_parallel_group,
+        )
+        # slice off to the correct length to remove potential CP padding
+        return logprobs[:, : input_ids.shape[1] - 1]
+    if isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+        return get_logprobs_from_vocab_parallel_logits(
+            next_token_logits, input_ids, seq_index=seq_index
+        )
+    # Remove last position's logits; skip the first token
+    next_token_logprobs = torch.nn.functional.log_softmax(
+        next_token_logits[:, :-1], dim=-1
+    )
+    next_tokens = input_ids[:, 1:].to(next_token_logprobs.device)
+    return next_token_logprobs.gather(dim=-1, index=next_tokens.unsqueeze(-1)).squeeze(
+        -1
+    )
+
+
 class ClippedPGLossConfig(TypedDict):
     reference_policy_kl_penalty: float
     reference_policy_kl_type: str
@@ -239,36 +280,14 @@ class ClippedPGLossFn(LossFunction):
 
         next_token_logits = next_token_logits.to(torch.float32)
 
-        if vocab_parallel_group is not None:
-            assert vocab_parallel_rank is not None, (
-                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
-            )
-            curr_logprobs = from_parallel_logits_to_logprobs(
-                next_token_logits,
-                data["input_ids"],
-                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
-                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                tp_group=vocab_parallel_group,
-                inference_only=False,
-                cp_group=context_parallel_group,
-            )
-            # slice off to the correct length to remove potential CP padding
-            curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
-        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
-            curr_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
-            )
-        else:
-            next_token_logits_wo_last = next_token_logits[
-                :, :-1
-            ]  # Remove last position's logits
-            next_token_logprobs = torch.nn.functional.log_softmax(
-                next_token_logits_wo_last, dim=-1
-            )
-            next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
-            curr_logprobs = next_token_logprobs.gather(
-                dim=-1, index=next_tokens.unsqueeze(-1)
-            ).squeeze(-1)
+        curr_logprobs = _get_next_token_logprobs(
+            next_token_logits,
+            data["input_ids"],
+            seq_index,
+            vocab_parallel_rank,
+            vocab_parallel_group,
+            context_parallel_group,
+        )
 
         # Calculate KL regularization.
         if self.reference_policy_kl_penalty != 0:
@@ -504,34 +523,14 @@ class NLLLoss(LossFunction):
         next_token_logits = next_token_logits.to(torch.float32)
 
         # Gather the logprobs for the actual next tokens
-        if vocab_parallel_group is not None:
-            assert vocab_parallel_rank is not None, (
-                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
-            )
-            token_logprobs = from_parallel_logits_to_logprobs(
-                next_token_logits,
-                data["input_ids"],
-                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
-                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                tp_group=vocab_parallel_group,
-                inference_only=False,
-                cp_group=context_parallel_group,
-            )
-            # slice off to the correct length to remove potential CP padding
-            token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
-        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
-            token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
-            )
-        else:
-            next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
-            next_token_logprobs = torch.nn.functional.log_softmax(
-                next_token_logits, dim=-1
-            )
-            logprobs = next_token_logprobs[:, :-1]  # Remove last position's logits
-            token_logprobs = logprobs.gather(
-                dim=-1, index=next_tokens.unsqueeze(-1)
-            ).squeeze(-1)
+        token_logprobs = _get_next_token_logprobs(
+            next_token_logits,
+            data["input_ids"],
+            seq_index,
+            vocab_parallel_rank,
+            vocab_parallel_group,
+            context_parallel_group,
+        )
 
         if dpo_loss:
             ## shape: [batch_size]
@@ -758,34 +757,14 @@ class DPOLossFn(PreferenceLoss):
         seq_index = data.get("seq_index", None)
 
         next_token_logits = next_token_logits.to(torch.float32)
-        if vocab_parallel_group is not None:
-            assert vocab_parallel_rank is not None, (
-                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
-            )
-            token_logprobs = from_parallel_logits_to_logprobs(
-                next_token_logits,
-                data["input_ids"],
-                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
-                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                tp_group=vocab_parallel_group,
-                inference_only=False,
-                cp_group=context_parallel_group,
-            )
-            # slice off to the correct length to remove potential CP padding
-            token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
-        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
-            token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
-            )
-        else:
-            next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
-            next_token_logprobs = torch.nn.functional.log_softmax(
-                next_token_logits, dim=-1
-            )
-            logprobs = next_token_logprobs[:, :-1]  # Remove last position's logits
-            token_logprobs = logprobs.gather(
-                dim=-1, index=next_tokens.unsqueeze(-1)
-            ).squeeze(-1)
+        token_logprobs = _get_next_token_logprobs(
+            next_token_logits,
+            data["input_ids"],
+            seq_index,
+            vocab_parallel_rank,
+            vocab_parallel_group,
+            context_parallel_group,
+        )
 
         ref_logprobs = data["reference_policy_logprobs"][:, :-1]
 
@@ -967,6 +946,129 @@ class DistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float
     zero_outside_topk: bool
+    # Block reverse KL (see docs/design-docs/opd.md). 1 = per-token KL. >1 also
+    # credits each sampled token with the KL of later tokens in its block (the
+    # score-function term per-token KL drops); requires kl_type "reverse" and
+    # zero_outside_topk false.
+    block_size: int
+    # "fixed": non-overlapping blocks from the first response token; exact gradient
+    #   of the sum of block KLs with each block's prefix distribution held fixed.
+    # "sliding": "fixed" averaged over all block_size block offsets, i.e. the later
+    #   token j steps ahead is weighted (block_size - j) / block_size.
+    block_mode: str
+    # block_size > 1 only: subtract from each KL-to-go a baseline built from earlier
+    # positions that y_t cannot affect (see _block_kl_baseline). Unbiased; lowers the
+    # variance of the score-function term, whose KL-to-go is otherwise always >= 0.
+    block_baseline: bool
+
+
+def _block_kl_to_go(
+    per_token_kl: torch.Tensor,
+    mask: torch.Tensor,
+    block_size: int,
+    block_mode: str,
+) -> torch.Tensor:
+    """Per position, the weighted KL of the later response tokens in its block.
+
+    With k = block_size and KL_{+j} the KL of the response token j steps after t:
+      fixed:   R_t = sum of KL_{+j} over the rest of t's block
+      sliding: R_t = sum_{j=1}^{k-1} (k - j) / k * KL_{+j}
+    "sliding" is "fixed" averaged over the k possible block offsets (KL_{+j} shares
+    a block with t for k - j of them), which removes the block-boundary artifact.
+
+    Blocks are laid out in response-token order (positions with mask > 0), so
+    prompt and padding positions never count toward a block's length.
+
+    Args:
+        per_token_kl: [B, S] per-position KL.
+        mask: [B, S] response-token mask.
+        block_size: number of response tokens per block.
+        block_mode: "fixed" or "sliding".
+
+    Returns:
+        [B, S] detached KL-to-go; 0 everywhere when block_size == 1.
+    """
+    valid = mask > 0
+    # float64: the prefix sums below grow with sequence length and are differenced
+    kl = (per_token_kl.detach() * valid).to(torch.float64)
+    # 0-based index of each position among its sequence's response tokens
+    resp_idx = (valid.to(torch.long).cumsum(dim=1) - 1).clamp(min=0)
+    # kl_cum[b, r] = KL summed over response tokens 0..r of sequence b
+    kl_cum = torch.zeros_like(kl).scatter_add_(1, resp_idx, kl).cumsum(dim=1)
+    last = kl.shape[1] - 1
+    cum_at = kl_cum.gather(1, resp_idx)
+    if block_mode == "fixed":
+        end_idx = ((resp_idx // block_size + 1) * block_size - 1).clamp(max=last)
+        kl_to_go = kl_cum.gather(1, end_idx) - cum_at
+    else:
+        # sum_{j=1}^{k-1} (k-j) KL_{+j} = sum_{m=1}^{k-1} (kl_cum[r+m] - kl_cum[r]);
+        # kl_cum is constant past the last response token.
+        cum_cum = kl_cum.cumsum(dim=1)
+        end_idx = resp_idx + block_size - 1
+        end_clamped = end_idx.clamp(max=last)
+        sum_cum = (
+            cum_cum.gather(1, end_clamped)
+            - cum_cum.gather(1, resp_idx)
+            + (end_idx - end_clamped) * kl_cum[:, last:]
+        )
+        kl_to_go = (sum_cum - (block_size - 1) * cum_at) / block_size
+    return kl_to_go.to(per_token_kl.dtype)
+
+
+def _block_kl_baseline(
+    kl_to_go: torch.Tensor,
+    mask: torch.Tensor,
+    block_size: int,
+    block_mode: str,
+) -> torch.Tensor:
+    """Per position t, the mean KL-to-go of earlier positions already fixed by y_<t.
+
+    R_s sums KL up to s + k - 1, and the KL at position m depends only on the
+    tokens before m, so R_s is a function of y_<t when s <= t - k + 1. Averaging
+    only those keeps the baseline independent of y_t (the score term stays
+    unbiased) while centering R_t:
+      fixed:   mean of R_s over earlier blocks, at the same in-block position as t
+      sliding: mean of R_s over s <= t - k + 1
+    Positions with no such s get baseline 0. Positions are counted in
+    response-token order, as in _block_kl_to_go.
+
+    Args:
+        kl_to_go: [B, S] output of _block_kl_to_go.
+        mask: [B, S] response-token mask.
+        block_size: number of response tokens per block (> 1).
+        block_mode: "fixed" or "sliding".
+
+    Returns:
+        [B, S] detached baseline.
+    """
+    valid = mask > 0
+    resp_idx = (valid.to(torch.long).cumsum(dim=1) - 1).clamp(min=0)
+    # r_resp[b, i] = KL-to-go of the i-th response token of sequence b
+    r = (kl_to_go.detach() * valid).to(torch.float64)
+    r_resp = torch.zeros_like(r).scatter_add_(1, resp_idx, r)
+    batch, seq = r_resp.shape
+    # A row holds at most seq response tokens, so capping the block (fixed) or lag
+    # (sliding) at seq leaves the result unchanged (no earlier block / s exists, so
+    # the baseline is 0) while keeping the padding O(seq) for huge block_size.
+    if block_mode == "fixed":
+        block_size = min(block_size, seq)
+        num_blocks = -(-seq // block_size)
+        blocks = torch.nn.functional.pad(
+            r_resp, (0, num_blocks * block_size - seq)
+        ).view(batch, num_blocks, block_size)
+        prev_sum = blocks.cumsum(dim=1) - blocks
+        num_prev = torch.arange(num_blocks, device=r.device, dtype=torch.float64)
+        num_prev = num_prev.view(1, -1, 1).clamp(min=1)
+        baseline = (prev_sum / num_prev).view(batch, -1)[:, :seq]
+    else:
+        lag = min(block_size - 1, seq)
+        # cum_lagged[:, i] = sum of r_resp[:, : i - lag + 1] (0 for i < lag)
+        cum_lagged = torch.nn.functional.pad(r_resp.cumsum(dim=1), (lag, 0))[:, :seq]
+        num_prev = (
+            torch.arange(seq, device=r.device, dtype=torch.float64) - lag + 1
+        ).clamp(min=1)
+        baseline = cum_lagged / num_prev
+    return (baseline.gather(1, resp_idx) * valid).to(kl_to_go.dtype)
 
 
 class DistillationLossDataDict(TypedDict):
@@ -982,6 +1084,9 @@ class DistillationLossDataDict(TypedDict):
     # noisier than the prefix — the core testable hypothesis of the proposal).
     # If absent, the diagnostic is skipped.
     token_mask_pre_warmup: NotRequired[torch.Tensor]
+    # Set by the DTensor worker under context parallelism; needed to gather the
+    # sampled-token logprobs for block_size > 1.
+    seq_index: NotRequired[torch.Tensor]
 
 
 class DistillationLossFn(LossFunction):
@@ -991,12 +1096,27 @@ class DistillationLossFn(LossFunction):
         self.kl_type = cfg["kl_type"]
         self.mixed_kl_weight = cfg["mixed_kl_weight"]
         self.zero_outside_topk = cfg["zero_outside_topk"]
+        self.block_size = cfg["block_size"]
+        self.block_mode = cfg["block_mode"]
+        self.block_baseline = cfg["block_baseline"]
         self.log_infinitesimal = -100
         self.loss_type = LossType.TOKEN_LEVEL
 
         assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
+        )
+        assert self.block_size >= 1, "block_size must be >= 1"
+        assert self.block_mode in ["fixed", "sliding"], "Invalid block mode"
+        # The block KL's chain-rule decomposition is an expectation over student
+        # samples, which is what the rollouts are; forward KL would need teacher samples.
+        assert self.block_size == 1 or self.kl_type == "reverse", (
+            "block_size > 1 is only supported with kl_type 'reverse'"
+        )
+        # zero_outside_topk adds -log_infinitesimal * P_rest (= 100 * P_rest) per
+        # token; summed into the block KL-to-go it swamps the gradient.
+        assert self.block_size == 1 or not self.zero_outside_topk, (
+            "block_size > 1 is not supported with zero_outside_topk"
         )
 
     def __call__(
@@ -1208,21 +1328,47 @@ class DistillationLossFn(LossFunction):
         per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
 
         # Masking and reduction
-        if "token_mask" in data and "sample_mask" in data:
-            token_mask = data["token_mask"][:, 1:]
-            sample_mask = data["sample_mask"]
-            # Align mask length to current per_token_kl
-            max_len = per_token_kl.shape[1]
-            token_mask = token_mask[:, :max_len]
-            mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
-            # align mask shape to per_token_kl
-            kl_loss = masked_mean(
-                per_token_kl,
-                mask,
-                global_normalization_factor=global_valid_toks,
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        # Align mask length to current per_token_kl
+        max_len = per_token_kl.shape[1]
+        token_mask = token_mask[:, :max_len]
+        mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
+
+        per_token_loss = per_token_kl
+        if self.block_size > 1:
+            # Block reverse KL. By the chain rule, the KL between the student's and
+            # teacher's joint distributions over a block B of sampled tokens is
+            # E_q[sum_{t in B} KL_t], where KL_t (above) is conditioned on the
+            # sampled prefix. Its gradient is sum_t grad KL_t plus a score-function
+            # term sum_t grad log q(y_t) * kl_to_go_t (the KL of the later tokens of
+            # t's block), which per-token KL drops. log q is the full-vocab student
+            # logprob, i.e. the sampling distribution. The term below has forward
+            # value 0, so the reported loss stays the per-token KL mean.
+            student_logprobs = _get_next_token_logprobs(
+                next_token_logits,
+                input_ids,
+                data.get("seq_index"),
+                vocab_parallel_rank,
+                vocab_parallel_group,
+                context_parallel_group,
+            )[:, :max_len]
+            kl_to_go = _block_kl_to_go(
+                per_token_kl, mask, self.block_size, self.block_mode
             )
-        else:
-            kl_loss = per_token_kl.mean()
+            if self.block_baseline:
+                kl_to_go = kl_to_go - _block_kl_baseline(
+                    kl_to_go, mask, self.block_size, self.block_mode
+                )
+            per_token_loss = per_token_kl + (
+                student_logprobs - student_logprobs.detach()
+            ) * kl_to_go.to(student_logprobs.device)
+
+        kl_loss = masked_mean(
+            per_token_loss,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        )
 
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
@@ -1236,11 +1382,7 @@ class DistillationLossFn(LossFunction):
         # We emit SUMS and token counts so the outer loop can compute a proper
         # weighted mean across microbatches (mean-of-means would be biased when
         # mb sizes differ).
-        if (
-            "token_mask_pre_warmup" in data
-            and "token_mask" in data
-            and "sample_mask" in data
-        ):
+        if "token_mask_pre_warmup" in data:
             pre_mask_full = data["token_mask_pre_warmup"][:, 1:]
             pre_mask = pre_mask_full[:, :max_len].to(mask.dtype)
             sample_mask_b = sample_mask.unsqueeze(-1)

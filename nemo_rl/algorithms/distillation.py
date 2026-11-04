@@ -337,6 +337,21 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
     )
+    # The block KL's score-function term needs samples from the current student,
+    # so each rollout batch may take only one optimizer step (no importance ratio).
+    rollouts_per_step = (
+        distillation_config["num_prompts_per_step"]
+        * distillation_config["num_generations_per_prompt"]
+    )
+    assert (
+        loss_config["block_size"] == 1
+        or policy_config["train_global_batch_size"] == rollouts_per_step
+    ), (
+        "loss_fn.block_size > 1 requires policy.train_global_batch_size == "
+        "num_prompts_per_step * num_generations_per_prompt "
+        f"({policy_config['train_global_batch_size']} != {rollouts_per_step}), "
+        "otherwise later optimizer steps train on off-policy samples"
+    )
 
     # Disallow SP + packing for dtensor path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):

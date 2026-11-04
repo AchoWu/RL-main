@@ -23,6 +23,8 @@ from nemo_rl.algorithms.loss_functions import (
     DistillationLossFn,
     DPOLossFn,
     NLLLoss,
+    _block_kl_baseline,
+    _block_kl_to_go,
 )
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -1616,6 +1618,9 @@ def test_distillation_loss_forward_kl():
             "kl_type": "forward",
             "mixed_kl_weight": 0.5,
             "zero_outside_topk": False,
+            "block_size": 1,
+            "block_mode": "fixed",
+            "block_baseline": False,
         }
     )
 
@@ -1647,6 +1652,9 @@ def test_distillation_loss_reverse_kl():
             "kl_type": "reverse",
             "mixed_kl_weight": 0.5,
             "zero_outside_topk": False,
+            "block_size": 1,
+            "block_mode": "fixed",
+            "block_baseline": False,
         }
     )
 
@@ -1679,6 +1687,9 @@ def test_distillation_loss_mixed_kl():
             "kl_type": "mixed",
             "mixed_kl_weight": mixed_kl_weight,
             "zero_outside_topk": False,
+            "block_size": 1,
+            "block_mode": "fixed",
+            "block_baseline": False,
         }
     )
 
@@ -1714,6 +1725,9 @@ def test_distillation_loss_topk_filtering():
                 "kl_type": "forward",
                 "mixed_kl_weight": 0.5,
                 "zero_outside_topk": False,
+                "block_size": 1,
+                "block_mode": "fixed",
+                "block_baseline": False,
             }
         )
 
@@ -1751,6 +1765,9 @@ def test_distillation_loss_invalid_k_zero():
             "kl_type": "forward",
             "mixed_kl_weight": 0.5,
             "zero_outside_topk": False,
+            "block_size": 1,
+            "block_mode": "fixed",
+            "block_baseline": False,
         }
     )
 
@@ -1779,6 +1796,9 @@ def test_distillation_loss_zero_outside_topk():
                 "kl_type": "forward",
                 "mixed_kl_weight": 0.5,
                 "zero_outside_topk": True,
+                "block_size": 1,
+                "block_mode": "fixed",
+                "block_baseline": False,
             }
         )
 
@@ -1818,6 +1838,9 @@ def test_distillation_loss_gradient_flow():
             "kl_type": "forward",
             "mixed_kl_weight": 0.5,
             "zero_outside_topk": False,
+            "block_size": 1,
+            "block_mode": "fixed",
+            "block_baseline": False,
         }
     )
 
@@ -1849,6 +1872,9 @@ def test_distillation_loss_edge_cases():
             "kl_type": "forward",
             "mixed_kl_weight": 0.5,
             "zero_outside_topk": False,
+            "block_size": 1,
+            "block_mode": "fixed",
+            "block_baseline": False,
         }
     )
 
@@ -1899,6 +1925,9 @@ def test_distillation_loss_fn_initialization():
         "kl_type": "forward",
         "mixed_kl_weight": 0.5,
         "zero_outside_topk": False,
+        "block_size": 1,
+        "block_mode": "fixed",
+        "block_baseline": False,
     }
     loss_fn = DistillationLossFn(default_config)
     assert loss_fn.kl_type == "forward"
@@ -1910,6 +1939,9 @@ def test_distillation_loss_fn_initialization():
         "kl_type": "reverse",
         "mixed_kl_weight": 0.3,
         "zero_outside_topk": True,
+        "block_size": 1,
+        "block_mode": "fixed",
+        "block_baseline": False,
     }
     loss_fn = DistillationLossFn(custom_config)
     assert loss_fn.kl_type == "reverse"
@@ -1926,6 +1958,9 @@ def test_distillation_loss_fn_call():
             "kl_type": "forward",
             "mixed_kl_weight": 0.5,
             "zero_outside_topk": False,
+            "block_size": 1,
+            "block_mode": "fixed",
+            "block_baseline": False,
         }
     )
 
@@ -1949,3 +1984,277 @@ def test_distillation_loss_fn_call():
     expected_fields = ["loss"]
     for field in expected_fields:
         assert field in metrics
+
+
+def _block_kl_test_mask():
+    mask = torch.zeros(3, 12)
+    mask[0, 2:9] = 1  # prompt + right padding
+    mask[1, 0:12] = 1  # no prompt, no padding
+    mask[2, 5:7] = 1  # response shorter than a block
+    return mask
+
+
+@pytest.mark.parametrize("block_mode", ["fixed", "sliding"])
+@pytest.mark.parametrize("block_size", [1, 2, 3, 5])
+def test_block_kl_to_go_matches_bruteforce(block_mode, block_size):
+    """fixed: unit weight on the rest of the block; sliding: (k - j) / k decay."""
+    torch.manual_seed(0)
+    per_token_kl = torch.rand(3, 12)
+    mask = _block_kl_test_mask()
+
+    kl_to_go = _block_kl_to_go(per_token_kl, mask, block_size, block_mode)
+
+    for b in range(3):
+        positions = mask[b].nonzero().flatten().tolist()
+        for r, t in enumerate(positions):
+            expected = 0.0
+            for j in range(1, len(positions) - r):
+                if block_mode == "fixed":
+                    weight = float(r // block_size == (r + j) // block_size)
+                else:
+                    weight = max(block_size - j, 0) / block_size
+                expected += weight * per_token_kl[b, positions[r + j]].item()
+            assert kl_to_go[b, t].item() == pytest.approx(expected, abs=1e-5)
+
+
+@pytest.mark.parametrize("block_mode", ["fixed", "sliding"])
+@pytest.mark.parametrize("block_size", [2, 3, 5])
+def test_block_kl_baseline_matches_bruteforce(block_mode, block_size):
+    """Mean KL-to-go over earlier response tokens s with R_s fixed by y_<t."""
+    torch.manual_seed(0)
+    kl_to_go = torch.rand(3, 12)
+    mask = _block_kl_test_mask()
+
+    baseline = _block_kl_baseline(kl_to_go, mask, block_size, block_mode)
+
+    assert (baseline * (1 - mask)).abs().max() == 0
+    for b in range(3):
+        positions = mask[b].nonzero().flatten().tolist()
+        for r, t in enumerate(positions):
+            if block_mode == "fixed":
+                earlier = range(r - block_size, -1, -block_size)
+            else:
+                earlier = range(r - block_size + 1, -1, -1)
+            values = [kl_to_go[b, positions[s]].item() for s in earlier]
+            expected = sum(values) / len(values) if values else 0.0
+            assert baseline[b, t].item() == pytest.approx(expected, abs=1e-5)
+    # the 12-token response gets a baseline at its later positions
+    assert baseline[1, block_size:].min() > 0
+
+
+@pytest.mark.parametrize("block_mode", ["fixed", "sliding"])
+def test_block_kl_baseline_huge_block_size(block_mode):
+    """block_size beyond the sequence: no earlier window exists, baseline is 0.
+
+    block_size is capped internally, so this must not pad to block_size columns.
+    """
+    torch.manual_seed(0)
+    kl_to_go = torch.rand(3, 12)
+    mask = _block_kl_test_mask()
+    for block_size in [13, 10**12]:
+        baseline = _block_kl_baseline(kl_to_go, mask, block_size, block_mode)
+        assert baseline.abs().max() == 0
+
+
+@pytest.mark.parametrize("block_size", [2, 3, 5])
+def test_block_kl_to_go_sliding_is_fixed_averaged_over_offsets(block_size):
+    """Shifting the fixed blocks by o = 0..k-1 tokens and averaging gives sliding."""
+    torch.manual_seed(0)
+    per_token_kl = torch.rand(3, 12)
+    mask = _block_kl_test_mask()
+
+    fixed_avg = torch.zeros_like(per_token_kl)
+    for offset in range(block_size):
+        # o leading zero-KL response tokens shift every block boundary by o
+        pad = torch.zeros(3, offset)
+        shifted = _block_kl_to_go(
+            torch.cat([pad, per_token_kl], 1),
+            torch.cat([pad + 1, mask], 1),
+            block_size,
+            "fixed",
+        )
+        fixed_avg += shifted[:, offset:] / block_size
+
+    sliding = _block_kl_to_go(per_token_kl, mask, block_size, "sliding")
+    torch.testing.assert_close(sliding * mask, fixed_avg * mask)
+
+
+@pytest.mark.parametrize("block_mode", ["fixed", "sliding"])
+def test_block_kl_to_go_long_sequence_precision(block_mode):
+    """16k tokens: prefix-sum differencing must not lose precision or go negative."""
+    torch.manual_seed(0)
+    block_size, seq_len = 8, 16384
+    per_token_kl = torch.rand(1, seq_len) * 20
+    kl64 = per_token_kl.double()[0]
+    if block_mode == "fixed":
+        blocks = kl64.view(-1, block_size)
+        expected = (blocks.flip(1).cumsum(1).flip(1) - blocks).flatten()
+    else:
+        padded = torch.cat([kl64, torch.zeros(block_size, dtype=torch.float64)])
+        weights = torch.tensor(
+            [(block_size - j) / block_size for j in range(1, block_size)],
+            dtype=torch.float64,
+        )
+        expected = padded[1:].unfold(0, block_size - 1, 1)[:seq_len] @ weights
+
+    kl_to_go = _block_kl_to_go(
+        per_token_kl, torch.ones_like(per_token_kl), block_size, block_mode
+    )
+
+    assert kl_to_go.min() >= 0
+    torch.testing.assert_close(kl_to_go[0].double(), expected, rtol=1e-6, atol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "block_mode,block_size,topk",
+    [
+        ("fixed", 2, 3),
+        ("fixed", 3, 2),
+        ("fixed", 8, 3),
+        ("sliding", 2, 3),
+        ("sliding", 3, 2),
+    ],
+)
+@pytest.mark.parametrize("block_baseline", [False, True])
+def test_distillation_block_kl_gradient_matches_exact_objective(
+    block_mode, block_size, topk, block_baseline
+):
+    """Expected gradient equals the exact gradient of the block objective.
+
+    Student and teacher are tiny autoregressive models (next-token logits depend
+    on the previous token). Enumerating every response and weighting each by its
+    student probability (via sample_mask) turns the sampled loss into its
+    expectation. With KL~_t the per-token KL on the teacher top-k (renormalised),
+    the target is, for each window w = [s, e] of response tokens,
+
+        E_{y_<s ~ sg(q)} E_{y_w ~ q} [ sum_{t in w} KL~_t ]
+
+    summed over the fixed blocks, or over every k-window (including those cut
+    off at either end of the response) divided by k for sliding. When top-k
+    covers the vocab, a fixed block is exactly KL(q(y_w | y_<s) || p(y_w | y_<s)).
+    The response has a 2-token prompt before it and padding after it. The
+    baseline depends only on y_<t, so it must leave the expected gradient unchanged.
+    """
+    torch.manual_seed(0)
+    vocab_size, response_len, prompt, num_pad = 3, 4, [0, 1], 2
+    student_table = torch.randn(vocab_size, vocab_size, dtype=torch.float64)
+    student_table.requires_grad_(True)
+    teacher_table = torch.randn(vocab_size, vocab_size, dtype=torch.float64)
+
+    responses = torch.tensor(
+        list(itertools.product(range(vocab_size), repeat=response_len))
+    )
+    num_seqs = responses.shape[0]
+    input_ids = torch.cat(
+        [
+            torch.tensor(prompt).expand(num_seqs, -1),
+            responses,
+            torch.zeros(num_seqs, num_pad, dtype=torch.long),
+        ],
+        dim=1,
+    )
+    seq_len = input_ids.shape[1]
+    resp_start = len(prompt)
+    # The logits predicting response token i sit at position resp_start - 1 + i
+    # and depend only on the token there.
+    pred_pos = slice(resp_start - 1, resp_start - 1 + response_len)
+    prev_tokens = input_ids[:, pred_pos]
+    targets = responses.unsqueeze(-1)
+    teacher_topk_indices = teacher_table[input_ids].topk(topk, dim=-1).indices
+
+    student_logits = student_table[prev_tokens]
+    teacher_logits = teacher_table[prev_tokens]
+    lq = torch.log_softmax(student_logits, -1).gather(-1, targets).squeeze(-1)
+    idx = teacher_topk_indices[:, pred_pos]
+    q_topk = torch.log_softmax(student_logits.gather(-1, idx), -1)
+    p_topk = torch.log_softmax(teacher_logits.gather(-1, idx), -1)
+    kl_topk = (q_topk.exp() * (q_topk - p_topk)).sum(-1)  # [N, L]
+
+    def window_objective(start, end):
+        prefix = lq[:, :start].sum(1).detach()
+        suffix = lq[:, end + 1 :].sum(1).detach()
+        window = lq[:, start : end + 1].sum(1)
+        return (
+            (prefix + suffix).exp() * window.exp() * kl_topk[:, start : end + 1].sum(1)
+        ).sum()
+
+    def window(start):
+        return max(start, 0), min(start + block_size, response_len) - 1
+
+    if block_mode == "fixed":
+        starts = range(0, response_len, block_size)
+        target = sum(window_objective(*window(s)) for s in starts)
+    else:
+        starts = range(1 - block_size, response_len)
+        target = sum(window_objective(*window(s)) for s in starts) / block_size
+    (target_grad,) = torch.autograd.grad(target, student_table)
+
+    if topk == vocab_size and block_mode == "fixed" and block_size >= response_len:
+        lp = torch.log_softmax(teacher_logits, -1).gather(-1, targets).squeeze(-1)
+        seq_lq, seq_lp = lq.sum(1), lp.sum(1)
+        joint_kl = (seq_lq.exp() * (seq_lq - seq_lp)).sum()
+        assert target.item() == pytest.approx(joint_kl.item(), rel=1e-9)
+
+    token_mask = torch.zeros(num_seqs, seq_len)
+    token_mask[:, resp_start : resp_start + response_len] = 1
+    data = {
+        "input_ids": input_ids,
+        "input_lengths": torch.full((num_seqs,), resp_start + response_len),
+        "token_mask": token_mask,
+        "sample_mask": lq.sum(1).exp().detach().float(),
+        "teacher_topk_logits": teacher_table[input_ids]
+        .gather(-1, teacher_topk_indices)
+        .float(),
+        "teacher_topk_indices": teacher_topk_indices,
+    }
+
+    def loss_and_grad(cfg_block_size):
+        loss_fn = DistillationLossFn(
+            {
+                "kl_type": "reverse",
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": False,
+                "block_size": cfg_block_size,
+                "block_mode": block_mode,
+                "block_baseline": block_baseline,
+            }
+        )
+        loss, _ = loss_fn(
+            student_table.float()[input_ids],
+            data,
+            global_valid_seqs=torch.tensor(1.0),
+            global_valid_toks=torch.tensor(1.0),
+        )
+        (grad,) = torch.autograd.grad(loss, student_table)
+        return loss, grad
+
+    block_loss, block_grad = loss_and_grad(block_size)
+    token_loss, token_grad = loss_and_grad(1)
+
+    # The forward value is the per-token KL; only the gradient changes.
+    assert block_loss.item() == pytest.approx(token_loss.item(), rel=1e-6)
+    torch.testing.assert_close(block_grad, target_grad, rtol=1e-4, atol=1e-5)
+    # Per-token KL drops the score-function term.
+    assert not torch.allclose(token_grad, target_grad, rtol=1e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "kl_type,zero_outside_topk,match",
+    [
+        ("forward", False, "kl_type 'reverse'"),
+        ("mixed", False, "kl_type 'reverse'"),
+        ("reverse", True, "zero_outside_topk"),
+    ],
+)
+def test_distillation_block_kl_invalid_config(kl_type, zero_outside_topk, match):
+    with pytest.raises(AssertionError, match=match):
+        DistillationLossFn(
+            {
+                "kl_type": kl_type,
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": zero_outside_topk,
+                "block_size": 2,
+                "block_mode": "fixed",
+                "block_baseline": False,
+            }
+        )

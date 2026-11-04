@@ -93,6 +93,78 @@ for batch in dataloader:
   `ChunkedDistributedGatherLogprob` + `ChunkedDistributedEntropy` 分块计算，兼容
   TP+CP。
 
+**块级 reverse KL（`block_size` / `block_mode`）：**
+
+逐 token reverse KL 在学生采样出的前缀上算每个位置的 `KL_t`，再按 token 平均。它
+只对 `KL_t` 本身求导，丢掉了"当前 token 的选择会改变后续位置的 `KL_t'`"这部分梯度。
+整条序列的 reverse KL 由链式法则可写成 `E_{y~q}[ sum_t KL_t ]`，它的梯度是
+
+```
+grad = E[ sum_t grad KL_t + sum_t grad log q(y_t) * sg( sum_{t' > t} KL_t' ) ]
+```
+
+第二项相当于"后续 KL 之和"作为 cost-to-go 的 score-function 项。`block_size > 1`
+时保留这一项，但把 cost-to-go 截断到 k 个 token 的范围内。实现上
+（`_block_kl_to_go`），每个位置的 loss 是
+
+```
+KL_t + (log q(y_t) - sg(log q(y_t))) * sg(R_t)
+```
+
+第二项前向值为 0，所以日志里的 `loss` 仍是逐 token KL 均值，和 baseline 可直接比较。
+`log q(y_t)` 是学生在全词表下对采样 token 的 logprob（即采样分布），
+取法与 `ClippedPGLossFn` 共用 `_get_next_token_logprobs`。两种截断方式
+（`KL_{+j}` 表示 t 之后第 j 个 response token 的 KL）：
+
+- `block_mode: "fixed"` — 从第一个 response token 起每 k 个切一块，互不重叠，最后一块
+  可不满。`R_t` 为 t 所在块内、t 之后各 token 的 KL 之和。这正好是
+  `sum_块 KL(q(y_块 | 前缀) || p(y_块 | 前缀))` 在**块前缀分布 stop-grad** 下的精确
+  梯度：块内的 token 对后续块的影响不计入。块首 token 看 k-1 步，块尾 token 看 0 步。
+- `block_mode: "sliding"` — `R_t = sum_{j=1}^{k-1} (k-j)/k * KL_{+j}`。它等于把
+  fixed 的块边界平移 0..k-1 个 token 后取平均（`KL_{+j}` 与 t 同块的概率是
+  (k-j)/k），也等于"所有 k-token 滑窗的块 KL 之和 / k"的梯度——这里的滑窗包括在
+  response 两端被截断的窗口（起点从 1-k 到 L-1，L 为 response 长度）；只算完整窗口时
+  两端 token 的 `grad KL_t` 计入次数不足 k，就不是这个目标了。和 fixed 优化的是同一
+  件事，只是去掉了块边界带来的偏差，score 项的平均权重也与 fixed 相同（(k-1)/2）。
+- `block_size: 1`（默认）— `R_t = 0`，与原逐 token KL 完全等价；`block_size` ≥
+  response 长度的 fixed 即为整条序列 reverse KL 的梯度。
+
+**目标的确切含义。** `KL_t` 是在 teacher top-k 上**重新归一化**后的 KL（`KL~_t`），而
+采样分布是全词表 q。所以优化的是 `E_{y~q}[ sum KL~_t ]` 的（截断后）精确梯度；只有
+top-k 覆盖整个词表时，它才等于截断前块联合分布的 KL。
+
+**限制与注意事项：**
+
+- 只支持 `kl_type: "reverse"`：期望是对学生采样取的，forward KL 需要教师采样。
+- 不支持 `zero_outside_topk: true`：它给每个 token 加 `100 * P_rest` 的替代项
+  （P_rest=0.2 时约为 20），累加进 `R_t` 后会达到上百，压过 KL 项本身，
+  `max_grad_norm` 裁剪又会把 KL 梯度一起缩小。
+- `R_t >= 0`，不减 baseline 时 score 项会按后续 KL 统一压低每个采样 token 的概率，
+  期望正确但噪声随 k 增大。`block_baseline: true` 时改乘 `R_t - b_t`
+  （`_block_kl_baseline`），`b_t` 是同一条序列里**已由 y_<t 确定**的 `R_s` 的均值：
+  `R_s` 用到的 KL 最远到 s+k-1，位置 m 的 KL 只依赖 m 之前的 token，所以
+  s <= t-k+1 时 `R_s` 与 y_t 无关，`E[grad log q(y_t) * b_t] = 0`，仍然无偏。
+  fixed 取之前各块里与 t 块内位置相同的 `R_s`（块内不同位置的 `R` 本身差很多），
+  sliding 取全部 s <= t-k+1；没有这样的 s 时 `b_t = 0`。没用 batch / 序列均值：
+  `train_micro_batch_size=1` 时 loss 只看得到一条序列，序列均值含 t 之后的 KL，
+  相当于多减了一个缩放后的整条序列 cost-to-go，会引入偏差。
+- score 项要求样本来自**当前**学生（on-policy）：
+  - `train_global_batch_size` 不等于每步 rollout 数时（默认 YAML 为 64 < 128），同一批
+    rollout 会更新多次，第二次起样本来自旧策略，score 项有偏（代码不做 importance
+    ratio 修正）。所以 `block_size > 1` 时 `distillation.setup` 会 assert
+    `train_global_batch_size == num_prompts_per_step * num_generations_per_prompt`；
+    `train_bopd.sh` 用 gbs=128，每批 rollout 只更新一次。
+  - vLLM 与训练端 logprob 的数值差异会带来小偏差。
+  - 生成时如果 `top_p < 1` 或设置了 `top_k`，采样分布就不是 q，也会引入偏差；
+    默认 `temperature=1.0, top_p=1.0, top_k=null` 没有这个问题。
+- 显存：要多做一次全词表 log_softmax，结果保留到 backward。16k 序列在 tp=cp=1 时
+  每个 microbatch 约多占 10 GB，TP2/CP2 时每卡约 2.5 GB。
+- 单测 `test_distillation_block_kl_gradient_matches_exact_objective` 在 V=3 的玩具
+  自回归模型上枚举全部序列（多块、top-k < V、多 token prompt、右侧 padding），验证
+  期望梯度等于上述目标的精确梯度；`test_block_kl_to_go_sliding_is_fixed_averaged_over_offsets`
+  验证 sliding = fixed 在所有块偏移下的平均。梯度测试同时跑 `block_baseline` 开/关，
+  开启时期望梯度仍须等于精确目标，即验证 baseline 无偏。
+
 ### 3.2 OAD (`type: "oad"`) — Overlap-Aligned Distillation
 
 `OADLossFn` (`loss_functions.py:1261`)。设计动机见 `BASIC_OAD_PROPOSAL.md`。
@@ -158,6 +230,9 @@ loss_fn:
     kl_type: "mixed"                     # forward / reverse / mixed
     mixed_kl_weight: 0.5
     zero_outside_topk: false
+    block_size: 1                        # >1: 块级 reverse KL
+    block_mode: "fixed"                  # fixed / sliding（fixed 对所有块偏移的平均）
+    block_baseline: false                # true: score 项减去只依赖 y_<t 的 baseline
     oad:
         eps: 1.0e-8
 
