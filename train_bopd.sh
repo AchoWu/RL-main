@@ -146,7 +146,7 @@ cd /group/40092/howu/RL-main
 SUMMARY=()
 for ARM in "${ARMS[@]}"; do
     read -r LABEL ARM_BLOCK_SIZE ARM_BLOCK_MODE ARM_BASELINE RUN_NAME <<< "${ARM}"
-    LOG_FILE="logs/${RUN_NAME}.log"
+    LOG_FILE="logs/bopd/${RUN_NAME}.log"
     ARM_DESC="${LABEL}: block_size=${ARM_BLOCK_SIZE} block_mode=${ARM_BLOCK_MODE} block_baseline=${ARM_BASELINE}"
 
     echo ""
