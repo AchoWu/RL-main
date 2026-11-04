@@ -178,12 +178,12 @@ for ARM in "${ARMS[@]}"; do
         teacher.dtensor_cfg.context_parallel_size=2 \
         distillation.max_num_epochs=1 \
         distillation.max_num_steps=100 \
-        distillation.val_period=5 \
+        distillation.val_period=10 \
         distillation.val_at_start=true \
         distillation.max_val_samples=768 \
         +data.val_aime_years="[2024,2025,2026]" \
         +data.val_repeat=8 \
-        checkpointing.save_period=5 \
+        checkpointing.save_period=10 \
         checkpointing.keep_top_k=10 \
         checkpointing.save_consolidated=false \
         checkpointing.checkpoint_dir="checkpoints/distillation-${RUN_NAME}" \
