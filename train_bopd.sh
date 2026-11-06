@@ -11,7 +11,7 @@
 #   - BLOCK_BASELINE=true 时 score 项减去只依赖 y_<t 的 baseline（loss_fn.block_baseline，
 #     无偏、降方差），run 名追加 -bl；默认 false。只接受 true / false
 #   - train_global_batch_size 必须等于每步 rollout 数（128），否则 setup 会 assert 失败
-#   - 本脚本串行跑三组对照，除 loss 外超参与随机种子完全一致：
+#   - 支持三组对照，除 loss 外超参与随机种子完全一致：
 #       opd     ：标准 OPD 基线，逐 token reverse KL（block_size=1），与 BLOCK_SIZE /
 #                 BLOCK_BASELINE 无关。扫多个 BLOCK_SIZE 时只需跑一次，之后用
 #                 RUN_OPD_BASELINE=false 跳过
@@ -100,42 +100,21 @@ for d in "$TEACHER_MODEL" "$POLICY_MODEL"; do
 done
 echo "▶ Using policy=$POLICY_MODEL  teacher=$TEACHER_MODEL"
 
-# 块大小（response token 数）；block_size=1 就是标准 OPD，由下面的 opd 组单独跑
-BLOCK_SIZE="${BLOCK_SIZE:-4}"
-BLOCK_BASELINE="${BLOCK_BASELINE:-false}"
-RUN_OPD_BASELINE="${RUN_OPD_BASELINE:-true}"
-if ! [[ "$BLOCK_SIZE" =~ ^[0-9]+$ ]] || (( BLOCK_SIZE < 2 )); then
-    echo "❌ BLOCK_SIZE 必须是 >= 2 的整数（当前: ${BLOCK_SIZE}）；block_size=1 即标准 OPD 组"; exit 1
-fi
-# 只接受小写 true / false：写成 True / 1 时 Hydra 仍会开启 baseline，但 run 名不带 -bl，
-# checkpoint 目录会和不带 baseline 的那组撞车（续训或覆盖）。
-for v in BLOCK_BASELINE RUN_OPD_BASELINE; do
-    if [[ "${!v}" != "true" && "${!v}" != "false" ]]; then
-        echo "❌ ${v} 只能是 true 或 false（当前: ${!v}）"; exit 1
-    fi
-done
-BASELINE_SUFFIX=""
-[[ "${BLOCK_BASELINE}" == "true" ]] && BASELINE_SUFFIX="-bl"
+# ====== sliding 块大小扫描 ======
+# 只跑 sliding：BLOCK_SIZE=2、4、8、16
+# 不跑标准 OPD baseline，不跑 fixed，关闭 block_baseline。
+# 四组串行运行，其余训练参数保持不变。
+BLOCK_SIZES=(2 4 8 16)
 
-# 实验名：标准 OPD 不带块参数；块级组每组再追加 -<fixed|sliding>
-OPD_RUN_NAME="bopd-skywork7b-to-r1qwen15b-reverse-16k-step100-opd"
-RUN_PREFIX="bopd-skywork7b-to-r1qwen15b-reverse-bs${BLOCK_SIZE}${BASELINE_SUFFIX}-16k-step100"
-
-# ====== 三组对照实验 ======
-#   opd    ：标准 OPD，逐 token reverse KL（block_size=1）
-#   fixed  ：从第一个 response token 起每 BLOCK_SIZE 个切一块，块间互不影响
-#   sliding：fixed 对所有 BLOCK_SIZE 种块偏移取平均，没有块边界；后面第 j 个 token
-#            的 KL 权重为 (k-j)/k。与 fixed 优化同一件事，唯一变量是有没有块边界
-# 三组共用 distillation.seed=42，其余超参完全一致。8 卡独占，只能串行跑。
-# 每组格式："<标签> <block_size> <block_mode> <block_baseline> <run 名>"
+# 每组格式：
+# "<标签> <block_size> <block_mode> <block_baseline> <run 名>"
 ARMS=()
-if [[ "${RUN_OPD_BASELINE}" == "true" ]]; then
-    ARMS+=("opd 1 fixed false ${OPD_RUN_NAME}")
-fi
-ARMS+=("fixed ${BLOCK_SIZE} fixed ${BLOCK_BASELINE} ${RUN_PREFIX}-fixed")
-ARMS+=("sliding ${BLOCK_SIZE} sliding ${BLOCK_BASELINE} ${RUN_PREFIX}-sliding")
+for BS in "${BLOCK_SIZES[@]}"; do
+    RUN_NAME="bopd-skywork7b-to-r1qwen15b-reverse-bs${BS}-16k-step100-sliding"
+    ARMS+=("sliding ${BS} sliding false ${RUN_NAME}")
+done
 
-mkdir -p /group/40092/howu/RL-main/logs
+mkdir -p /group/40092/howu/RL-main/logs/bopd
 
 export HTTP_PROXY=http://star-proxy.oa.com:3128
 export HTTPS_PROXY=http://star-proxy.oa.com:3128
