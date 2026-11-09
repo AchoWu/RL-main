@@ -101,15 +101,16 @@ for d in "$TEACHER_MODEL" "$POLICY_MODEL"; do
 done
 echo "▶ Using policy=$POLICY_MODEL  teacher=$TEACHER_MODEL"
 
-# ====== sliding 块大小扫描 ======
-# 只跑 sliding：BLOCK_SIZE=2、4、8、16
-# 不跑标准 OPD baseline，不跑 fixed，关闭 block_baseline。
-# 四组串行运行，其余训练参数保持不变。
-BLOCK_SIZES=(2 8 16)
+# ====== 标准 OPD + sliding 块大小扫描 ======
+# 先跑标准 OPD baseline（逐 token reverse KL，block_size=1），
+# 再跑 sliding：BLOCK_SIZE=2、4、8、16。不跑 fixed，关闭 block_baseline。
+# 五组串行运行，其余训练参数保持不变。
+BLOCK_SIZES=(2 4 8 16)
 
 # 每组格式：
 # "<标签> <block_size> <block_mode> <block_baseline> <run 名>"
-ARMS=()
+# block_size=1 时 block_mode / block_baseline 不起作用，loss 退化为逐 token KL
+ARMS=("opd 1 fixed false bopd-skywork7b-to-r1qwen15b-reverse-16k-step100-opd")
 for BS in "${BLOCK_SIZES[@]}"; do
     RUN_NAME="bopd-skywork7b-to-r1qwen15b-reverse-bs${BS}-16k-step100-sliding"
     ARMS+=("sliding ${BS} sliding false ${RUN_NAME}")
