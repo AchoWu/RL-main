@@ -19,7 +19,8 @@
 #       sliding ：fixed 对所有块偏移取平均，后面第 j 个 token 权重 (k-j)/k
 #     run/checkpoint/日志分别带 -opd / -fixed / -sliding 后缀
 #   - 训练 distillation.max_num_steps 步；训练前及每 distillation.val_period 步测评、每 checkpointing.save_period 步保存权重
-#   - 验证集 AIME 2024/2025/2026，每题采样 8 次（3 × 30 × 8 = 720 条），分年份报 validation/accuracy/aime<年>
+#   - 验证集：从 DeepScaleR 训练集（seed=42 打乱后）留出 1000 题并从训练集删除（含重复题），
+#     每题采样 1 次（1000 条），报 validation/accuracy
 #   - checkpoint 保存超时放宽到 30 分钟
 #   - save_consolidated=false（nemo_automodel consolidate 的 all_gather_object 会误算尺寸 OOM），
 #     训练结束后手工转 HF：
@@ -104,7 +105,7 @@ echo "▶ Using policy=$POLICY_MODEL  teacher=$TEACHER_MODEL"
 # 只跑 sliding：BLOCK_SIZE=2、4、8、16
 # 不跑标准 OPD baseline，不跑 fixed，关闭 block_baseline。
 # 四组串行运行，其余训练参数保持不变。
-BLOCK_SIZES=(2 4 8 16)
+BLOCK_SIZES=(2 8 16)
 
 # 每组格式：
 # "<标签> <block_size> <block_mode> <block_baseline> <run 名>"
@@ -159,9 +160,9 @@ for ARM in "${ARMS[@]}"; do
         distillation.max_num_steps=100 \
         distillation.val_period=10 \
         distillation.val_at_start=true \
-        distillation.max_val_samples=768 \
-        +data.val_aime_years="[2024,2025,2026]" \
-        +data.val_repeat=8 \
+        distillation.max_val_samples=1024 \
+        +data.val_holdout_size=1000 \
+        +data.val_repeat=1 \
         checkpointing.save_period=10 \
         checkpointing.keep_top_k=10 \
         checkpointing.save_consolidated=false \

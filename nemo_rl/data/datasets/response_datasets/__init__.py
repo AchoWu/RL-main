@@ -88,6 +88,11 @@ def load_response_dataset(data_config, seed: int = 42):
                 if "val_repeat" in data_config
                 else {}
             ),
+            val_holdout_size=(
+                data_config["val_holdout_size"]
+                if "val_holdout_size" in data_config
+                else None
+            ),
         )
     elif dataset_name == "DAPOMath17K":
         print(

@@ -51,6 +51,7 @@ def prepare_deepscaler_dataset(
     task_name: str = "DeepScaler",
     val_aime_years: list[int] | None = None,
     val_repeat: int = 16,
+    val_holdout_size: int | None = None,
 ) -> dict[str, Dataset | None]:
     """Load and split the DeepScaler dataset into train and test sets.
 
@@ -61,12 +62,28 @@ def prepare_deepscaler_dataset(
             name ``aime<year>`` so validation reports one accuracy per year. None
             keeps the original single AIME 2024 set under ``task_name``.
         val_repeat: Samples per validation problem (16 = the DeepScaleR setting).
+        val_holdout_size: If set, validate on this many problems held out from the
+            (shuffled) training set instead of AIME; they and any duplicate of them
+            are removed from training. Mutually exclusive with ``val_aime_years``.
     """
     # Load the original dataset for training
     train_ds = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train")
 
     # Shuffle the training dataset with the specified seed
     train_ds = train_ds.shuffle(seed=seed)
+
+    holdout_ds = None
+    if val_holdout_size is not None:
+        if val_aime_years is not None:
+            raise ValueError(
+                "val_holdout_size and val_aime_years are mutually exclusive"
+            )
+        holdout_ds = train_ds.select(range(val_holdout_size))
+        holdout_problems = set(holdout_ds["problem"])
+        # DeepScaleR has duplicate problems; drop every copy so none leaks into training.
+        train_ds = train_ds.select(range(val_holdout_size, len(train_ds))).filter(
+            lambda row: row["problem"] not in holdout_problems
+        )
 
     # Format the examples, removing original columns
     train_formatted = train_ds.map(
@@ -75,12 +92,20 @@ def prepare_deepscaler_dataset(
         fn_kwargs={"task_name": task_name},
     )
 
-    val_sets = (
-        [(2024, task_name)]
-        if val_aime_years is None
-        else [(year, f"aime{year}") for year in val_aime_years]
-    )
     val_parts = []
+    if holdout_ds is not None:
+        val_sets = []
+        val_parts.append(
+            holdout_ds.map(
+                format_math,
+                remove_columns=holdout_ds.column_names,
+                fn_kwargs={"task_name": task_name},
+            )
+        )
+    elif val_aime_years is None:
+        val_sets = [(2024, task_name)]
+    else:
+        val_sets = [(year, f"aime{year}") for year in val_aime_years]
     for year, val_task_name in val_sets:
         if year not in AIME_VAL_SOURCES:
             raise ValueError(
@@ -114,6 +139,7 @@ class DeepScalerDataset(RawDataset):
         seed: int = 42,
         val_aime_years: list[int] | None = None,
         val_repeat: int = 16,
+        val_holdout_size: int | None = None,
     ) -> None:
         """Initialize the DeepScaler dataset with train/test split.
 
@@ -121,6 +147,8 @@ class DeepScalerDataset(RawDataset):
             seed: Random seed for reproducible splitting
             val_aime_years: AIME years to validate on; None = AIME 2024 only.
             val_repeat: Samples per validation problem.
+            val_holdout_size: Validate on this many problems held out from the
+                training set instead of AIME; None = use AIME.
         """
         self.task_name = "DeepScaler"
         self.formatted_ds = prepare_deepscaler_dataset(
@@ -128,4 +156,5 @@ class DeepScalerDataset(RawDataset):
             task_name=self.task_name,
             val_aime_years=val_aime_years,
             val_repeat=val_repeat,
+            val_holdout_size=val_holdout_size,
         )

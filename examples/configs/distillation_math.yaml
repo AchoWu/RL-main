@@ -220,6 +220,8 @@ data:
     # Each year is 30 problems x val_repeat samples; raise distillation.max_val_samples to cover them.
     # val_aime_years: [2024, 2025, 2026]
     # val_repeat: 16 # optional, DeepScaler only: samples per validation problem; absent = 16
+    # val_holdout_size: 1000 # optional, DeepScaler only: validate on this many problems held out from
+    #   (and removed from) the training set instead of AIME; exclusive with val_aime_years
     shuffle: true
 
 env:
