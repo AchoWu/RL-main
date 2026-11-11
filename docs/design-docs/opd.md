@@ -165,6 +165,92 @@ top-k 覆盖整个词表时，它才等于截断前块联合分布的 KL。
   验证 sliding = fixed 在所有块偏移下的平均。梯度测试同时跑 `block_baseline` 开/关，
   开启时期望梯度仍须等于精确目标，即验证 baseline 无偏。
 
+#### 3.1.1 块级 KL 的梯度诊断（`tools/bopd_diagnostics`）
+
+用来回答三个问题：score 项相对逐 token KL 多出了多少有效信号（Q1）；y_t 是否真的改变后续
+KL（Q2）；baseline 是否真的降低了梯度方差（Q3）。诊断离线进行，固定一个 student
+checkpoint：
+
+1. `generate`：按 `train_bopd.sh` 的 prompt 分布（DeepScaleR 训练集，去掉 1000 道留出题）
+   随机取 `NUM_SAMPLES` 道题，用 vLLM 以训练相同的采样参数各采 1 条 rollout。
+2. `analyze`：每条 rollout 在单卡上用 HF 模型处理（student 用 fp32 权重 + bf16 autocast，
+   与训练一致），teacher 取 top-64。逐 token KL、`R_t`、`b_t` 直接调用训练用的
+   `_block_kl_to_go` / `_block_kl_baseline`。对 direct 项 `sum_t KL_t` 和每个 k 的 score 项
+   `sum_t log q(y_t) R_t`、`sum_t log q(y_t) (R_t - b_t)` 分别做一次 forward + backward，
+   得到精确的单条参数梯度。
+3. `summarize`：按 `sample_id // 128` 分 batch，每个 batch 的梯度和除以该 batch 的
+   response token 数，与训练时一步的梯度 G 相同，然后输出三张表。
+
+单条梯度的范数、以及它和同一条的 direct 梯度的内积都是精确值。batch 级的内积在
+2^23 维随机符号折叠 sketch 上计算：sketch 是线性的，估计无偏，误差约为
+`|a||b| / 2900`。单测 `tests/unit/tools/test_bopd_diagnostics.py` 验证 direct + score 拆分后
+的梯度与 `DistillationLossFn` 完全一致。
+
+**Q1 score vs direct（参数空间）。** "batch" 列取单个 batch 的 G（一步训练实际看到的梯度）
+在各 batch 上的平均。"E" 列用不同 batch 之间的内积 `<G^b, G^c>`（b ≠ c）估计 `<E G, E G>`，
+即去掉了采样噪声，至少需要 2 个 batch。分解式为 `G_S = alpha G_D + perp`。
+
+- `|E G_S| / |E G_D|` 小：score 项的期望贡献很小，Block OPD 的额外机制影响有限。
+- 期望级 `alpha > 0` 且 `cos(E G_D, E G_S)` 高：score 项主要是在强化原有 OPD 方向。
+- 期望级 `alpha < 0`：与 direct 冲突。
+- 期望级 cos 低但 `|E G_S|` 不小：score 项提供了 OPD 没有的方向。
+- batch 级 cos 低、期望级 cos 高，或 `signal frac`（`|E G_S|^2` 占 `|G_S|^2` 的比例）很低：
+  单步看到的"新方向"主要是噪声，不能算新信息。
+- `|G_D+G_S|` 可以直接和 `max_grad_norm = 1.0` 比较。超过 1 时梯度裁剪会把 direct 项一起缩小。
+
+**Q2 y_t 是否影响后续 KL（嵌套分支）。** 在随机 response 位置 t 的同一前缀 y_<t 下，
+从 q 采 N1=8 个 y_t；每个 y_t 再由学生续写 N2=4 条，长到 y_{t+k_max-1}；师生在这些位置
+计算 KL，得到 `R_t`。k > 2 时 `R_t` 还依赖 y_t 之后 k-2 个随机 token，所以把
+`Var(R_t | y_<t)` 拆成两部分：
+
+- `between = Var_{y_t}( E[R_t | y_<=t] )`：y_t 的选择本身造成的差异，也是 score 项唯一能利用的信号。
+- `within = E_{y_t} Var(R_t | y_<=t)`：后续 token 带来的噪声，对 score 项是纯噪声。
+  k=2 时它恒为 0。
+
+另外在 logit 空间给出 score 项的期望梯度 `s* = E[(e_{y_t} - q) mu(y_t)]`，其中
+`mu(y) = E[R_t | y_<t, y_t = y]`，并和 direct 梯度 `d = grad_z KL` 比较 `|s*|/|d|` 与 cos。
+所有量都对分支采样无偏，按学生熵分 3 档输出。每个位置另跑一条重放真实续写的分支，
+它的 `R_t` 必须与训练算出的值一致（`replay rel err`，用来校验 KV-cache 路径）。
+
+判读：`between` 小，说明当前 token 对未来 KL 的影响有限；`between` 大而 SNR 低，说明问题
+在估计方差，而不是机制本身。
+
+**Q3 baseline 是否降方差，分三层看：**
+
+1. KL-to-go 本身：`Var(R)` vs `Var(R-b)`，以及 `E R^2` vs `E (R-b)^2`。score 估计的噪声
+   取决于二阶矩而不是方差：`R >= 0` 的整体偏移本身就是噪声，所以 `Var(R-b)` 变大时
+   二阶矩仍可能下降。
+2. logit 空间、每个位置的估计噪声 `tr Var((e_y - q)(R - b))`。b 取三种：0、训练用的
+   history baseline、oracle `E[R | y_<t]`。oracle 是"完美 baseline"的下界，
+   `hist/none` 与 `oracle/none` 对比可以看出 history baseline 收回了多少噪声。
+3. 参数空间：对 `S`、`Sbl` 以及训练实际使用的 `D+S`、`D+Sbl`，给出 batch 梯度的信号
+   `|E G|^2`、噪声 `tr Var(G)`（within 由单条梯度估计，cross 由 batch 间离散度估计）、
+   SNR 和跨 batch cos（方向一致性）。这一层才是 baseline 是否真正降低参数梯度方差的结论。
+
+**用法：**
+
+```bash
+# base 模型，和 step 50 的 OPD / sliding-bs8 各测一次（训练 checkpoint 自动转 HF）
+STUDENT=/dev/shm/llms/DeepSeek-R1-Distill-Qwen-1.5B/ OUT=diag/base \
+    bash tools/bopd_diagnostics/run_diag.sh
+STUDENT=checkpoints/distillation-bopd-skywork7b-to-r1qwen15b-reverse-16k-step100-opd/step_50 \
+    OUT=diag/opd-step50 bash tools/bopd_diagnostics/run_diag.sh
+# 同时看 fixed、只重跑 analyze + summarize
+ANALYZE_ARGS="--block_modes sliding fixed" STAGES="analyze summarize" OUT=diag/base \
+    STUDENT=... bash tools/bopd_diagnostics/run_diag.sh
+```
+
+结果写在 `$OUT/summary.md`（表格）和 `$OUT/summary.json`。同一 checkpoint、同一批 rollout
+上会同时算出所有 k 的结果。默认 512 条 = 4 个 batch，跨 batch 的估计只有 12 个 batch 对，
+噪声较大，需要更稳的 Q1 期望级 / Q3 结论时可以加大 `NUM_SAMPLES`。
+
+**局限：**
+
+- 只分析原始梯度，不模拟 Adam：score 项噪声大时会抬高 Adam 的二阶矩估计，从而缩小
+  direct 方向的有效步长，这一点要结合训练曲线判断。
+- HF 前向与 DTensor 训练前向存在 bf16 数值差异。
+- 只支持单轮 rollout（math 任务）。
+
 ### 3.2 OAD (`type: "oad"`) — Overlap-Aligned Distillation
 
 `OADLossFn` (`loss_functions.py:1261`)。设计动机见 `BASIC_OAD_PROPOSAL.md`。
