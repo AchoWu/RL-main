@@ -72,6 +72,7 @@ def test_split_objective_matches_distillation_loss(block_mode, block_size, basel
             "block_size": block_size,
             "block_mode": block_mode,
             "block_baseline": baseline,
+            "score_loss_weight": 1.0,
         }
     )
     data = {

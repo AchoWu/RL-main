@@ -1621,6 +1621,7 @@ def test_distillation_loss_forward_kl():
             "block_size": 1,
             "block_mode": "fixed",
             "block_baseline": False,
+            "score_loss_weight": 1.0,
         }
     )
 
@@ -1655,6 +1656,7 @@ def test_distillation_loss_reverse_kl():
             "block_size": 1,
             "block_mode": "fixed",
             "block_baseline": False,
+            "score_loss_weight": 1.0,
         }
     )
 
@@ -1690,6 +1692,7 @@ def test_distillation_loss_mixed_kl():
             "block_size": 1,
             "block_mode": "fixed",
             "block_baseline": False,
+            "score_loss_weight": 1.0,
         }
     )
 
@@ -1728,6 +1731,7 @@ def test_distillation_loss_topk_filtering():
                 "block_size": 1,
                 "block_mode": "fixed",
                 "block_baseline": False,
+                "score_loss_weight": 1.0,
             }
         )
 
@@ -1768,6 +1772,7 @@ def test_distillation_loss_invalid_k_zero():
             "block_size": 1,
             "block_mode": "fixed",
             "block_baseline": False,
+            "score_loss_weight": 1.0,
         }
     )
 
@@ -1799,6 +1804,7 @@ def test_distillation_loss_zero_outside_topk():
                 "block_size": 1,
                 "block_mode": "fixed",
                 "block_baseline": False,
+                "score_loss_weight": 1.0,
             }
         )
 
@@ -1841,6 +1847,7 @@ def test_distillation_loss_gradient_flow():
             "block_size": 1,
             "block_mode": "fixed",
             "block_baseline": False,
+            "score_loss_weight": 1.0,
         }
     )
 
@@ -1875,6 +1882,7 @@ def test_distillation_loss_edge_cases():
             "block_size": 1,
             "block_mode": "fixed",
             "block_baseline": False,
+            "score_loss_weight": 1.0,
         }
     )
 
@@ -1928,6 +1936,7 @@ def test_distillation_loss_fn_initialization():
         "block_size": 1,
         "block_mode": "fixed",
         "block_baseline": False,
+        "score_loss_weight": 1.0,
     }
     loss_fn = DistillationLossFn(default_config)
     assert loss_fn.kl_type == "forward"
@@ -1942,6 +1951,7 @@ def test_distillation_loss_fn_initialization():
         "block_size": 1,
         "block_mode": "fixed",
         "block_baseline": False,
+        "score_loss_weight": 1.0,
     }
     loss_fn = DistillationLossFn(custom_config)
     assert loss_fn.kl_type == "reverse"
@@ -1961,6 +1971,7 @@ def test_distillation_loss_fn_call():
             "block_size": 1,
             "block_mode": "fixed",
             "block_baseline": False,
+            "score_loss_weight": 1.0,
         }
     )
 
@@ -2217,6 +2228,7 @@ def test_distillation_block_kl_gradient_matches_exact_objective(
                 "block_size": cfg_block_size,
                 "block_mode": block_mode,
                 "block_baseline": block_baseline,
+                "score_loss_weight": 1.0,
             }
         )
         loss, _ = loss_fn(
@@ -2256,5 +2268,101 @@ def test_distillation_block_kl_invalid_config(kl_type, zero_outside_topk, match)
                 "block_size": 2,
                 "block_mode": "fixed",
                 "block_baseline": False,
+                "score_loss_weight": 1.0,
+            }
+        )
+
+
+def _score_weight_batch(vocab=7, topk=4, seed=0):
+    """One sequence with a prompt, a response long enough to span blocks, and padding."""
+    gen = torch.Generator().manual_seed(seed)
+    prompt, response, pad = 3, 9, 2
+    seq = prompt + response + pad
+    input_ids = torch.randint(1, vocab, (1, seq), generator=gen)
+    input_ids[0, prompt + response :] = 0
+    token_mask = torch.zeros(1, seq)
+    token_mask[0, prompt : prompt + response] = 1
+    teacher_topk_logits, teacher_topk_indices = torch.randn(
+        1, seq, vocab, generator=gen
+    ).topk(topk, dim=-1)
+    data = {
+        "input_ids": input_ids,
+        "input_lengths": torch.tensor([prompt + response]),
+        "token_mask": token_mask,
+        "sample_mask": torch.ones(1),
+        "teacher_topk_logits": teacher_topk_logits,
+        "teacher_topk_indices": teacher_topk_indices,
+    }
+    return data, torch.randn(1, seq, vocab, generator=gen)
+
+
+def _score_weight_loss_and_grad(logits, data, block_size, block_mode, weight):
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+            "block_size": block_size,
+            "block_mode": block_mode,
+            "block_baseline": False,
+            "score_loss_weight": weight,
+        }
+    )
+    logits = logits.clone().requires_grad_(True)
+    loss, _ = loss_fn(
+        logits,
+        data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=data["token_mask"][:, 1:].sum(),
+    )
+    (grad,) = torch.autograd.grad(loss, logits)
+    return loss, grad
+
+
+@pytest.mark.parametrize("block_mode", ["fixed", "sliding"])
+@pytest.mark.parametrize("weight", [0.25, 0.5, 1.5, 3.0])
+def test_score_loss_weight_scales_only_the_score_term(block_mode, weight):
+    """grad(lambda) = grad_direct + lambda * score_grad, exactly."""
+    data, logits = _score_weight_batch()
+    _, direct = _score_weight_loss_and_grad(logits, data, 4, block_mode, 0.0)
+    _, full = _score_weight_loss_and_grad(logits, data, 4, block_mode, 1.0)
+    _, scaled = _score_weight_loss_and_grad(logits, data, 4, block_mode, weight)
+
+    torch.testing.assert_close(scaled, direct + weight * (full - direct))
+    # the score term is actually present, so the check above is not vacuous
+    assert not torch.allclose(full, direct, rtol=1e-3, atol=1e-5)
+
+
+@pytest.mark.parametrize("block_mode", ["fixed", "sliding"])
+@pytest.mark.parametrize("block_size", [2, 4, 8])
+def test_score_loss_weight_zero_is_per_token_kl(block_mode, block_size):
+    """lambda = 0 reproduces block_size 1 bit for bit, however large the block."""
+    data, logits = _score_weight_batch()
+    per_token = _score_weight_loss_and_grad(logits, data, 1, block_mode, 1.0)
+    zeroed = _score_weight_loss_and_grad(logits, data, block_size, block_mode, 0.0)
+    for a, b in zip(per_token, zeroed):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("weight", [0.0, 0.25, 1.0, 2.0])
+def test_score_loss_weight_leaves_reported_loss_unchanged(weight):
+    """The score term has forward value 0, so the logged loss stays comparable."""
+    data, logits = _score_weight_batch()
+    baseline, _ = _score_weight_loss_and_grad(logits, data, 1, "sliding", 1.0)
+    weighted, _ = _score_weight_loss_and_grad(logits, data, 4, "sliding", weight)
+    assert weighted.item() == pytest.approx(baseline.item(), rel=1e-6)
+
+
+def test_score_loss_weight_rejects_negative():
+    with pytest.raises(AssertionError, match="score_loss_weight must be >= 0"):
+        DistillationLossFn(
+            {
+                "kl_type": "reverse",
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": False,
+                "block_size": 4,
+                "block_mode": "sliding",
+                "block_baseline": False,
+                "score_loss_weight": -1.0,
             }
         )

@@ -345,9 +345,11 @@ def setup(
     )
     assert (
         loss_config["block_size"] == 1
+        or loss_config["score_loss_weight"] == 0
         or policy_config["train_global_batch_size"] == rollouts_per_step
     ), (
-        "loss_fn.block_size > 1 requires policy.train_global_batch_size == "
+        "loss_fn.block_size > 1 with loss_fn.score_loss_weight > 0 requires "
+        "policy.train_global_batch_size == "
         "num_prompts_per_step * num_generations_per_prompt "
         f"({policy_config['train_global_batch_size']} != {rollouts_per_step}), "
         "otherwise later optimizer steps train on off-policy samples"

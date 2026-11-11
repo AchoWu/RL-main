@@ -129,6 +129,32 @@ KL_t + (log q(y_t) - sg(log q(y_t))) * sg(R_t)
 - `block_size: 1`（默认）— `R_t = 0`，与原逐 token KL 完全等价；`block_size` ≥
   response 长度的 fixed 即为整条序列 reverse KL 的梯度。
 
+**score 项权重（`score_loss_weight`，λ）：** 损失拆成
+
+```
+L = L_direct + λ * L_score
+```
+
+`L_direct` 是逐 token KL，λ **不会**作用在它上面；`L_score` 是上面那个 score-function 项。
+取值含义：`λ=1` 是块级 KL 的精确梯度（默认）；`0<λ<1` 削弱、`λ>1` 放大 score 项；`λ=0`
+时该项被整段跳过，梯度与 `block_size=1` **逐位相同**，同时省掉 score 项额外的全词表
+gather（见下面的显存一条）。λ 必须 ≥ 0：负值是翻转 score 项的符号，不是缩放它，
+`DistillationLossFn.__init__` 会 assert 掉。
+
+实现上 λ 只乘在 `per_token_loss` 的 score 项上（`loss_functions.py`）。两项在 reduction
+**之前**就按位置相加，共用同一个 `masked_mean(..., global_valid_toks)`，所以无论 λ 取多少，
+两项的归一化方式都与 λ=1 时完全一致——扫 λ 测到的只是 λ，不含归一化变化。score 项前向值
+为 0，所以日志里的 `loss` 始终是逐 token KL 均值，各 λ 的曲线可直接比较。
+
+λ=0 且 `block_size>1` 时没有 score 项，`distillation.setup` 里那条
+`train_global_batch_size == 每步 rollout 数` 的 on-policy 断言也随之放宽。
+
+扫 λ 的脚本是 `train_bopd_lambda.sh`（只改 λ，block_size / baseline / teacher / lr / seed
+都与 `train_bopd.sh` 的 sliding 组一致）。因为 `L_score` 对 λ 线性，
+`tools/bopd_diagnostics` 在 λ=1 下量到的 score 梯度大小可以直接按 λ 缩放来预估：base 模型
+bs8 的 `|E G_score| / |E G_direct| ≈ 0.24`，于是 λ=0.25/0.5/1/1.5 对应约 6%/12%/24%/36%。
+这是 base 模型上的估计，训练中途的实际比例要用诊断工具在对应 checkpoint 上重测。
+
 **目标的确切含义。** `KL_t` 是在 teacher top-k 上**重新归一化**后的 KL（`KL~_t`），而
 采样分布是全词表 q。所以优化的是 `E_{y~q}[ sum KL~_t ]` 的（截断后）精确梯度；只有
 top-k 覆盖整个词表时，它才等于截断前块联合分布的 KL。
@@ -158,7 +184,8 @@ top-k 覆盖整个词表时，它才等于截断前块联合分布的 KL。
   - 生成时如果 `top_p < 1` 或设置了 `top_k`，采样分布就不是 q，也会引入偏差；
     默认 `temperature=1.0, top_p=1.0, top_k=null` 没有这个问题。
 - 显存：要多做一次全词表 log_softmax，结果保留到 backward。16k 序列在 tp=cp=1 时
-  每个 microbatch 约多占 10 GB，TP2/CP2 时每卡约 2.5 GB。
+  每个 microbatch 约多占 10 GB，TP2/CP2 时每卡约 2.5 GB。`score_loss_weight: 0` 时这一步
+  被跳过，显存回到逐 token KL 的水平。
 - 单测 `test_distillation_block_kl_gradient_matches_exact_objective` 在 V=3 的玩具
   自回归模型上枚举全部序列（多块、top-k < V、多 token prompt、右侧 padding），验证
   期望梯度等于上述目标的精确梯度；`test_block_kl_to_go_sliding_is_fixed_averaged_over_offsets`
@@ -319,6 +346,7 @@ loss_fn:
     block_size: 1                        # >1: 块级 reverse KL
     block_mode: "fixed"                  # fixed / sliding（fixed 对所有块偏移的平均）
     block_baseline: false                # true: score 项减去只依赖 y_<t 的 baseline
+    score_loss_weight: 1.0               # score 项的权重 λ，不影响 direct KL；0 等价于逐 token KL
     oad:
         eps: 1.0e-8
 

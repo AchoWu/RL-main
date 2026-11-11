@@ -22,6 +22,9 @@ loss_fn:
     block_size: 1
     block_mode: "fixed" # fixed: non-overlapping blocks; sliding: fixed averaged over all block offsets (token j ahead weighted (k-j)/k)
     block_baseline: false # block_size > 1: subtract a baseline (mean KL-to-go of earlier positions y_t cannot affect) to cut score-term variance; unbiased
+    # block_size > 1: weight on the score-function term only, never on the direct per-token KL.
+    # 1 = exact block-KL gradient, <1 damps it, >1 amplifies, 0 drops it (identical to block_size 1).
+    score_loss_weight: 1.0
 
 checkpointing:
     enabled: true

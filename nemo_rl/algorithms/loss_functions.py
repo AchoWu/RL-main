@@ -960,6 +960,12 @@ class DistillationLossConfig(TypedDict):
     # positions that y_t cannot affect (see _block_kl_baseline). Unbiased; lowers the
     # variance of the score-function term, whose KL-to-go is otherwise always >= 0.
     block_baseline: bool
+    # block_size > 1 only: weight (lambda) on the score-function term alone; the direct
+    # per-token KL is never scaled. 1 = the exact block-KL gradient, <1 damps the term,
+    # >1 amplifies it, 0 drops it (and skips its extra full-vocab gather), leaving a
+    # gradient identical to block_size 1. Must be >= 0: a negative weight would flip the
+    # term's sign rather than scale it.
+    score_loss_weight: float
 
 
 def _block_kl_to_go(
@@ -1099,6 +1105,7 @@ class DistillationLossFn(LossFunction):
         self.block_size = cfg["block_size"]
         self.block_mode = cfg["block_mode"]
         self.block_baseline = cfg["block_baseline"]
+        self.score_loss_weight = cfg["score_loss_weight"]
         self.log_infinitesimal = -100
         self.loss_type = LossType.TOKEN_LEVEL
 
@@ -1108,6 +1115,10 @@ class DistillationLossFn(LossFunction):
         )
         assert self.block_size >= 1, "block_size must be >= 1"
         assert self.block_mode in ["fixed", "sliding"], "Invalid block mode"
+        assert self.score_loss_weight >= 0, (
+            f"score_loss_weight must be >= 0, got {self.score_loss_weight}; it scales "
+            "the score-function term and a negative value would flip its sign"
+        )
         # The block KL's chain-rule decomposition is an expectation over student
         # samples, which is what the rollouts are; forward KL would need teacher samples.
         assert self.block_size == 1 or self.kl_type == "reverse", (
@@ -1336,7 +1347,7 @@ class DistillationLossFn(LossFunction):
         mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
 
         per_token_loss = per_token_kl
-        if self.block_size > 1:
+        if self.block_size > 1 and self.score_loss_weight != 0:
             # Block reverse KL. By the chain rule, the KL between the student's and
             # teacher's joint distributions over a block B of sampled tokens is
             # E_q[sum_{t in B} KL_t], where KL_t (above) is conditioned on the
@@ -1345,6 +1356,9 @@ class DistillationLossFn(LossFunction):
             # t's block), which per-token KL drops. log q is the full-vocab student
             # logprob, i.e. the sampling distribution. The term below has forward
             # value 0, so the reported loss stays the per-token KL mean.
+            # score_loss_weight scales only this term. Both terms are summed per
+            # position and reduced by the single masked_mean below, so they always
+            # share one normalization no matter what the weight is.
             student_logprobs = _get_next_token_logprobs(
                 next_token_logits,
                 input_ids,
@@ -1360,9 +1374,10 @@ class DistillationLossFn(LossFunction):
                 kl_to_go = kl_to_go - _block_kl_baseline(
                     kl_to_go, mask, self.block_size, self.block_mode
                 )
-            per_token_loss = per_token_kl + (
-                student_logprobs - student_logprobs.detach()
-            ) * kl_to_go.to(student_logprobs.device)
+            per_token_loss = per_token_kl + self.score_loss_weight * (
+                (student_logprobs - student_logprobs.detach())
+                * kl_to_go.to(student_logprobs.device)
+            )
 
         kl_loss = masked_mean(
             per_token_loss,

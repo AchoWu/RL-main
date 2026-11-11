@@ -120,6 +120,10 @@ def mock_components(monkeypatch):
             "kl_type": "forward",
             "mixed_kl_weight": 0.5,
             "zero_outside_topk": False,
+            "block_size": 1,
+            "block_mode": "fixed",
+            "block_baseline": False,
+            "score_loss_weight": 1.0,
         }
     )
 
